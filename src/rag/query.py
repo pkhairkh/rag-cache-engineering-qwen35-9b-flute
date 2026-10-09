@@ -15,9 +15,10 @@
         the full-attn layers run fresh (spec §2.4)
     [8] decode: greedy loop via the model's forward (use_cache=True)
 
-Oracle mode: `retrieved_ids` passed explicitly skips steps 3–5 (the P6
+Oracle mode: `retrieved_ids` passed explicitly skips steps 3–4 (the P6
 e2e oracle-install variant — isolates retrieval quality from generation
-quality, PROPOSAL P6).
+quality, PROPOSAL P6); step 5 (loading the chosen chunks' codes) still
+runs — the install needs the codes.
 
 Timing: every step is instrumented (the §9 ledger); QueryResult.timings
 carries seconds per step.
