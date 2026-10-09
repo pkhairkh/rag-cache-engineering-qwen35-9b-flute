@@ -80,13 +80,21 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # Path resolution: FLUTE_EXT_DIR env var (if set), then sibling-dir candidates.
 
 _IDXN_CANDIDATES = [
+    # this repo's FLAT layout (src/flute_extended/idxN.py — same as the FHT
+    # loader's candidates; the nested candidates cover the source project's
+    # installed-tree layout where the package sits one level deeper)
+    os.path.join(_HERE, "..", "flute_extended", "idxN.py"),
+    os.path.join(_HERE, "flute_extended", "idxN.py"),
+    os.path.join(_HERE, "..", "..", "flute_extended", "idxN.py"),
+    # nested layouts (external/source trees)
     os.path.join(_HERE, "..", "flute_extended", "flute_extended", "idxN.py"),
     os.path.join(_HERE, "flute_extended", "flute_extended", "idxN.py"),
     os.path.join(_HERE, "..", "..", "flute_extended", "flute_extended", "idxN.py"),
 ]
 _env_flute = os.environ.get("FLUTE_EXT_DIR")
 if _env_flute:
-    _IDXN_CANDIDATES.insert(0, os.path.join(_env_flute, "flute_extended", "idxN.py"))
+    _IDXN_CANDIDATES.insert(0, os.path.join(_env_flute, "idxN.py"))
+    _IDXN_CANDIDATES.insert(1, os.path.join(_env_flute, "flute_extended", "idxN.py"))
 _idxn_module = None
 
 

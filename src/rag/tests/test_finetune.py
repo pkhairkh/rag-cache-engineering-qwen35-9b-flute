@@ -53,14 +53,12 @@ from torch import nn
 
 import _paths  # noqa: F401  (house sys.path anchor — must precede sibling imports)
 
-# palettized_modules' idxN loader resolves candidates as
-# <dir>/flute_extended/idxN.py (the upstream nested checkout layout);
-# this repo ships the FLAT src/flute_extended/idxN.py — point the
-# module's own FLUTE_EXT_DIR knob at src/ BEFORE the first
-# _get_idxn() call (module import time; nothing else in the suite
-# constructs PalettizedLinears, so the loader is still cold).
-_SRC = str(Path(__file__).resolve().parents[2])
-os.environ.setdefault("FLUTE_EXT_DIR", _SRC)
+# (Historical note: the idxN loader in palettized_modules used to search
+# only the upstream NESTED layout flute_extended/flute_extended/idxN.py;
+# this repo ships the FLAT src/flute_extended/idxN.py. Fixed at source
+# (the flat candidates now come first, matching the FHT loader) — this
+# suite constructs PalettizedLinears with NO env override, exercising the
+# fixed candidate list itself.)
 
 import finetune  # noqa: E402
 import lut_export  # noqa: E402
