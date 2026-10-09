@@ -48,9 +48,12 @@ src/
   (`pretrained_luts/`, SPECIFICATION.md §11).
 - Kernel bring-up on the GPU box: `src/docs/DEPLOY.md` (build, ptxas
   gate, differential spot-check).
-- The RAG pipeline itself (TurboQuant online cache wrapper, M1/M2
-  architectural addition, 9-hook capture, ingestion -> IVFADC ->
-  install) is specified but NOT yet implemented — SPECIFICATION.md
-  sections 2-9 are the build list, executed wave-by-wave per TASKS.md
-  (CPU coding box writes + verifies all code; GPU box runs the
-  measurement gates in TASKS.md §7).
+- The RAG pipeline (SPECIFICATION.md sections 2-9) is IMPLEMENTED under
+  `src/rag/` — executed wave-by-wave per TASKS.md (Waves 0-9, tag
+  `cpu-code-complete`): TurboQuant core (paper-constant gates), the
+  online cache wrapper, M1/M2 + modeling wiring, the 9-hook capture,
+  delta-protocol ingestion + snapshot codec, IVFADC index, the §6
+  install/query flow, the §7 fine-tune loop + LUT export, and the
+  phase-gate harness (`src/rag/evals.py --self-test` on CPU; the
+  measurement gates run on the GPU box per TASKS.md §7). Tests:
+  `python3 -m pytest src/rag/tests -q`.
