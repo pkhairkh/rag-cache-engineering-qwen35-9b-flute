@@ -11,11 +11,15 @@ cache API, the retrieval vector, the ingestion / query flows, and the
 fine-tune that makes the caches carry information. **PROPOSAL.md** is the
 build plan (how): the TurboQuant paper (arXiv:2504.19874) mapped onto our
 tensors, five design decisions, phased build with gates, risk register.
+**TASKS.md** is the execution plan (who/when): the CPU coding box's waves,
+granular tasks, and Definition-of-Done gates.
 
 ## Layout
 
 ```
 SPECIFICATION.md            the definitive spec (the contract)
+PROPOSAL.md                 the build plan (how) — TurboQuant mapped to our tensors
+TASKS.md                    the execution plan (waves, tasks, DoD gates)
 scripts/poc_toy/            the validated CPU toys (§12) + their deps
 src/
   scripts/                  model-side code: modeling (Qwen3.5-9B hybrid),
@@ -47,4 +51,6 @@ src/
 - The RAG pipeline itself (TurboQuant online cache wrapper, M1/M2
   architectural addition, 9-hook capture, ingestion -> IVFADC ->
   install) is specified but NOT yet implemented — SPECIFICATION.md
-  sections 2-9 are the build list.
+  sections 2-9 are the build list, executed wave-by-wave per TASKS.md
+  (CPU coding box writes + verifies all code; GPU box runs the
+  measurement gates in TASKS.md §7).
