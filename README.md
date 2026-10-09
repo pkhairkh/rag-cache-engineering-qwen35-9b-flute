@@ -8,7 +8,9 @@ disk, no re-prefill, TurboQuant online (3.5-bit, quality-neutral).
 geometry (24 linear-attention + 8 full-attention layers), the snapshotted
 caches (per-layer S + global M1/M2 + conv_state), the online TurboQuant
 cache API, the retrieval vector, the ingestion / query flows, and the
-fine-tune that makes the caches carry information.
+fine-tune that makes the caches carry information. **PROPOSAL.md** is the
+build plan (how): the TurboQuant paper (arXiv:2504.19874) mapped onto our
+tensors, five design decisions, phased build with gates, risk register.
 
 ## Layout
 
