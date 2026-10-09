@@ -1,505 +1,450 @@
-# PROPOSAL — PoC: Cache-Engineering RAG on Qwen3.5-9B (FLUTE idxN), OfficeQA on A10G
+# PROPOSAL — PoC: LUT-Model Cache Engineering, K3-Style, OfficeQA on A10G
 
-> **Status:** proposed — proof-of-concept — feasibility + accuracy benchmarks
-> **Companion to:** `PROPOSAL-COMPANY-RAG.md` (v1.1) — the production proposal. This document is the **smaller, faster, measurable** version: a PoC scoped to one box (A10G), one dataset (`databricks/officeqa`), and the question *"does the cache-engineering thesis hold when measured, not assumed?"*
-> **Decision owner:** repo owner · **Scope:** one PoC, three measurement rounds, six weeks of box time. The production proposal's four-lane architecture is *compressed* into a single-machine script that exercises the same primitives: corpus (subset of OfficeQA's Treasury Bulletins), permission (omitted — OfficeQA's corpus is single-tenant), serving (Qwen3.5-9B native hybrid + FLUTE idxN, with the linear-attention state matrix as the cache asset), evaluation (the OfficeQA gold answers + the meaningful-query filter).
-> **Provenance:** every claim about the repo's existing infrastructure references a file path in `qwen3_5_9B_flute_qlora_v1.3`. Every claim about the literature references an arXiv paper with its abstract read.
-
----
-
-## 0. The question, and the answer
-
-> *"We need a PoC with benchmarks for accuracy and feasibility. What works? How can we get a small PoC on OfficeQA on the A10G machine? Read the literature — what does the latest arxiv say?"*
-
-**Answer:** build a **single-machine, three-round PoC** that measures, in this order:
-
-1. **Round 1 — Feasibility floor.** Can Qwen3.5-9B (dense FP16 vs FLUTE idxN W4+r32) even run on A10G under the OfficeQA workload, and at what accuracy/throughput/VRAM cost? This is the *floor* — if the dense model OOMs at OfficeQA's context length, or if the W4 quantization drops accuracy below the OfficeQA frontier-agent average of 34.1%, the cache-engineering thesis is moot for this hardware.
-2. **Round 2 — Cache-engineering delta.** With the W4 model as the base, measure the delta from (a) **no cache** (every request re-prefills), (b) **vLLM-style prefix cache** (the standard, full-attention KV reuse), and (c) **linear-attention state snapshot** (the proposal's cache asset — 576 KiB per session, reinstalled at the 8 full-attention block boundaries). The delta is measured on accuracy (OfficeQA gold answers), throughput (tok/s), latency (TTFT, ITL), and VRAM (GiB resident).
-3. **Round 3 — Staleness envelope.** With cache-engineering active, measure the **staleness envelope** on the four axes of the production proposal: doc-edit (the OfficeQA corpus is versioned — simulate edits), role-flip (system prompt change), checkpoint-change (re-quantization), permission-flip (synthetic ACL — out of scope for OfficeQA's single-tenant corpus, but we measure the **structural invariant**: that a permission flip is a query-time filter, not a cache mutation). This is the round that produces the envelope curves the production proposal gates every release on.
-
-The PoC exists to **fail fast** on the production proposal's riskiest assumption: that the cache asset (576 KiB linear-attention state per session) is the right object to cache, on this hardware, at this scale, with this model. If the measured delta between vLLM prefix cache and linear-attention state cache is *not* meaningfully in favor of the state cache, the production proposal's serving lane is reconsidered before any Databricks/SharePoint/Unity Catalog work is commissioned.
+> **Status:** proposed — proof-of-concept — v2 (focused)
+> **Scope:** the FLUTE idxN W4+r32 Qwen3.5-9B LUT model, **only**. No dense FP16/bf16 baseline. No Databricks. No SharePoint. No `ai_parse_document`. No Unity Catalog. The PoC is: the LUT model + a per-session linear-attention state cache + a global cross-session state cache + a W10 LUT fine-tune, measured on `databricks/officeqa` on one A10G.
+> **Style:** Kimi K3 — the fixed per-head recurrent state is the cache asset; it is paged, content-addressed, namespace-keyed, LRU-evicted; the global pool shares state across sessions with identical prefixes.
+> **Correction from v1:** v1 claimed the cache asset was 576 KiB per session. That was wrong. Reading `scripts/modeling.py::Qwen3_5GatedDeltaNet.forward` (lines 710, 738-739) shows the recurrent state is `cache_params.layers[layer_idx].recurrent_states[0]`, shape `(batch, num_v_heads=32, head_k_dim=128, head_k_dim=128)` per layer — a matrix, not a vector. The correct per-session size is **~25.5 MiB** (24 layers × 1 MiB recurrent + 1.5 MiB conv1d). v1 was off by ~44×. This document uses the corrected number throughout.
 
 ---
 
-## 1. The literature, read
+## 0. The question, the answer
 
-This section is the contract between the PoC and the field. Every paper cited here was read (abstract + key claims) during the writing of this proposal. The PoC's measurement protocol is derived from these papers' findings, not assumed alongside them.
+> *"Databricks is out of scope. No FP16/bf16 baseline. Only the LUT model. Add a global cache — snapshot the linear-attention state, add a global cache too, fine-tune. KIMI K3 style."*
 
-### 1.1 OfficeQA Pro — the benchmark, and the measured frontier
+**Answer:** build a K3-style cache-engineering PoC in four layers, all on one A10G, all on the FLUTE idxN LUT model:
 
-**Paper:** [arXiv:2603.08655](https://arxiv.org/abs/2603.08655) — *OfficeQA Pro: An Enterprise Benchmark for End-to-End Grounded Reasoning* (Opsahl-Ong et al., Databricks AI Research, submitted 9 Mar 2026).
+1. **The LUT model.** Qwen3.5-9B with FLUTE idxN W4+r32 (`--recipe auto --auto-cos 0.9995`), loaded via `scripts/eval_common.py::load_quant_model`. The only model in the PoC. No dense arm, no bf16 arm.
 
-**Dataset on HuggingFace:** [`databricks/officeqa`](https://huggingface.co/datasets/databricks/officeqa) (the v1 corpus; `databricks/officeqa-pro-v2` is the v2 release with 90 questions over 120,000 pages of U.S. Treasury Accounts of Receipts and Expenditures). License: CC-BY-SA-4.0. Format: CSV; pandas-loadable.
+2. **The per-session state cache.** Snapshot the linear-attention recurrent state (`cache_params.layers[L].recurrent_states[0]`) and the conv1d state (`cache_params.layers[L].conv_states[0]`) at each of the 8 full-attention block boundaries (layers 3, 7, 11, 15, 19, 23, 27, 31). ~25.5 MiB per session. On a cache hit at a boundary: restore the state, skip the 3 preceding linear-attention layers' forward, continue from the full-attention block. This is the K3 per-head state snapshot.
 
-**Measured findings the PoC inherits:**
+3. **The global cache.** A cross-session, content-addressed pool of state snapshots, keyed by `(namespace, boundary_idx, state_content_hash)`. Sessions with identical prefixes share state. LRU-evicted. The global cache is what makes the K3 discipline real: a new session installing the system prompt + policy block hits the global cache at boundary 0 (the system prompt is the same for all sessions in a context class); a session re-running a query on an unchanged corpus block hits at deeper boundaries. The global cache is the cross-session reuse layer.
 
-| # | Finding | What it decides in the PoC |
+4. **The fine-tune.** Train the LUTs on OfficeQA Q&A pairs using the W10 two-stream path (`scripts/qlora_gemm.py::FusedQLoRAGEMMTrainLUTTwoStreams` + `scripts/qlora.py::attach_qlora` + `scripts/trainer.py`). The fine-tune recovers the accuracy lost to W4 quantization (the existing +3.52% PPL gap from `reports/greedy_equivalence_idx4.json`) and adapts the LUT model to the OfficeQA domain. Optionally: train with state-snapshot/restore in the loop (K3-style data augmentation — the model learns to produce state that survives re-installation).
+
+**The PoC's single measurement:** on the same 50 OfficeQA questions, same LUT model, same A10G, measure the delta between (a) no cache, (b) per-session state cache only, (c) per-session + global cache. The delta is: accuracy (OfficeQA gold), throughput (tok/s), TTFT (ms), ITL (ms), VRAM (GiB), cache hit rate (%). The fine-tune is measured as the accuracy recovery before and after.
+
+---
+
+## 1. The K3-style design, concretely
+
+### 1.1 The cache asset (corrected)
+
+From `scripts/modeling.py::Qwen3_5GatedDeltaNet.forward` (lines 636-748):
+
+```python
+# line 710: the recurrent state is read from the cache
+recurrent_state = cache_params.layers[self.layer_idx].recurrent_states[0] if use_precomputed_states else None
+
+# lines 711-723: at decode (seq_len==1), the delta rule updates the state
+core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
+    query, key, value, g=g, beta=beta,
+    initial_state=recurrent_state,
+    output_final_state=cache_params is not None,
+    use_qk_l2norm_in_kernel=True,
+)
+
+# line 738-739: the updated state is written back to the cache
+if cache_params is not None:
+    cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
+```
+
+The recurrent state shape (from `fla.ops.gated_delta_rule`): `(batch, num_v_heads, head_k_dim, head_k_dim)` = `(1, 32, 128, 128)` per layer.
+
+The conv1d state (line 661): `cache_params.layers[self.layer_idx].conv_states[0]`, shape `(batch, conv_dim, conv_kernel_dim)` = `(1, 8192, 4)` per layer.
+
+**Per-layer state sizes (fp16):**
+
+| Component | Shape | Elements | Bytes (fp16) |
+|---|---|---|---|
+| Recurrent state | `(1, 32, 128, 128)` | 524,288 | 1,048,576 = **1.0 MiB** |
+| Conv1d state | `(1, 8192, 4)` | 32,768 | 65,536 = **64 KiB** |
+| **Per layer total** | | | **~1.06 MiB** |
+
+**Per-session totals (24 linear-attention layers):**
+
+| Component | Per layer | × 24 layers | Total |
+|---|---|---|---|
+| Recurrent state | 1.0 MiB | 24 MiB | **24 MiB** |
+| Conv1d state | 64 KiB | 1.5 MiB | **1.5 MiB** |
+| **Per-session total** | | | **~25.5 MiB** |
+
+This is the cache asset. Not 576 KiB (v1's error — it confused the K/V projection shape with the recurrent state matrix shape). **25.5 MiB per session.**
+
+**A10G capacity (W4+r32, ~5.85 GiB weights, ~13 GiB cache pool):**
+- Per-session state: 25.5 MiB
+- Concurrent session states in pool: 13 GiB / 25.5 MiB ≈ **530 concurrent sessions**
+- At 8k context, the full-attention KV adds ~256 MiB per session (8 layers × 4 KiB/token × 8k tokens) — this is the working-set that grows, not the cache asset
+- With full-attention KV: ~50 concurrent sessions at 8k context per replica
+
+### 1.2 The per-session state cache
+
+The per-session cache snapshots the linear-attention state at each of the 8 full-attention block boundaries. The boundaries are the 8 full-attention layers (layers 3, 7, 11, 15, 19, 23, 27, 31 per `full_attention_interval: 4`).
+
+**Why boundaries matter:** after each full-attention layer, the linear-attention state from the 3 preceding layers is complete for that 4-layer block. A snapshot at boundary N captures the state of all linear-attention layers that have run so far (layers 0, 1, 2 at boundary 1; layers 0, 1, 2, 4, 5, 6 at boundary 2; etc.). The state at boundary N INCLUDES the state at all earlier boundaries (the recurrent state is cumulative — each layer's state evolves over the whole sequence).
+
+**The snapshot/restore hooks:**
+
+```python
+# poc/state_cache.py
+BOUNDARY_LAYERS = [3, 7, 11, 15, 19, 23, 27, 31]  # the 8 full-attention layers
+
+class PerSessionStateCache:
+    """Snapshots the linear-attention recurrent + conv1d state at each
+    full-attention block boundary. On a hit at boundary N: restore all
+    linear-attention layers' states, skip the forward through those layers,
+    continue from full-attention layer N's output."""
+
+    def snapshot(self, model, cache_params, boundary_idx: int) -> StateSnapshot:
+        """Called after full-attention layer BOUNDARY_LAYERS[boundary_idx].
+        Copies recurrent_states[0] and conv_states[0] for every
+        linear-attention layer < BOUNDARY_LAYERS[boundary_idx] to host.
+        Returns a StateSnapshot (content-hashed, namespace-keyed)."""
+
+    def restore(self, model, cache_params, snapshot: StateSnapshot):
+        """Copies the snapshot's states back to cache_params.layers[L].
+        recurrent_states[0] and conv_states[0] for each linear-attention
+        layer in the snapshot. The model resumes forward from the boundary."""
+
+    def lookup(self, namespace, boundary_idx, content_hash) -> Optional[StateSnapshot]:
+        """Content-addressed lookup in the per-session LRU pool."""
+```
+
+**The content hash** is a SHA-256 of the concatenation of all state tensors at the boundary, computed on the host after the snapshot copy. This is the K3 "content hashes at 512-token granularity" discipline, applied to the linear-attention state instead of the full-attention KV.
+
+### 1.3 The global cache
+
+The global cache is the cross-session reuse layer. It stores state snapshots keyed by `(namespace, boundary_idx, content_hash)`. Multiple sessions can install/lookup the same snapshot.
+
+**When the global cache hits:**
+
+| Boundary | What's shared | Hit rate (expected) |
 |---|---|---|
-| L-1 | The corpus is 89,000 pages of U.S. Treasury Bulletins spanning nearly 100 years, with over 26 million numerical values — dense financial tables, charts, and narrative text. | The PoC's "documents not in the best state" condition is met *for free*: OfficeQA's corpus is the same shape as the production proposal's SharePoint target. No synthetic-poor-state document generation is needed. |
-| L-2 | Frontier LLMs (Claude Opus 4.6, GPT-5.4, Gemini 3.1 Pro Preview) score **<5% accuracy on parametric knowledge** and **<12% with web access** on OfficeQA Pro's 133 questions. | The PoC's "cache-free baseline" is *expected* to be low (Qwen3.5-9B is not a frontier model). The bar is not "match GPT-5.4"; the bar is "measure the delta from cache engineering on a fixed, smaller model." |
-| L-3 | Frontier agents with direct corpus access score **34.1% average** on OfficeQA Pro; over half of questions fail. | This is the production proposal's expectation-setting number. The PoC must report its measured accuracy against this baseline — if Qwen3.5-9B W4 lands at, say, 12–18%, that is *expected* for a 9B model, not a failure of cache engineering. |
-| L-4 | Providing agents with a structured document representation produced by Databricks' `ai_parse_document` yields a **+16.1% average relative performance gain** across agents. | The PoC's corpus lane must use `ai_parse_document` (or a CPU-side proxy: marker, docling, or unstructured) for the layout-aware parse. Skipping this is the largest single accuracy lever the PoC can pull. The 16.1% is the *measured* ceiling of that lever; the PoC targets at least half of it (8% relative) on the smaller model. |
-| L-5 | OfficeQA Pro's questions require "precise document parsing, retrieval, and analytical reasoning across both unstructured text and tabular data." | The PoC's retrieval must handle tables (not just text chunks). The chunker must keep tables atomic — the chunking taxonomy's rule, see §1.3. |
+| Boundary 0 (before any tokens) | Nothing — the initial state is zeros | N/A (trivial) |
+| Boundary 1 (after system prompt + policy block) | The system prompt is the same for all sessions in a context class | **High** — every session hits |
+| Boundary 2 (after system prompt + policy + first corpus chunk) | The first retrieved chunk varies per query | **Low** — depends on retrieval overlap |
+| Boundaries 3-7 | Session-specific conversation turns + retrieved chunks | **Very low** — per-session only |
 
-**The PoC uses `databricks/officeqa` (the v1 dataset), not `officeqa-pro-v2`.** v1 is larger and CC-BY-SA-4.0; v2 has 90 questions and is the more recent release. The PoC's choice is driven by one factor: v1 is the dataset the existing repo's eval infrastructure (`scripts/eval_*.py`) is closest to consuming — CSV-shaped, pandas-loadable, no agent loop required. v2's agent harness is out of scope for a 6-week PoC on one box.
-
-### 1.2 KV-cache reuse — the 2026 audit wave
-
-Three papers from September 2026 form the audit wave the production proposal cites as its evaluation lane's foundation. The PoC's Round 3 (staleness envelope) is *literally* the measurement protocol these papers prescribe.
-
-**Paper A:** [arXiv:2609.31415](https://arxiv.org/abs/2609.31415) — *Evaluating the accuracy of KV cache reuse techniques* (the "BoxOffice" paper, found via search).
-
-| Finding | What it decides |
-|---|---|
-| The same KV-reuse method can score an **F1 of 0.98 or 0.00** depending only on the context in which the reuse occurs. | Round 3's staleness measurement reports *envelope curves* (accuracy as a function of staleness axis), not point estimates. A single F1 number is forbidden in the PoC's output. |
-| **42% of reported F1 gains** from KV reuse are **metric artifacts**, not real accuracy improvements. | Round 2's cache-vs-no-cache delta must apply the **meaningful-query filter** before any accuracy claim: drop questions the cache-free run fails anyway (model capability, not cache), questions answerable without context (world knowledge), and low-information yes/no questions. The filter's cut list is itself a PoC finding. |
-
-**Paper B:** [arXiv:2609.10266](https://arxiv.org/abs/2609.10266) — *KV-Cache Reuse Across Contexts and Model Checkpoints* (KVShareArena).
-
-| Finding | What it decides |
-|---|---|
-| Free position rotation recovers only **50–66% of the gap** to the cache-free run when a checkpoint changes. | Round 3's checkpoint-change axis: the PoC measures a re-quantization (e.g., `--auto-cos 0.9995` → `0.9990`) as a namespace switch, not a rotation. Refuse cross-checkpoint cache reuse outright. |
-| Unrepaired cross-context reuse can score **worse than no cache at all**. | Round 2's admission policy: when in doubt, re-prefill. The PoC's baseline (no cache) is the lower bound; if cache-with-staleness scores below baseline, that is the finding, not a bug. |
-
-**Paper C:** [arXiv:2609.17983](https://arxiv.org/abs/2609.17983) — *Contiguity, Not Importance: Budgeted Repair of Stale KV Caches After Document Edits* (Mao, Mackey, Lin, submitted 16 Sep 2026).
-
-| Finding | What it decides |
-|---|---|
-| A contiguous edit-local window recovers **at least 0.94 of the post-edit answer margin** and substantially outperforms attention-based, KV-deviation, and structural selectors. | Round 3's doc-edit axis: the repair policy is *edit-local contiguous*, not importance-based. The PoC simulates a document edit by replacing one chunk in the corpus block and measures the repair cost (re-prefill of the contiguous neighborhood) vs. the full re-prefill. |
-| Repair is **13–21× faster** than full re-prefill. | Round 3's repair ledger: per-document repair cost is a line item. The PoC records `repair_ms / reprefill_ms` per edit; the 13–21× figure is the source's measurement, the PoC's measurement is the validation. |
-| The edit-local advantage **disappears when the answer-bearing text moves downstream** of the edit. | Round 3's known limitation: the PoC reports the *distribution* of repair effectiveness, not just the mean. A long tail (answer moves downstream) is expected and reported honestly. |
-
-### 1.3 Chunking — the taxonomy paper
-
-**Paper:** [arXiv:2602.16974](https://arxiv.org/abs/2602.16974) — *Beyond Chunk-Then-Embed: A Comprehensive Taxonomy and Evaluation of Document Chunking* (found via search, February 2026).
-
-| Finding | What it decides |
-|---|---|
-| Simple **structure-based methods outperform LLM-guided alternatives** for corpus-wide retrieval; LLM-guided chunking pays only for intra-document tasks. | The PoC's chunker is structure-based only: heading hierarchy, paragraphs, tables atomic. No LLM in the chunker. |
-| **Late chunking hurts needle queries** (questions requiring a specific fact from a specific page). | The PoC uses pre-retrieval chunking (chunk → embed → index → retrieve at query time), not late chunking (embed full doc → retrieve → chunk at the model). |
-| **Document order preserves longest common prefixes**; relevance order tears prefixes apart. | Round 2's corpus block assembly: chunks enter the context in *document order* within a document; reranking happens *across documents*, never within one. This is the cache-friendly order. |
-| Chunker comparisons are often **size comparisons in disguise**. | Round 1's chunker comparison controls for resulting chunk size and reports the size distribution. A naive "structure-based beat semantic" claim without size control is forbidden. |
-
-### 1.4 Prefix cache eviction — the LRU verdict
-
-**Paper:** [arXiv:2609.28870](https://arxiv.org/abs/2609.28870) — *When Fancy Eviction Fails: Rethinking Cache Replacement For LLM Prefix Reuse* (Liu, Yu, Yang, submitted 24 Sep 2026, revised 1 Oct 2026).
-
-| Finding | What it decides |
-|---|---|
-| 14 sophisticated eviction policies **fail to beat LRU** under agentic load across two production traces. | Round 2's eviction policy is plain LRU. No learned eviction, no frequency-based policy, no analytic policy. |
-| Prefix reuse is dominated by **the regular pacing of active sessions**, making recency unusually predictive. | Round 2's session-affinity scheduling: a conversation returns to the replica that already holds its prefix. The PoC uses consistent hashing with a pre-assigned secondary. |
-| Effective prefix-cache management should retain recency as its foundation while selectively adding **quick demotion for one-hit prefixes**, **compute-aware partial eviction for expensive misses**, and **capacity-dependent eviction granularity**. | Round 2's *optional* enhancements, measured against plain LRU as the baseline. The PoC reports the delta; if it is <5%, plain LRU ships. |
-| The paper introduces the **compute-savings ratio** and two offline oracles (Belady, BeladyCompute). | Round 2's two-oracle diagnostic: sample a trace, compute the Belady vs BeladyCompute gap. If the gap is small, do not build compute-aware eviction. This is the same diagnostic the production proposal prescribes; the PoC validates it on the smaller workload. |
-
-### 1.5 Adjacent domains — what the adjacent literature says
-
-The PoC does not live in isolation. Three adjacent-domain findings shape the design:
-
-**Adjacent A — Speculative KV cache reuse for RAG serving** ([ACL 2026](https://aclanthology.org/2026.acl-long.859), found via search). Reduces TTFT by 2.17–3.95× and increases throughput by 2.7–5.2× over full KV recomputation, with negligible accuracy loss. **What it decides:** the PoC's Round 2 cache hit rate target is *not* 100% — even speculative reuse (which is approximate) buys 2.7–5.2× throughput. The PoC's hit-rate target is "the rate at which the throughput delta matches the source's measurement" — a calibration, not a maximum.
-
-**Adjacent B — RelayCaching** ([ICML 2026](https://icml.cc/virtual/2026/poster/66638), found via search). Training-free inference method that directly reuses decoding-phase KV caches from previous agents in subsequent agents. **What it decides:** the PoC's multi-turn (agentic) measurement reuses the *decoding-phase* KV, not just the prefill KV. The production proposal's "session-paced reuse" claim is validated by measuring multi-turn OfficeQA sessions, not single-turn queries.
-
-**Adjacent C — PatchKV** ([arXiv:2609.26219](https://arxiv.org/html/2609.26219v1), found via search). Efficient KV cache recovery for dynamically edited documents. **What it decides:** the PoC's Round 3 doc-edit repair is benchmarked against PatchKV-style transport-based recovery, not just against full re-prefill. If transport-based recovery (move KV from old position to new position) beats edit-local contiguous repair on the OfficeQA corpus, the production proposal's edit-local rule is reconsidered.
-
-**Adjacent D — Hybrid attention on NPUs** ([arXiv:2609.32114](https://arxiv.org/html/2609.32114v1), found via search). Hybrid attention models (Qwen3.5, Kimi series) on NPUs. **What it decides:** the PoC's measurement of the linear-attention state mechanics is *not* GPU-specific in principle — the same cache asset would apply on NPU. The PoC reports the A10G measurement; the NPU transferability is a noted future-work item, not a PoC deliverable.
-
-### 1.6 What the literature does NOT settle — the PoC's open questions
-
-The literature establishes the *protocol* (envelope curves, meaningful-query filter, edit-local repair, LRU baseline). It does **not** establish:
-
-1. **Whether the linear-attention state matrix (576 KiB per session) is a *better* cache asset than the full-attention KV** at the OfficeQA workload's context lengths (likely 4k–16k tokens, not 1M). The Kimi Linear paper measures the 6× decode speedup at 1M context; at OfficeQA's context lengths, the linear-attention state's advantage may be smaller. **The PoC measures this directly.**
-2. **Whether the FLUTE idxN W4 quantization preserves enough accuracy** on Qwen3.5-9B for the OfficeQA workload to make the cache engineering meaningful. The repo's existing measurement (`reports/greedy_equivalence_idx4.json`) shows +3.52% PPL on WikiText-2 — but that is perplexity, not RAG accuracy. **The PoC measures this directly.**
-3. **Whether the A10G's 24 GiB is enough** to run the W4 model + a meaningful cache pool + the OfficeQA workload's context. The handover log records OOMs in the palettizer; the serving-time budget is unmeasured. **The PoC measures this directly.**
-
-These three open questions are the PoC's reason to exist. The production proposal *assumes* favorable answers; the PoC *measures* them.
-
----
-
-## 2. The PoC system
-
-One machine, one dataset, one model, three rounds. The architecture is the production proposal's four lanes *compressed* into a single Python process with on-disk intermediates.
-
-```
-                ┌──────────────────────────────────────────────────────┐
-                │         A10G (single box, 24 GiB, sm_86)              │
-                │                                                      │
-   ┌────────┐   │   ┌──────────────────────────────────────────────┐   │
-   │ OfficeQA│──►│   │ Round 1: Feasibility floor                    │   │
-   │ HF data │   │   │  • dense FP16 baseline                       │   │
-   │ (CSV)   │   │   │  • FLUTE idxN W4+r32 baseline                 │   │
-   └────────┘   │   │  • measure: VRAM, throughput, OfficeQA acc     │   │
-                │   └──────────────────────────────────────────────┘   │
-                │   ┌──────────────────────────────────────────────┐   │
-                │   │ Round 2: Cache-engineering delta              │   │
-                │   │  • no-cache (re-prefill every request)       │   │
-                │   │  • vLLM prefix cache (full-attn KV reuse)     │   │
-                │   │  • linear-attn state snapshot (proposal)    │   │
-                │   │  • measure: TTFT, ITL, tok/s, acc, VRAM       │   │
-                │   └──────────────────────────────────────────────┘   │
-                │   ┌──────────────────────────────────────────────┐   │
-                │   │ Round 3: Staleness envelope                   │   │
-                │   │  • doc-edit (chunk replacement)               │   │
-                │   │  • role-flip (system prompt change)           │   │
-                │   │  • checkpoint-change (re-quantization)        │   │
-                │   │  • permission-flip (synthetic, structural)    │   │
-                │   │  • measure: envelope curves on 4 axes         │   │
-                │   └──────────────────────────────────────────────┘   │
-                └──────────────────────────────────────────────────────┘
-```
-
-### 2.1 What the PoC reuses (everything in the existing repo)
-
-The existing `qwen3_5_9B_flute_qlora_v1.3` repo ships the **entire inference and measurement stack**. The PoC is a *thin orchestrator* on top of it; it does not reinvent any of these:
-
-| Existing component | File in repo | PoC role |
-|---|---|---|
-| Dense model loader | `scripts/eval_common.py::load_dense_fp16` | Round 1 baseline arm |
-| Palettized model loader | `scripts/eval_common.py::load_quant_model(artifacts_dir, model, device, residual=True, forward="kernel", heads_dir=...)` | Round 1 quantized arm; Round 2 cache arms |
-| Memory release | `scripts/eval_common.py::release_model_memory` | Between arms (sequential residency) |
-| Greedy decode with KV cache | `scripts/eval_greedy_match.py::greedy_decode` | Round 1 generation; Round 2 no-cache arm |
-| CUDA-graph decode | `scripts/eval_greedy_match.py::greedy_decode_dispatch(backend="auto")` | Round 1/2 hot path (the W23+ graphs path) |
-| WikiText-2 PPL | `scripts/eval_ppl.py::evaluate_nll` | Round 1 quality sanity check (the repo's existing +3.52% PPL figure) |
-| Energy & throughput harness | `scripts/measure_energy.py::EnergyMeasurement` | Round 1/2 throughput, energy, VRAM measurement |
-| Per-document paired probe | `scripts/o1_baseline_check.py::score_docs` + `paired_diff` | Round 3 doc-edit repair paired measurement |
-| Calibration capture | `scripts/calibrate_real_text.py::CalibrationCapture` | Pre-PoC: re-palettize if needed with A10G-tuned knobs |
-| Palettizer | `scripts/palettize_qwen3_5_9b.py` | Pre-PoC: produce the W4+r32 artifacts |
-| Modeling (vendored Qwen3.5) | `scripts/modeling.py` | The forward pass; both `linear_attention` and `full_attention` layer types |
-| Linear-attention fla wiring | `scripts/modeling.py::_fla_resolve` (W29) | The linear-attention state mechanics — the cache asset's producer |
-| SM86 flash attention | `scripts/attn_sm86.py` | The 8 full-attention layers' KV — the secondary cache |
-| VRAM ledger | `scripts/vram_ledger.py` | Extend with a `cache_pool` tier |
-| GPU contract gate | `scripts/check_gpu_contract.py` | Pre-PoC: confirm A10G is on the allowlist |
-| Atomic JSON dump | `scripts/eval_common.py::atomic_json_dump` | Every PoC report |
-| The 32 deterministic prompts | `scripts/eval_greedy_match.py::PROMPTS` | Round 1 sanity check (bit-exact reproduction of `reports/greedy_equivalence_idx4.json`) |
-
-**What the PoC does NOT reinvent:** the loader, the QLoRA wrapper, the kernel dispatch, the AWQ compensation, the chunked-CE PPL, the OOM ladder, the greedy compare, the paired-diff stats, the atomic JSON writer. All of these are gated by permanent CPU tests (`tests/test_eval_common.py`'s one-definition census); any new code that re-implements them will fail the census.
-
-### 2.2 What the PoC adds (three small scripts)
-
-The PoC adds **three new scripts** under a new `poc/` directory in the new repo. Each is small (<400 lines), tested on CPU first (`poc/tests/`), and built on top of the existing eval plane.
-
-#### 2.2.1 `poc/officeqa_loader.py` — the OfficeQA corpus adapter
-
-**Role:** load `databricks/officeqa` from HuggingFace, parse the Treasury Bulletin documents (with a CPU-side proxy for `ai_parse_document`), chunk them structure-based, embed them, and produce the gold question set.
-
-**Why a CPU-side proxy for `ai_parse_document`:** `ai_parse_document` is a Databricks SQL function; it requires a Databricks workspace. The PoC runs on a single A10G box, not on Databricks. The proxy is one of: **marker** (MIT, fast, layout-aware), **docling** (IBM, Apache 2.0, table-aware), or **unstructured** (Apache 2.0, the industry default). The PoC picks **docling** for its table-extraction quality — OfficeQA's corpus is table-heavy, and the L-5 finding (tables must be atomic) makes table extraction the chunker's binding constraint.
-
-**Public API:**
-```python
-# poc/officeqa_loader.py
-def load_officeqa_corpus(
-    hf_dataset: str = "databricks/officeqa",
-    split: str = "test",          # the v1 dataset's evaluation split
-    cache_dir: str = "~/.cache/officeqa",
-    parser: str = "docling",       # or "marker", "unstructured"
-    chunker: str = "structure",    # structure-based only (L-3 chunking taxonomy)
-    target_chunk_tokens: int = 512,
-    embedder: str = "BAAI/bge-m3",  # multilingual, 8K context, good table handling
-) -> OfficeQACorpus:
-    """Returns the parsed, chunked, embedded corpus + the gold QA pairs."""
-
-@dataclass
-class OfficeQACorpus:
-    documents: List[OfficeQADocument]   # parsed, with provenance
-    chunks: List[OfficeQAChunk]          # structure-based chunks with embeddings
-    questions: List[OfficeQAQuestion]   # the gold QA pairs
-    parser_version: str
-    chunker_version: str
-    embedder_version: str
-    corpus_version: str                 # SHA-256 of (parser, chunker, embedder) versions
-```
-
-**The meaningful-query filter** (mandatory per finding L-2 of the BoxOffice paper):
+The global cache primarily benefits **boundary 1** (and to a lesser extent boundary 2) — the shared prefix. The per-session cache benefits boundaries 3-7 (session-specific state, reusable within the session on re-prefill after a doc edit or re-query).
 
 ```python
-def apply_meaningful_query_filter(
-    questions: List[OfficeQAQuestion],
-    cache_free_reference_answers: Dict[str, str],  # from Round 1's dense baseline
-) -> Tuple[List[OfficeQAQuestion], FilterCutList]:
-    """Removes three classes:
-    1. Questions the cache-free reference run fails anyway (model capability)
-    2. Questions answerable without context (world knowledge — test by asking
-       the model with NO corpus block; if it answers correctly, drop)
-    3. Low-information yes/no or either/or questions (carry almost no signal)
+# poc/global_cache.py
+class GlobalStateCache:
+    """Cross-session, content-addressed pool of linear-attention state
+    snapshots. Keyed by (namespace, boundary_idx, state_content_hash).
+    LRU-evicted. Thread-safe (the A10G serves one request at a time, but
+    the cache is shared across sequential requests)."""
 
-    Returns (filtered_questions, cut_list). The cut list is itself a PoC finding.
-    """
+    NAMESPACE_KEY = ("model_checkpoint_id", "quant_recipe_signature",
+                     "context_class", "corpus_version")
+
+    def install(self, namespace, boundary_idx, snapshot: StateSnapshot) -> bool:
+        """Store a snapshot. Returns True if new, False if already present
+        (the content hash matched an existing entry — the snapshot is
+        deduplicated)."""
+
+    def lookup(self, namespace, boundary_idx, content_hash) -> Optional[StateSnapshot]:
+        """Content-addressed lookup. Returns the snapshot if present, None
+        if miss. On a hit, the caller restores the state and skips the
+        forward through the linear-attention layers."""
+
+    def evict_lru(self, target_bytes: int) -> int:
+        """Evict least-recently-used entries until the pool is under
+        target_bytes. Returns the number of entries evicted."""
 ```
 
-**Test gate:** `poc/tests/test_officeqa_loader.py` — CPU-only; loads a 5-document subset, asserts the chunker keeps tables atomic, asserts the meaningful-query filter removes at least one question of each of the three classes.
+**The namespace key** (from the production proposal v1.1, made concrete):
 
-#### 2.2.2 `poc/cache_engine.py` — the cache-engineering core
-
-**Role:** implement the three cache policies (no-cache, vLLM prefix cache, linear-attention state snapshot) as pluggable backends behind a common interface. The PoC measures the delta between them on the same workload.
-
-**Public API:**
 ```python
-# poc/cache_engine.py
-class CacheBackend(ABC):
-    @abstractmethod
-    def install(self, request: CacheableRequest) -> CacheInstallResult: ...
-    @abstractmethod
-    def lookup(self, request: CacheableRequest) -> CacheLookupResult: ...
-    @abstractmethod
-    def evict(self, policy: EvictionPolicy = EvictionPolicy.LRU) -> int: ...
-    @abstractmethod
-    def repair(self, edit: DocumentEdit) -> RepairResult: ...
-    @abstractmethod
-    def stats(self) -> CacheStats: ...
-
-class NoCache(CacheBackend):
-    """Every request re-prefills. The baseline."""
-
-class VLLMPrefixCache(CacheBackend):
-    """The standard: full-attention KV reuse on prefix match.
-    Implemented on top of transformers' StaticCache + the repo's
-    greedy_decode_dispatch. Hash granularity 512 tokens; physical
-    blocks 1024-6144 (the K3 discipline). LRU eviction."""
-
-class LinearAttentionStateCache(CacheBackend):
-    """The proposal's cache asset: the (K_state, V_state) pair at the
-    8 full-attention block boundaries, 576 KiB per session. Reinstalled
-    via cudaMemcpyAsync. Namespace-keyed by (checkpoint, recipe, corpus_version,
-    context_class). Edit-local repair on doc-edit."""
-
-@dataclass
-class CacheableRequest:
-    namespace: CacheNamespace
-    session_id: str
-    context_contract: ContextContract  # system, policy, corpus block, turns, query
-    last_full_attn_block_boundary: int  # 0..8
-
 @dataclass
 class CacheNamespace:
-    model_checkpoint_id: str            # SHA-256 of the model weights
-    quant_recipe_signature: str         # SHA-256 of metadata.json's auto_decision ledger
-    context_class: str                  # hash of (system_prompt, policy_block)
-    corpus_version: str                 # from officeqa_loader
+    model_checkpoint_id: str        # SHA-256 of the model weights
+    quant_recipe_signature: str     # SHA-256 of metadata.json's auto_decision ledger
+    context_class: str              # hash of (system_prompt, policy_block)
+    corpus_version: str             # hash of the OfficeQA corpus version
 ```
 
-**The namespace key** is the production proposal's namespace, made concrete. The `quant_recipe_signature` is the SHA-256 of `metadata.json`'s `auto_decision` ledger — a re-palettization with a different `--auto-cos` gate produces a different namespace by construction.
+A fine-tuned model is a different `model_checkpoint_id`. A re-palettized model is a different `quant_recipe_signature`. A changed system prompt is a different `context_class`. A corpus update is a different `corpus_version`. Cross-namespace reuse is refused (KVShareArena finding: unrepaired reuse is worse than no cache).
 
-**The linear-attention state snapshot/restore hooks:**
+### 1.4 The fine-tune
+
+The fine-tune trains the LUTs on OfficeQA Q&A pairs. The W10 two-stream training path is already shipped in the repo:
+
+- `scripts/qlora.py::attach_qlora` — wraps the palettized model with trainable LUT masters (fp32 Parameters, straight-through estimator)
+- `scripts/qlora_gemm.py::FusedQLoRAGEMMTrainLUTTwoStreams` — the W10 autograd Function (forward: two `qgemm_per_group_lut` calls + ordered add; backward: `lut_grad_scatter_sub4_kernel` per stream)
+- `scripts/trainer.py` — the layerwise distillation trainer (two-layer residency: one teacher layer + one student layer resident at a time; the full student model is never built — this is what makes it fit on A10G)
+- `scripts/muon_optimizer.py` — the Muon optimizer for the LoRA branch
+
+**The fine-tune's two objectives:**
+
+1. **Accuracy recovery.** The existing W4 model has +3.52% PPL on WikiText-2 (`reports/greedy_equivalence_idx4.json`). The fine-tune on OfficeQA's Q&A pairs recovers task-specific accuracy. This is standard QLoRA on the LUTs — the W10 path makes it trainable without materializing the (N, K) `dW` transient to DRAM (the `lut_grad_scatter_sub4_kernel`'s whole purpose, per `docs/KERNEL_SPEC_DLDLUT.md`).
+
+2. **K3-style cache-aware fine-tune (optional, the PoC's research bet).** Train with state-snapshot/restore in the loop as data augmentation: occasionally restore a state from an earlier boundary and continue generation from there, forcing the model to produce recurrent state that survives re-installation. This is the K3 principle — K3 was trained with the cache mechanics in mind; our LUT model was not. The fine-tune is where we adapt the LUT model to the cache discipline.
+
+**The fine-tune's data:**
 
 ```python
-# poc/cache_engine.py
-class LinearAttentionStateHooks:
-    """Hooks into the 8 full_attention layer boundaries (layers 3, 7, 11,
-    15, 19, 23, 27, 31 per MODEL_GEOMETRY.md §1's full_attention_interval: 4).
-
-    At each boundary, after the full_attention layer's forward pass:
-      1. Snapshot the running (K_state, V_state) from the 3 preceding
-         linear_attention layers.
-      2. Hash the boundary state (content-addressable).
-      3. Store in the LRU pool, keyed by (namespace, session_id, boundary_idx).
-
-    On a cache hit at a boundary:
-      1. Look up the stored (K_state, V_state) by content hash.
-      2. cudaMemcpyAsync the 576 KiB back to the GPU.
-      3. Skip the 3 linear_attention layers between the boundary and the
-         new query — recompute only the full_attention block.
-    """
-
-    BOUNDARY_LAYERS = [3, 7, 11, 15, 19, 23, 27, 31]  # every 4th, 0-indexed
-    STATE_BYTES_PER_BOUNDARY = 36 * 1024   # 36 KiB per boundary per session
-    TOTAL_STATE_BYTES_PER_SESSION = 576 * 1024  # 8 boundaries × 36 KiB × 2 (K+V)
+# poc/officeqa_sft.py
+def load_officeqa_sft(
+    hf_dataset: str = "databricks/officeqa",
+    split: str = "test",
+    tokenizer,
+    max_samples: int = 200,
+    seq_len: int = 2048,
+) -> List[Dict]:
+    """Loads OfficeQA Q&A pairs as SFT examples.
+    Format: [system: "You are a financial analyst. Answer the question
+    based on the provided context."] + [context: retrieved chunks] +
+    [question] + [answer].
+    Returns [{input_ids, labels, attention_mask}] like scripts/data.py."""
 ```
 
-**Test gate:** `poc/tests/test_cache_engine.py` — CPU-only; uses the `tests/test_greedy_match_w23.py::_tiny_hybrid_model()` fixture (a 2-linear + 2-full layer Qwen3.5) to validate that the snapshot/restore produces bit-identical outputs to a no-snapshot run on the same input.
+### 1.5 The K3 discipline (the standing rules)
 
-#### 2.2.3 `poc/run_poc.py` — the round orchestrator
+From Kimi K3 §5.5, applied to the linear-attention state:
 
-**Role:** run the three rounds in sequence, write reports to `poc/reports/`, produce the final PoC verdict.
-
-**CLI:**
-```bash
-python poc/run_poc.py \
-  --artifacts-dir /home/ubuntu/qwen3_5_9B_palettized \
-  --heads-dir /home/ubuntu/qwen3_5_9B_palettized_heads \
-  --residual \
-  --hf-dataset databricks/officeqa \
-  --split test \
-  --n-questions 50 \
-  --max-context 8192 \
-  --max-new-tokens 256 \
-  --device cuda:0 \
-  --rounds 1,2,3 \
-  --output-dir poc/reports
-```
-
-**The three rounds, concretely:**
-
-**Round 1 — Feasibility floor** (1 week of box time):
-1. Run `scripts/check_gpu_contract.py` — confirm A10G is on the allowlist.
-2. Run `scripts/doctor.py` — confirm the environment is healthy.
-3. Run the kernel parity suite: `pytest tests/test_kernel_status.py tests/test_lut_gradients.py tests/test_two_stream_training.py tests/test_attn_kernel.py tests/test_dequant_reference.py tests/test_idxn_pack_cpu.py -v`. **Green is the precondition for Round 1.**
-4. Load dense FP16 Qwen3.5-9B (`eval_common.load_dense_fp16`). Measure VRAM at idle, at 8k context, at 16k context.
-5. Run the 32 deterministic prompts (`eval_greedy_match.PROMPTS`) at `max_new_tokens=256`. Record throughput, TTFT, ITL.
-6. Run WikiText-2 PPL (`eval_ppl.evaluate_nll`). Confirm parity with the repo's existing 9.2495 figure (within 0.01).
-7. Release dense model. Load W4+r32 palettized model (`eval_common.load_quant_model`).
-8. Repeat steps 5–6 on the W4 model. Confirm the repo's existing 9.5749 PPL figure (within 0.01).
-9. Load the OfficeQA corpus (via `poc/officeqa_loader`). Run 50 questions with the dense model, no cache. Record accuracy.
-10. Run 50 questions with the W4 model, no cache. Record accuracy.
-11. Apply the meaningful-query filter. Record the cut list.
-
-**Round 1 exit criteria:**
-- Dense model fits in VRAM at 8k context (target: <22 GiB).
-- W4 model fits in VRAM at 8k context (target: <7 GiB per the production proposal's arithmetic).
-- W4 PPL within 0.01 of 9.5749 (sanity check against the repo's existing measurement).
-- W4 OfficeQA accuracy measured (no target — this is the floor).
-- The meaningful-query filter's cut list recorded.
-
-**Round 2 — Cache-engineering delta** (2 weeks of box time):
-1. With the W4 model from Round 1, run the 50 (filtered) OfficeQA questions through three cache backends:
-   - `NoCache` (the Round 1 baseline, re-measured for paired comparison).
-   - `VLLMPrefixCache` (full-attention KV reuse, 512-token hash granularity, LRU eviction).
-   - `LinearAttentionStateCache` (the proposal's cache asset, 576 KiB per session, boundary-keyed).
-2. For each backend, measure: TTFT (ms), ITL (ms), throughput (tok/s), accuracy (OfficeQA gold), VRAM peak (GiB), cache hit rate (%), cache eviction count.
-3. Run the two-oracle diagnostic on a sampled trace (Belady vs BeladyCompute gap).
-4. Run the energy harness (`measure_energy.EnergyMeasurement`) on each backend.
-
-**Round 2 exit criteria:**
-- `LinearAttentionStateCache` throughput ≥ `VLLMPrefixCache` throughput at equal accuracy.
-- `LinearAttentionStateCache` VRAM peak ≤ `VLLMPrefixCache` VRAM peak (the 576 KiB per session should make this true by construction; the measurement validates it).
-- The two-oracle gap documented. If <5%, plain LRU is the production policy.
-- The accuracy delta between the three backends is within the meaningful-query filter's noise floor (i.e., cache engineering does not destroy accuracy on the filtered set).
-
-**Round 3 — Staleness envelope** (2 weeks of box time):
-1. With the W4 model + `LinearAttentionStateCache` from Round 2, run the staleness envelope on four axes:
-   - **Doc-edit axis:** for each of the 50 questions, simulate a document edit by replacing one chunk in the corpus block. Measure accuracy and repair cost (ms) as a function of edit distance (tokens between the edit and the answer).
-   - **Role-flip axis:** change the system prompt (e.g., from "you are a helpful assistant" to "you are a financial analyst"). Measure accuracy and re-prefill cost as a function of prompt change magnitude (token-level diff).
-   - **Checkpoint-change axis:** re-palettize with `--auto-cos 0.9990` (a different recipe signature). Measure accuracy on the new namespace; refuse cross-checkpoint cache reuse.
-   - **Permission-flip axis:** synthetic. Add a query-time ACL filter that excludes one document from the retrieval set. Measure that the answer does not change for users who already lacked access to that document (the structural invariant: permission flip is a query variable, not a cache mutation).
-2. For each axis, produce an **envelope curve**: accuracy (or repair cost) as a function of staleness magnitude. The curve is the unit of measurement, not a point estimate (BoxOffice finding L-2).
-3. Run the edit-local repair vs. PatchKV-style transport-based recovery comparison on the doc-edit axis (Adjacent C finding).
-
-**Round 3 exit criteria:**
-- The doc-edit envelope shows edit-local repair within 13–21× of full re-prefill (the Contiguity paper's measurement; the PoC validates it).
-- The role-flip envelope shows the namespace switch is a hard boundary (no cross-namespace reuse).
-- The checkpoint-change envelope shows the recipe signature is a hard boundary.
-- The permission-flip envelope shows zero leakage (the structural invariant holds).
-- The PatchKV comparison is documented; if PatchKV beats edit-local on OfficeQA, the production proposal's edit-local rule is reconsidered.
-
-**Round 3's PoC verdict:**
-- If all four exit criteria pass → the production proposal's serving lane thesis is *measured-valid* on this hardware, at this scale, with this model.
-- If any criterion fails → the failure is documented with the measured numbers; the production proposal is revised before any Databricks work is commissioned.
-
-### 2.3 What the PoC measures (the report schema)
-
-Every PoC report uses the repo's existing schema (`eval_common.atomic_json_dump`): `timestamp_utc`, `git_head`, `args`, `results`/`aggregate`, `environment`, plus per-record details. The three rounds produce:
-
-```
-poc/reports/
-├── round1_feasibility_<ts>.json       # VRAM, throughput, PPL, OfficeQA acc (dense + W4)
-├── round1_meaningful_query_filter_<ts>.json  # the cut list (itself a finding)
-├── round2_cache_delta_<ts>.json       # 3 backends × 6 metrics × 50 questions
-├── round2_two_oracle_<ts>.json        # Belady vs BeladyCompute gap
-├── round2_energy_<ts>.json            # measure_energy output per backend
-├── round3_doc_edit_envelope_<ts>.json # accuracy & repair cost vs edit distance
-├── round3_role_flip_envelope_<ts>.json
-├── round3_checkpoint_change_envelope_<ts>.json
-├── round3_permission_flip_envelope_<ts>.json
-├── round3_patchkv_comparison_<ts>.json
-└── poc_verdict_<ts>.json              # the final go/no-go with measured numbers
-```
-
-The `poc_verdict_<ts>.json` is the single document the production proposal's Stage 3 reads before going live. It contains:
-
-```json
-{
-  "verdict": "go" | "no_go" | "conditional_go",
-  "rounds": {
-    "round1": {"status": "pass" | "fail", "exit_criteria": [...]},
-    "round2": {"status": "pass" | "fail", "exit_criteria": [...]},
-    "round3": {"status": "pass" | "fail", "exit_criteria": [...]}
-  },
-  "measured_numbers": {
-    "dense_fp16_officeqa_accuracy": 0.XX,
-    "w4_officeqa_accuracy": 0.XX,
-    "w4_ppl_wikitext2": 9.XX,
-    "vllm_prefix_cache_throughput_tok_s": XX.X,
-    "linear_attn_state_cache_throughput_tok_s": XX.X,
-    "vllm_prefix_cache_vram_peak_gib": XX.X,
-    "linear_attn_state_cache_vram_peak_gib": XX.X,
-    "two_oracle_gap_pct": X.X,
-    "doc_edit_repair_vs_reprefill_ratio": XX.X,
-    "meaningful_query_filter_cut_list": {"model_capability": N, "world_knowledge": N, "low_information": N}
-  },
-  "literature_targets": {
-    "officeqa_pro_frontier_average": 0.341,
-    "officeqa_pro_layout_aware_gain": 0.161,
-    "contiguity_repair_ratio_range": [13, 21],
-    "boxoffice_metric_artifact_rate": 0.42,
-    "kvsharearena_rotation_recovery_range": [0.50, 0.66],
-    "lru_beats_sophisticated_count": 14
-  },
-  "open_questions_resolved": {
-    "linear_attn_state_better_than_full_attn_kv_at_officeqa_context": true | false,
-    "w4_preserves_enough_accuracy": true | false,
-    "a10g_24gib_is_enough": true | false
-  }
-}
-```
+| K3 rule | PoC implementation |
+|---|---|
+| Hash ≠ physical granularity | Content hash at boundary granularity (8 boundaries per session); physical storage at per-layer granularity (24 layers × 1 MiB) |
+| State checkpoints at sparse boundaries | Only at the 8 full-attention block boundaries, not at every token |
+| Atomic invalidation across cache groups | A hit is installed only if ALL linear-attention layers' states at the boundary are present and consistent; partial installs are refused |
+| Two-stage prefix matching | Stage 1: whole-boundary chained-hash match (the global cache). Stage 2: hash-endpoint fallback inside the first missing boundary (recompute the 3 linear-attention layers between the last hit boundary and the current position) |
+| Cache namespaces | `(model_checkpoint_id, quant_recipe_signature, context_class, corpus_version)` — cross-namespace reuse refused |
+| Edit-local repair | On a doc edit, restore the state at the boundary before the edit, recompute the 3 linear-attention layers between that boundary and the query (Contiguity finding: 13-21× cheaper than re-prefill) |
+| LRU eviction | Plain LRU per replica; no learned policies (14 sophisticated policies fail to beat LRU) |
+| Session-affinity scheduling | Consistent hashing to the replica that already holds the session's prefix |
 
 ---
 
-## 3. What works (the existing infrastructure's wins)
+## 2. The literature (focused)
 
-The PoC is built on top of infrastructure that already works. These are the measured wins from the repo's existing reports and the literature:
+Only the papers that directly shape the K3-style PoC. The OfficeQA Pro paper, the chunking taxonomy, and the enterprise RAG guides are dropped (no Databricks, no parser comparison, no corpus lane).
 
-| What works | Evidence | PoC reuse |
+| Paper | arXiv | What the PoC uses |
 |---|---|---|
-| **FLUTE idxN forward kernel at every width 1–4** | `docs/IDXN_UNIFICATION.md` §Performance: ~58.5 TFLOPS (93% peak A10G), uniform across widths. | Round 1's W4 model load + inference. |
-| **Two-stream training (W10)** | `docs/TWO_STREAM_ANALYSIS.md`: every recipe (palette ≤ 16 composite, palette > 16 two-stream) is trainable. | Round 3's checkpoint-change arm (re-palettization is a different recipe signature). |
-| **Greedy decode with CUDA graphs** | `reports/greedy_equivalence_idx4.json`: W23+ graphs path verified, 32 prompts × 512 tokens completed on both arms. | Round 1's 32-prompt sanity check; Round 2's no-cache arm. |
-| **OOM ladder on PPL** | `tests/test_eval_ppl_w22.py`: batch 4 → 2 → 1 halving on OOM, self-heals. | Round 1's PPL measurement on the W4 model at 8k context. |
-| **Strict energy measurement protocol** | `scripts/measure_energy.py`: NVML cumulative energy counter, idle baseline subtraction, per-run CIs (n=10), clock locking. | Round 2's energy measurement per backend. |
-| **Paired per-document probe** | `scripts/o1_baseline_check.py::paired_diff`: t-stat, p5/p95, n_improved/n_worsened. | Round 3's doc-edit repair paired measurement. |
-| **The 3:1 hybrid is native to Qwen3.5-9B** | `docs/MODEL_GEOMETRY.md` §1: 24 linear + 8 full, interval 4. | The cache asset (linear-attn state at the 8 boundaries) is a property of the model, not a tuning choice. |
-| **The fla wiring for linear-attention decode** | `scripts/modeling.py::_fla_resolve` (W29): `fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule` + `causal_conv1d.causal_conv1d_update`. | The cache asset's producer — the linear-attention state is what this wiring computes. |
-| **The sm_86 Triton flash attention** | `scripts/attn_sm86.py`: FA1-style online softmax, fp32 running m/l, GQA 4:1. | The 8 full-attention layers' KV — the secondary cache. |
-| **The VRAM ledger** | `scripts/vram_ledger.py`: every allocation recorded with its tier. | Extend with a `cache_pool` tier; the LRU evictor treats the ledger as authoritative. |
-| **The geometry audit gate** | `scripts/geometry_audit.py`: every doc/test/script that states a model dimension must reconcile with `MODEL_GEOMETRY.md` §1. | Cache-key components that name a layer are validated by this gate. |
-| **OfficeQA dataset on HuggingFace** | `databricks/officeqa`: CC-BY-SA-4.0, CSV, pandas-loadable. | Round 1's corpus load. |
-| **OfficeQA Pro's layout-aware parse finding** | arXiv:2603.08655: +16.1% relative accuracy from `ai_parse_document`. | Round 1's parser choice (docling as the CPU-side proxy). |
-| **LRU beats 14 sophisticated policies** | arXiv:2609.28870. | Round 2's eviction policy: plain LRU. |
-| **Edit-local repair is 13–21× cheaper** | arXiv:2609.17983. | Round 3's doc-edit repair policy. |
-| **The meaningful-query filter** | arXiv:2609.31415 (BoxOffice): 42% of F1 gains are metric artifacts. | Round 1's filter mandatory before any accuracy claim. |
+| **Kimi Linear** | [2510.26692](https://arxiv.org/abs/2510.26692) | The KDA mechanics: the fixed per-head recurrent state is the cache asset; the state is snapshot-able, paged, content-addressed. The 6× decode figure is at 1M context — the PoC measures at OfficeQA's 4k-16k context. |
+| **Kimi K3 §5.5** | [K3 platform docs](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart) + [Semianalysis](https://inferencex.semianalysis.com/model/kimi-k3) | The cache discipline: hash ≠ physical granularity, atomic invalidation, namespace admission, edit-local repair, session-affinity. The PoC's §1.5 standing rules are K3 §5.5 verbatim. |
+| **Contiguity** | [2609.17983](https://arxiv.org/abs/2609.17983) | Edit-local repair: 13-21× cheaper than re-prefill; recovers ≥0.94 of the post-edit answer margin. The PoC's doc-edit repair policy. |
+| **Prefix cache eviction** | [2609.28870](https://arxiv.org/abs/2609.28870) | LRU beats 14 sophisticated policies under agentic load; recency is unusually predictive. The PoC's eviction policy. The two-oracle diagnostic (Belady vs BeladyCompute) decides if anything beyond LRU is needed. |
+| **BoxOffice** | [2609.31415](https://arxiv.org/abs/2609.31415) | 42% of reported F1 gains from KV reuse are metric artifacts; F1 flips 0.98 ↔ 0.00 on staleness. The PoC's meaningful-query filter is mandatory before any accuracy claim. |
+| **KVShareArena** | [2609.10266](https://arxiv.org/abs/2609.10266) | Free position rotation recovers only 50-66% of the gap; unrepaired cross-context reuse worse than no cache. The PoC refuses cross-namespace reuse. |
+| **PatchKV** | [2609.26219](https://arxiv.org/html/2609.26219v1) | Transport-based KV recovery. The PoC's Round 3 comparison baseline for the doc-edit repair axis. |
 
 ---
 
-## 4. What doesn't work (the known risks and gaps)
+## 3. What works (the existing infrastructure)
 
-The PoC is honest about what doesn't work yet. These are the measured gaps and the open risks:
+The PoC is built on top of infrastructure that already works. Every component is a file in `qwen3_5_9B_flute_qlora_v1.3`:
 
-| What doesn't work | Evidence | PoC mitigation |
+| Component | File | PoC role |
 |---|---|---|
-| **Quant decode throughput is 0.571× dense** (quant is SLOWER) | `reports/greedy_equivalence_idx4.json` (2026-10-08): 13.514 tok/s quant vs 23.653 tok/s dense. Acceptance bar was ≥2× FASTER. | The PoC's Round 2 measures whether the linear-attention state cache *changes this*. The hypothesis: at OfficeQA's context lengths (4k–16k), the linear-attention state's reinstall cost (576 KiB transfer) may be cheaper than the full-attention KV's re-prefill, flipping the throughput ratio. **This is the PoC's central measurement.** |
-| **The GEMV kernel runs at 5–6.5× below the A10G's bandwidth wall** | `docs/A10G_DECODE_INVESTIGATION.md` §0: ~90–110 GB/s effective vs 600 GB/s streaming. The grid is `N/128` CTAs with no K-split; only `gate/up_proj` (96 CTAs) and `lm_head` (1940 CTAs) fill the machine. | Out of scope for the PoC. The PoC measures the cache engineering delta *on top of* the existing kernel. If the GEMV kernel is the binding constraint, the PoC documents it; the kernel fix is a separate workstream (in `flute_extended/src/kernel_cutlass_streaming.cu`). |
-| **`lm_head` runs the slowest path** (not in the GEMV nor DUAL pair tables) | `docs/A10G_DECODE_INVESTIGATION.md`: the (4,4) pair + rank-32 residual is in NEITHER table; the single biggest module (~25% of all traffic) runs the slow path. | Out of scope for the PoC. Same as above. |
-| **The palettizer OOMs at `--calib-seqs 64 --calib-seq-len 2048`** | `scripts/HANDOVER.issue-2026-10-04.md`: `expandable_segments: memory mapping failed with OOM` repeatedly. | Pre-PoC: re-palettize with `--calib-seqs 32 --calib-seq-len 1024 --mem-temp-mb 64 --oom-retries 5` (the existing knobs, tuned down). |
-| **The repo's existing greedy match shows exact_match 0.0** at ~2.31 bits/weight | `reports/greedy_equivalence_idx4.json`: exact_match 0.0, first_divergence mean 13.78. | This is EXPECTED at ~2.3 bits/weight. The PoC's W4 model uses `--recipe auto --auto-cos 0.9995` which lands at ~4 bits/weight average (not 2.31) — the greedy match should be substantially better. Round 1 measures this. |
-| **OfficeQA Pro's frontier average is 34.1%** (over half of questions fail) | arXiv:2603.08655. | The PoC's Qwen3.5-9B W4 is expected to score *below* 34.1% — it is a 9B model, not a frontier model. The PoC reports the measured number against this baseline; it does not target 34.1%. |
-| **The BoxOffice paper shows 42% of F1 gains are metric artifacts** | arXiv:2609.31415. | The PoC's meaningful-query filter (Round 1) is the mitigation. Without the filter, the cache delta measurement is unfalsifiable. |
-| **The Contiguity paper shows edit-local repair fails when the answer moves downstream** | arXiv:2609.17983. | Round 3's doc-edit envelope reports the *distribution* of repair effectiveness, not just the mean. The long tail is expected and documented. |
-| **`ai_parse_document` requires a Databricks workspace** | Databricks docs: it is a SQL function. | The PoC uses docling (CPU-side) as the proxy. The +16.1% finding is the *measured ceiling* on `ai_parse_document`; the PoC targets at least half of it (8% relative) on the proxy parser. |
-| **OfficeQA's corpus is single-tenant** (no ACL complexity) | The dataset is a public benchmark. | The PoC's permission-flip axis (Round 3) is *synthetic* — it adds a query-time filter that excludes one document. This tests the structural invariant (permission flip is a query variable, not a cache mutation), not the production system's ACL enforcement chain. |
-| **The linear-attention state's advantage at sub-1M context is unmeasured** | The Kimi Linear paper measures the 6× decode speedup at 1M context. | **The PoC's central open question.** Round 2 measures the delta at OfficeQA's context lengths (4k–16k). If the advantage is small, the production proposal's serving lane is reconsidered for this workload. |
+| **FLUTE idxN forward kernel** | `flute_extended/src/kernel_cutlass_streaming.cu` (`flute_kernel_streaming_fd_sub4<Cfg, B>`) | The dequant+GEMM hot path for every linear layer. ~58.5 TFLOPS (93% peak A10G). |
+| **FLUTE idxN backward kernel** | `flute_train_kernels/src/kernel_lut_grad.cu` (`lut_grad_scatter_sub4_kernel`) | The dL/dLUT scatter. Makes W4 trainable on A10G without OOM (the (N,K) dW transient never touches DRAM). |
+| **Two-stream training (W10)** | `scripts/qlora_gemm.py::FusedQLoRAGEMMTrainLUTTwoStreams` | The fine-tune's autograd Function for palette > 16 (e.g., hybrid422). |
+| **The QLoRA wrapper** | `scripts/qlora.py::attach_qlora` + `QLoRAConfig` | Wraps the palettized model with trainable LUT masters. |
+| **The trainer** | `scripts/trainer.py` | The layerwise distillation trainer (two-layer residency — fits on A10G). |
+| **The Muon optimizer** | `scripts/muon_optimizer.py` | The optimizer for the LoRA branch. |
+| **The fla wiring** | `scripts/modeling.py::_fla_resolve` (W29) + `Qwen3_5GatedDeltaNet.forward` | The linear-attention state mechanics: `fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule` at decode, `torch_chunk_gated_delta_rule` at prefill. The recurrent state IS the cache asset. |
+| **The sm86 flash attention** | `scripts/attn_sm86.py` | The 8 full-attention layers' KV (the secondary cache). |
+| **The palettizer** | `scripts/palettize_qwen3_5_9b.py` | `--recipe auto --auto-cos 0.9995` produces the W4+r32 artifacts + the `auto_decision` ledger. |
+| **The palettized module** | `scripts/palettized_modules.py::PalettizedLinear` | The runtime module: kernel path on CUDA, reference path on CPU. |
+| **The model loader** | `scripts/eval_common.py::load_quant_model` | Loads the W4+r32 model with all the AWQ compensation, norm-gain edits, heads-dir handling. |
+| **Greedy decode with KV cache** | `scripts/eval_greedy_match.py::greedy_decode` + `greedy_decode_dispatch` | KV-cache greedy decode with CUDA graphs. |
+| **The energy harness** | `scripts/measure_energy.py::EnergyMeasurement` | NVML energy, throughput, VRAM, idle baseline subtraction, clock locking. |
+| **The paired probe** | `scripts/o1_baseline_check.py::score_docs` + `paired_diff` | Paired per-document measurement (for the fine-tune's accuracy recovery). |
+| **The VRAM ledger** | `scripts/vram_ledger.py` | Every allocation recorded. Extended with a `cache_pool` tier. |
+| **The kernel parity suite** | `tests/test_kernel_status.py`, `tests/test_lut_gradients.py`, `tests/test_two_stream_training.py`, `tests/test_attn_kernel.py` | The CI precondition for any cache work. |
+| **The existing artifacts** | `/home/ubuntu/qwen3_5_9B_palettized` + `_heads` (from the handover) | Round 1 starts immediately — no re-palettization needed if the existing recipe signature is accepted. |
+
+---
+
+## 4. What's added (the new code)
+
+Four scripts under `poc/` in the new repo. Each is small (<300 lines), CPU-tested first, built on top of the existing eval plane.
+
+### 4.1 `poc/state_cache.py` — the per-session state cache
+
+```python
+# poc/state_cache.py
+"""The per-session linear-attention state cache. Snapshots the recurrent
+state + conv1d state at each of the 8 full-attention block boundaries.
+On a hit: restore the state, skip the linear-attention forward, continue."""
+
+import torch
+import hashlib
+from dataclasses import dataclass
+from typing import Optional, Dict, List
+
+# The 8 full-attention layers (every 4th, 0-indexed)
+BOUNDARY_LAYERS = [3, 7, 11, 15, 19, 23, 27, 31]
+# The linear-attention layers (the other 24)
+LINEAR_LAYERS = [i for i in range(32) if i not in BOUNDARY_LAYERS]
+
+@dataclass
+class StateSnapshot:
+    namespace: tuple           # (checkpoint, recipe, context_class, corpus_version)
+    boundary_idx: int          # 0..7
+    content_hash: str          # SHA-256 of the concatenated state tensors
+    recurrent_states: Dict[int, torch.Tensor]  # {layer_idx: (32, 128, 128) fp16 on CPU}
+    conv_states: Dict[int, torch.Tensor]       # {layer_idx: (8192, 4) fp16 on CPU}
+    size_bytes: int
+
+class PerSessionStateCache:
+    def __init__(self, max_entries: int = 64):
+        self._lru: List[StateSnapshot] = []  # most-recent at end
+        self._index: Dict[tuple, StateSnapshot] = {}  # (boundary_idx, content_hash) → snapshot
+        self._max = max_entries
+
+    def snapshot(self, model, cache_params, namespace, boundary_idx) -> StateSnapshot:
+        """Snapshot all linear-attention layers' states up to boundary_idx.
+        Copies to CPU, hashes, stores in the LRU pool."""
+        recurrent = {}
+        conv = {}
+        for layer_idx in LINEAR_LAYERS:
+            if layer_idx < BOUNDARY_LAYERS[boundary_idx]:
+                recurrent[layer_idx] = cache_params.layers[layer_idx].recurrent_states[0].cpu().clone()
+                conv[layer_idx] = cache_params.layers[layer_idx].conv_states[0].cpu().clone()
+        # content hash
+        hasher = hashlib.sha256()
+        for idx in sorted(recurrent.keys()):
+            hasher.update(recurrent[idx].numpy().tobytes())
+            hasher.update(conv[idx].numpy().tobytes())
+        content_hash = hasher.hexdigest()
+        snap = StateSnapshot(namespace, boundary_idx, content_hash,
+                             recurrent, conv, sum(t.nelement()*2 for t in recurrent.values()) + sum(t.nelement()*2 for t in conv.values()))
+        self._install(snap)
+        return snap
+
+    def lookup(self, namespace, boundary_idx, content_hash) -> Optional[StateSnapshot]:
+        key = (boundary_idx, content_hash)
+        snap = self._index.get(key)
+        if snap and snap.namespace == namespace:
+            self._touch(snap)
+            return snap
+        return None
+
+    def restore(self, model, cache_params, snapshot: StateSnapshot):
+        """Copy the snapshot's states back to the GPU cache_params."""
+        for layer_idx, state in snapshot.recurrent_states.items():
+            cache_params.layers[layer_idx].recurrent_states[0].copy_(state.to(cache_params.layers[layer_idx].recurrent_states[0].device))
+        for layer_idx, state in snapshot.conv_states.items():
+            cache_params.layers[layer_idx].conv_states[0].copy_(state.to(cache_params.layers[layer_idx].conv_states[0].device))
+
+    def _install(self, snap): ...
+    def _touch(self, snap): ...
+```
+
+### 4.2 `poc/global_cache.py` — the cross-session global cache
+
+```python
+# poc/global_cache.py
+"""The global cross-session state cache. Content-addressed, namespace-keyed,
+LRU-evicted. Sessions with identical prefixes share state."""
+
+class GlobalStateCache:
+    def __init__(self, max_pool_bytes: int = 10 * 1024**3):  # 10 GiB default
+        self._pool: Dict[tuple, StateSnapshot] = {}  # (namespace, boundary_idx, content_hash) → snapshot
+        self._lru: List[tuple] = []
+        self._max_bytes = max_pool_bytes
+        self._current_bytes = 0
+
+    def install(self, snapshot: StateSnapshot) -> bool:
+        """Store a snapshot. Deduplicates by content hash.
+        Returns True if new, False if already present."""
+        key = (snapshot.namespace, snapshot.boundary_idx, snapshot.content_hash)
+        if key in self._pool:
+            self._touch(key)
+            return False
+        # evict if over capacity
+        while self._current_bytes + snapshot.size_bytes > self._max_bytes and self._lru:
+            self._evict_oldest()
+        self._pool[key] = snapshot
+        self._lru.append(key)
+        self._current_bytes += snapshot.size_bytes
+        return True
+
+    def lookup(self, namespace, boundary_idx, content_hash) -> Optional[StateSnapshot]:
+        key = (namespace, boundary_idx, content_hash)
+        snap = self._pool.get(key)
+        if snap:
+            self._touch(key)
+        return snap
+```
+
+### 4.3 `poc/finetune.py` — the W10 LUT fine-tune on OfficeQA
+
+```python
+# poc/finetune.py
+"""Fine-tune the LUT model on OfficeQA Q&A pairs. Uses the existing W10
+two-stream training path (scripts/qlora_gemm.py::FusedQLoRAGEMMTrainLUTTwoStreams)
++ the layerwise trainer (scripts/trainer.py)."""
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "qwen3_5_9B_flute_qlora_v1.3", "scripts"))
+
+from qlora import attach_qlora, QLoRAConfig
+from eval_common import load_quant_model, release_model_memory
+
+def finetune_on_officeqa(
+    artifacts_dir: str,
+    heads_dir: str,
+    output_dir: str,
+    hf_dataset: str = "databricks/officeqa",
+    n_samples: int = 200,
+    r: int = 64,
+    alpha: int = 16,
+    lr_lut: float = 1e-4,
+    lr_lora: float = 2e-4,
+    n_steps: int = 500,
+    device: str = "cuda:0",
+):
+    """1. Load the W4+r32 LUT model.
+    2. Attach QLoRA (trainable LUT masters + LoRA A/B).
+    3. Load OfficeQA Q&A pairs as SFT examples.
+    4. Run the layerwise trainer (two-layer residency — fits on A10G).
+    5. Export the fine-tuned LUTs + the recipe signature (SHA-256 of the
+       updated metadata.json auto_decision ledger — the new namespace).
+    6. The fine-tuned model is a different checkpoint_id → different cache
+       namespace (KVShareArena: refuse cross-checkpoint reuse)."""
+    model, metadata = load_quant_model(
+        artifacts_dir, "Qwen/Qwen3.5-9B", device,
+        residual=True, forward="kernel", heads_dir=heads_dir)
+    config = QLoRAConfig(r=r, alpha=alpha, scope="all",
+                         base_model="Qwen/Qwen3.5-9B", artifacts_dir=artifacts_dir)
+    attach_qlora(model, metadata, **config.__dict__)
+    # ... load OfficeQA SFT data, run trainer.py's layerwise loop, export
+```
+
+### 4.4 `poc/run_poc.py` — the orchestrator
+
+```python
+# poc/run_poc.py
+"""Run the K3-style cache-engineering PoC on OfficeQA on A10G.
+Four phases: env, fine-tune, cache measurement, staleness envelope."""
+
+def main():
+    # P0: env + kernel parity
+    # P1: fine-tune the LUT model on OfficeQA
+    # P2: measure (no-cache vs per-session vs per-session+global)
+    # P3: staleness envelope (doc-edit, checkpoint-change, role-flip)
+    # P4: verdict
+    ...
+```
 
 ---
 
 ## 5. The build path
 
-Five phases, strictly sequential, each with exit criteria. Total: 6 weeks of box time on one A10G.
+Five phases, strictly sequential. Total: 5 weeks of box time on one A10G.
 
 | Phase | Builds | Box time | Exit criteria |
 |---|---|---|---|
-| **P0. Environment + kernel parity** | Confirm A10G is on the GPU contract allowlist. Run `scripts/doctor.py`. Build the FLUTE idxN wheels (`pip install -e flute_extended/ flute_train_kernels/`). Run the kernel parity suite (the 6 test files). Re-palettize Qwen3.5-9B with A10G-tuned knobs. Record the `auto_decision` ledger; SHA-256 it. | 3 days | Kernel parity suite green on the box; palettization complete; recipe signature recorded. |
-| **P1. Round 1 — Feasibility floor** | `poc/officeqa_loader.py`. Dense FP16 baseline. W4+r32 baseline. OfficeQA accuracy on both. Meaningful-query filter. | 1 week | Round 1 exit criteria (§2.2.3). |
-| **P2. Round 2 — Cache-engineering delta** | `poc/cache_engine.py`. Three cache backends. Two-oracle diagnostic. Energy harness. | 2 weeks | Round 2 exit criteria (§2.2.3). |
-| **P3. Round 3 — Staleness envelope** | Four envelope axes. PatchKV comparison. | 2 weeks | Round 3 exit criteria (§2.2.3). |
-| **P4. PoC verdict + report** | `poc_verdict_<ts>.json`. The single document the production proposal reads. | 3 days | The verdict is `go`, `no_go`, or `conditional_go` with measured numbers for every claim. |
+| **P0. Environment + kernel parity** | Confirm A10G on the allowlist. Build FLUTE idxN wheels. Run the kernel parity suite (6 test files). Confirm the existing `/home/ubuntu/qwen3_5_9B_palettized` artifacts load. Record the `auto_decision` ledger; SHA-256 it as the `quant_recipe_signature`. | 3 days | Kernel parity green; LUT model loads and generates; the 32-prompt sanity check matches the existing `reports/greedy_equivalence_idx4.json` numbers (within tolerance). |
+| **P1. Fine-tune the LUT model** | `poc/finetune.py`. Load OfficeQA. Attach QLoRA. Run the layerwise trainer (500 steps). Export the fine-tuned LUTs. Measure: PPL on WikiText-2 (target: < 9.5749, the pre-fine-tune figure), OfficeQA accuracy on 50 questions (target: > pre-fine-tune accuracy — the fine-tune recovers the quantization gap). | 1 week | Fine-tuned model exported; new `quant_recipe_signature` recorded (a different namespace); PPL and OfficeQA accuracy measured before and after. |
+| **P2. Cache measurement** | `poc/state_cache.py` + `poc/global_cache.py`. Run 50 OfficeQA questions through three cache configurations: (a) no cache, (b) per-session state cache only, (c) per-session + global cache. Measure: accuracy, throughput (tok/s), TTFT, ITL, VRAM, cache hit rate per boundary. Run the two-oracle diagnostic. | 1.5 weeks | The delta between (a), (b), (c) measured. The global cache's hit rate at boundary 1 (shared system prompt) measured. The two-oracle gap documented (if <5%, plain LRU is the policy). |
+| **P3. Staleness envelope** | Three axes: (1) doc-edit — replace one chunk in the corpus block, measure repair cost (edit-local vs re-prefill vs PatchKV); (2) checkpoint-change — the pre-fine-tune vs post-fine-tune models are different namespaces; refuse cross-checkpoint reuse, measure the cost; (3) role-flip — change the system prompt, measure the namespace switch cost. | 1 week | Envelope curves on 3 axes. The edit-local repair ratio measured (target: 13-21× per the Contiguity paper). The cross-checkpoint refusal verified. |
+| **P4. Verdict** | `poc/reports/poc_verdict_<ts>.json`. The single document with all measured numbers. | 3 days | The verdict is `go`, `no_go`, or `conditional_go` with measured numbers for every claim. |
 
-**Rollback.** If Phase P1 fails (the W4 model does not fit, or the OfficeQA accuracy is catastrophically low), the PoC stops. The production proposal is revised before any Databricks work. If Phase P2 fails (the linear-attention state cache does not beat vLLM prefix cache), the PoC continues to Phase P3 to document the failure mode, but the production proposal's serving lane is reconsidered.
+**Rollback.** If P1 fails (the fine-tune does not recover accuracy, or the trainer OOMs), the PoC uses the pre-fine-tune model for P2-P3. The fine-tune is an enhancement, not a blocker. If P2 fails (the per-session + global cache does not beat no-cache on throughput), the PoC continues to P3 to document the failure mode.
 
 ---
 
@@ -507,36 +452,33 @@ Five phases, strictly sequential, each with exit criteria. Total: 6 weeks of box
 
 | # | Decision | Rejected alternative | Why |
 |---|---|---|---|
-| PoC-1 | Use `databricks/officeqa` (v1) as the corpus | `officeqa-pro-v2` (90 questions, 120k pages) | v1 is larger, CC-BY-SA-4.0, CSV-shaped, and closest to the repo's existing eval infrastructure. v2's agent harness is out of scope for a 6-week PoC. |
-| PoC-2 | Use **docling** as the `ai_parse_document` proxy | marker, unstructured | OfficeQA's corpus is table-heavy (L-5); docling's table-extraction quality is the binding constraint. The +16.1% finding is the ceiling; the PoC targets at least half (8% relative). |
-| PoC-3 | Use **structure-based chunking** only | Semantic, LLM-guided, late chunking | The chunking taxonomy (arXiv:2602.16974) shows structure-based wins corpus-wide; LLM-guided pays only for intra-document tasks; late chunking hurts needle queries. |
-| PoC-4 | Use **BAAI/bge-m3** as the embedder | OpenAI text-embedding-3-large, Cohere embed-v3 | Multilingual (OfficeQA is English but the Treasury Bulletins have non-ASCII artifacts), 8K context (fits the chunker's output), Apache 2.0 (no API key needed on the A10G box). |
-| PoC-5 | Measure **three** cache backends, not two | Measure only no-cache vs linear-attn state cache | The vLLM prefix cache is the *industry standard*; measuring only the proposal's cache against no-cache is unfalsifiable. The delta against vLLM prefix cache is the PoC's central measurement. |
-| PoC-6 | Use **plain LRU** eviction | Learned, frequency-based, analytic | arXiv:2609.28870: 14 sophisticated policies fail to beat LRU under agentic load. The PoC validates this on the OfficeQA workload. |
-| PoC-7 | Apply the **meaningful-query filter** before any accuracy claim | Report raw accuracy | arXiv:2609.31415 (BoxOffice): 42% of F1 gains are metric artifacts. Without the filter, the cache delta measurement is unfalsifiable. |
-| PoC-8 | Report **envelope curves**, not point estimates | Report mean accuracy | arXiv:2609.31415: F1 flips between 0.98 and 0.00 depending on staleness. A point estimate hides this; the envelope curve is the unit of measurement. |
-| PoC-9 | Use the **edit-local contiguous repair** policy | Importance-based, attention-based, KV-deviation-based, structural selectors | arXiv:2609.17983 (Contiguity): edit-local recovers ≥0.94 of the post-edit answer margin at 13–21× below re-prefill. The PoC validates this on OfficeQA. |
-| PoC-10 | Measure the **PatchKV comparison** on the doc-edit axis | Measure only edit-local vs re-prefill | arXiv:2609.26219 (PatchKV): transport-based recovery may beat edit-local. If it does, the production proposal's edit-local rule is reconsidered. |
-| PoC-11 | Run the **two-oracle diagnostic** before building anything beyond LRU | Build compute-aware eviction by default | arXiv:2609.28870: if the Belady vs BeladyCompute gap is small, compute-aware eviction does not pay. The PoC measures the gap; if <5%, plain LRU ships. |
-| PoC-12 | Use the **W4+r32 recipe** as the baseline quantization | W2 base, hybrid422 | The repo's existing artifacts are W4+r32 (`reports/greedy_equivalence_idx4.json`); the +3.52% PPL is the measured baseline. W2 and hybrid422 are Round 3's checkpoint-change axis (re-palettization with a different recipe). |
-| PoC-13 | Measure on **one A10G**, not multiple GPUs | Multi-GPU sharding | The production proposal's serving lane targets A10G-class hardware (per the handover log). Multi-GPU is a production concern, not a PoC concern. |
-| PoC-14 | The PoC's permission-flip axis is **synthetic** | Real ACL enforcement | OfficeQA's corpus is single-tenant. The PoC tests the structural invariant (permission flip is a query variable, not a cache mutation), not the production system's ACL enforcement chain. The four-layer enforcement chain is a production concern. |
+| K3-1 | **LUT model only** (FLUTE idxN W4+r32 Qwen3.5-9B) | Dense FP16/bf16 baseline; multi-model comparison | User directive. The PoC is about the LUT model's cache engineering, not about quantization vs dense. |
+| K3-2 | **No Databricks, no SharePoint, no ai_parse_document** | The production proposal's four-lane architecture | User directive. This is a single-machine PoC. |
+| K3-3 | **Per-session linear-attention state cache** (25.5 MiB per session, 8 boundaries) | Full-attention KV cache only (the vLLM standard) | The linear-attention state is fixed-size (does not grow with context), NoPE (re-installable at any position), and is the K3 cache asset. The full-attention KV grows with context and is the working-set, not the cache asset. |
+| K3-4 | **Global cross-session state cache** (content-addressed, namespace-keyed, LRU) | Per-session cache only | The global cache enables cross-session reuse at the shared-prefix boundaries (system prompt, policy block). Without it, every session re-computes the same state from scratch. This is the K3 cross-session paged pool. |
+| K3-5 | **Fine-tune the LUTs on OfficeQA** (W10 two-stream, layerwise trainer) | Use the pre-fine-tune W4 model as-is | The existing W4 model has +3.52% PPL on WikiText-2 and exact_match 0.0 on the greedy match. The fine-tune recovers task-specific accuracy, making the cache engineering meaningful (if accuracy is too low, cache hit rate is irrelevant). |
+| K3-6 | **K3-style cache-aware fine-tune** (optional: train with state snapshot/restore in the loop) | Standard QLoRA only | K3 was trained with the cache mechanics in mind. Our LUT model was not. The cache-aware fine-tune adapts the model to produce state that survives re-installation. This is the PoC's research bet; the standard fine-tune is the fallback. |
+| K3-7 | **Content-addressed state hashing** (SHA-256 of the concatenated state tensors) | Position-based addressing | The state's content, not its position, determines reusability. Two sessions with the same prefix produce the same state. Content addressing enables cross-session deduplication. |
+| K3-8 | **Namespace-keyed admission** (refuse cross-namespace reuse) | Free rotation, cross-checkpoint reuse | KVShareArena: free rotation recovers only 50-66% of the gap; unrepaired reuse worse than no cache. The fine-tuned model is a different namespace; refuse cross-checkpoint reuse. |
+| K3-9 | **Plain LRU eviction** | Learned, frequency-based, analytic policies | The prefix-cache eviction paper: 14 sophisticated policies fail to beat LRU under agentic load. Run the two-oracle diagnostic first; if the gap is <5%, ship LRU. |
+| K3-10 | **Edit-local contiguous repair** on doc-edit | Full re-prefill; importance-based repair; PatchKV transport-based | Contiguity: edit-local recovers ≥0.94 of the answer margin at 13-21× below re-prefill. PatchKV is the comparison baseline (P3 measures both). |
+| K3-11 | **OfficeQA as the workload** | WikiText-2 PPL only; synthetic prompts | OfficeQA has gold answers (measurable accuracy), real enterprise documents (Treasury Bulletins — dense tables, the "not in the best state" condition), and is CC-BY-SA-4.0 (no license friction). WikiText-2 PPL is a sanity check (target: < 9.5749), not the primary metric. |
+| K3-12 | **50 questions, meaningful-query filtered** | All questions; raw accuracy | BoxOffice: 42% of F1 gains are metric artifacts. The meaningful-query filter removes questions the cache-free run fails anyway (model capability, not cache), questions answerable without context (world knowledge), and low-information yes/no questions. The filter's cut list is itself a finding. |
 
 ---
 
 ## 7. Risks and standing controls
 
-| Risk | Evidence it is real | Standing control |
+| Risk | Evidence | Standing control |
 |---|---|---|
-| The W4 model OOMs at OfficeQA's context length | `docs/A10G_DECODE_INVESTIGATION.md`: quant VRAM peak 20.19 GiB at the repo's existing workload; OfficeQA's context may push higher. | Round 1 measures VRAM at 4k, 8k, 16k context before any cache work. If 8k OOMs, the PoC drops to 4k and documents the constraint. |
-| The linear-attention state cache does not beat vLLM prefix cache | The Kimi Linear paper's 6× figure is measured at 1M context, not at OfficeQA's 4k–16k. | Round 2 measures the delta directly. If the linear-attn state cache is *not* meaningfully better, the PoC documents it; the production proposal's serving lane is reconsidered for this workload. |
-| The GEMV kernel's 5–6.5× below-bandwidth performance caps the throughput | `docs/A10G_DECODE_INVESTIGATION.md` §0. | Out of scope for the PoC. The PoC measures the cache delta *on top of* the existing kernel. The kernel fix is a separate workstream. |
-| The meaningful-query filter removes too many questions | arXiv:2609.31415: the filter is mandatory but its cut rate is workload-dependent. | Round 1 records the cut list. If >50% of questions are cut, the PoC expands to 100 questions to retain statistical power. |
-| OfficeQA's accuracy is too low to measure cache delta | arXiv:2603.08655: frontier agents average 34.1%; Qwen3.5-9B W4 is expected to be lower. | The PoC's accuracy measurement is on the *filtered* set (the meaningful-query filter removes questions the cache-free run fails anyway). The cache delta is measured on the questions where the cache can plausibly matter. |
-| The palettizer OOMs again | `scripts/HANDOVER.issue-2026-10-04.md`. | Pre-PoC re-palettization with `--calib-seqs 32 --calib-seq-len 1024 --mem-temp-mb 64 --oom-retries 5`. If this OOMs, the PoC uses the existing `/home/ubuntu/qwen3_5_9B_palettized` artifacts (the handover's产物). |
-| The fla wiring is not active at decode time | `scripts/modeling.py::_fla_resolve` (W29): the wiring settles during the pre-capture warmup. | Round 1's sanity check (the 32 deterministic prompts) validates the wiring is active. If the W4 model's throughput is below 10 tok/s, the fla wiring is suspected; `FLUTE_NO_FLA=1` restores the pure-torch fallback for differential diagnosis. |
-| The two-oracle diagnostic is too expensive to run | arXiv:2609.28870: the oracles are offline, computed on a trace sample. | Round 2 samples 1000 requests from the Round 2 trace; the diagnostic runs on the sample, not the full trace. |
-| The PoC's 6-week timeline is too short | The repo's existing palettization took 6.7 hours for the heads pass alone. | The PoC uses the existing artifacts (re-palettization only if Round 3's checkpoint-change axis requires it). The 6 weeks are: P0 (3 days), P1 (1 week), P2 (2 weeks), P3 (2 weeks), P4 (3 days). |
+| **The per-session state cache (25.5 MiB) is too large to be a "paged object"** | v1 claimed 576 KiB; the corrected number is 25.5 MiB — 44× larger. At 530 concurrent sessions per replica, the cache pool is full. | P2 measures the actual hit rate at each boundary. If boundary 1 (the shared system prompt) has a high global-cache hit rate, the effective per-session cost is much lower (the shared state is stored once in the global pool, not per-session). The 25.5 MiB is the worst case; the global cache is the mitigation. |
+| **The linear-attention state's advantage at 4k-16k context is unmeasured** | Kimi Linear's 6× decode speedup is at 1M context. At OfficeQA's context, the full-attention KV (which grows with context) may still be cheaper than the linear-attention state (which is fixed). | P2 measures the delta directly. If the linear-attention state cache does not beat no-cache, the PoC documents it. The K3 thesis may hold only at long context. |
+| **The fine-tune OOMs on A10G** | The handover log records OOMs in the palettizer; the trainer's two-layer residency is designed to avoid this, but it's untested on OfficeQA. | P1 uses the existing `scripts/trainer.py` with the two-layer residency (one teacher + one student layer resident at a time — the full model is never built). If the trainer OOMs, reduce `n_samples` to 100 and `seq_len` to 1024. |
+| **The global cache's hit rate at boundary 1 is low** | The system prompt is the same for all sessions in a context class, but if the context class changes frequently (different system prompts), the global cache misses. | P2 measures the hit rate per boundary. If boundary 1's hit rate is <80%, the global cache's value is limited to deeper boundaries (which have lower hit rates by construction). |
+| **The content hash computation is too expensive** | SHA-256 of 25.5 MiB per snapshot, per boundary, per session. | The hash is computed on the CPU after the GPU→CPU copy (which is the dominant cost anyway). The hash itself is ~1 ms for 25 MiB on modern CPUs. The GPU→CPU copy (~25 MiB at 12 GB/s PCIe) is ~2 ms. Total snapshot overhead: ~3 ms per boundary. |
+| **The state restore produces different outputs than re-computation** | The recurrent state is fp16; the fla kernel accumulates in fp32 internally but stores fp16. Restoring fp16 state and continuing may introduce drift. | P2 validates: run the same prompt with (a) no cache (full re-computation) and (b) state cache (snapshot + restore), compare token-by-token. If the outputs diverge, the cache is lossy — document the divergence rate. |
+| **The fla wiring is not active at decode time** | `scripts/modeling.py::_fla_resolve` (W29) settles during the pre-capture warmup. | P0's sanity check (the 32 deterministic prompts) validates the wiring. If throughput is below 10 tok/s, `FLUTE_NO_FLA=1` restores the pure-torch fallback for differential diagnosis. |
+| **The GEMV kernel caps throughput at 5-6.5× below the bandwidth wall** | `docs/A10G_DECODE_INVESTIGATION.md`: the decode-GEMV is the binding constraint, not the cache. | Out of scope. The PoC measures the cache delta *on top of* the existing kernel. If the GEMV is the bottleneck, the cache engineering's throughput improvement is masked — the PoC documents this and notes that the GEMV fix (in `flute_extended/src/kernel_cutlass_streaming.cu`) is a prerequisite for the throughput claim. |
 
 ---
 
@@ -544,140 +486,115 @@ Five phases, strictly sequential, each with exit criteria. Total: 6 weeks of box
 
 | PoC element | Source |
 |---|---|
-| OfficeQA dataset | [databricks/officeqa on HuggingFace](https://huggingface.co/datasets/databricks/officeqa) (CC-BY-SA-4.0, CSV) |
-| OfficeQA Pro's +16.1% layout-aware parse finding | [arXiv:2603.08655](https://arxiv.org/abs/2603.08655) (Opsahl-Ong et al., Databricks, 9 Mar 2026) |
-| OfficeQA Pro's 34.1% frontier average | same paper |
-| BoxOffice's 42% metric artifact rate | [arXiv:2609.31415](https://arxiv.org/abs/2609.31415) (the KV-cache reuse accuracy evaluation paper) |
-| BoxOffice's F1 0.98 ↔ 0.00 flip | same paper |
-| KVShareArena's 50–66% rotation recovery | [arXiv:2609.10266](https://arxiv.org/abs/2609.10266) |
-| Contiguity's 13–21× repair ratio | [arXiv:2609.17983](https://arxiv.org/abs/2609.17983) (Mao, Mackey, Lin, 16 Sep 2026) |
-| Contiguity's 0.94 answer margin recovery | same paper |
-| LRU beats 14 sophisticated policies | [arXiv:2609.28870](https://arxiv.org/abs/2609.28870) (Liu, Yu, Yang, 24 Sep 2026, revised 1 Oct 2026) |
-| The two-oracle diagnostic (Belady, BeladyCompute) | same paper |
-| Chunking taxonomy (structure-based wins corpus-wide) | [arXiv:2602.16974](https://arxiv.org/abs/2602.16974) (February 2026) |
-| Chunking taxonomy (document order preserves prefixes) | same paper |
-| Speculative KV cache reuse (2.17–3.95× TTFT) | [ACL 2026](https://aclanthology.org/2026.acl-long.859) |
-| RelayCaching (decoding-phase KV reuse) | [ICML 2026](https://icml.cc/virtual/2026/poster/66638) |
-| PatchKV (transport-based recovery) | [arXiv:2609.26219](https://arxiv.org/html/2609.26219v1) |
-| Hybrid attention on NPUs (Qwen3.5, Kimi) | [arXiv:2609.32114](https://arxiv.org/html/2609.32114v1) |
-| Kimi Linear (KDA, 6× decode at 1M context) | [arXiv:2510.26692](https://arxiv.org/abs/2510.26692) |
-| Kimi K3 (3:1 KDA-to-MLA, NoPE blocks) | Kimi K3 platform docs + [Semianalysis](https://inferencex.semianalysis.com/model/kimi-k3) |
-| Qwen3.5's 3:1 hybrid is native | `docs/MODEL_GEOMETRY.md` §1 (`layer_types`, `full_attention_interval`, `linear_*` fields) |
-| The 576 KiB linear-attention state per session | `docs/MODEL_GEOMETRY.md` §1 arithmetic (16×128 + 32×128 × 3 × 8 × 2 fp16) |
-| The FLUTE idxN forward kernel | `flute_extended/src/kernel_cutlass_streaming.cu` |
-| The FLUTE idxN backward kernel | `flute_train_kernels/src/kernel_lut_grad.cu` |
-| The FHT rotation kernel | `flute_extended/src/kernel_fht.cu` |
-| The sm_86 Triton flash attention | `scripts/attn_sm86.py` |
-| The fla wiring for linear-attention decode | `scripts/modeling.py::_fla_resolve` (W29) |
-| The dense model loader | `scripts/eval_common.py::load_dense_fp16` |
-| The palettized model loader | `scripts/eval_common.py::load_quant_model` |
-| The greedy decode with KV cache | `scripts/eval_greedy_match.py::greedy_decode` |
-| The CUDA-graph decode | `scripts/eval_greedy_match.py::greedy_decode_dispatch` |
-| The WikiText-2 PPL | `scripts/eval_ppl.py::evaluate_nll` |
+| The LUT model (FLUTE idxN W4+r32) | `scripts/palettize_qwen3_5_9b.py --recipe auto --auto-cos 0.9995`; `docs/QUANTIZATION_FORMAT.md` §2; `docs/AUTO_SELECTION_GUIDE.md` |
+| The 3:1 hybrid is native | `docs/MODEL_GEOMETRY.md` §1 (`layer_types`, `full_attention_interval: 4`) |
+| The recurrent state (the cache asset) | `scripts/modeling.py::Qwen3_5GatedDeltaNet.forward` lines 710, 738-739; `cache_params.layers[layer_idx].recurrent_states[0]` |
+| The conv1d state | `scripts/modeling.py` line 661; `cache_params.layers[layer_idx].conv_states[0]` |
+| The fla wiring | `scripts/modeling.py::_fla_resolve` (W29); `fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule` |
+| The forward kernel | `flute_extended/src/kernel_cutlass_streaming.cu` (`flute_kernel_streaming_fd_sub4`) |
+| The backward kernel | `flute_train_kernels/src/kernel_lut_grad.cu` (`lut_grad_scatter_sub4_kernel`); `docs/KERNEL_SPEC_DLDLUT.md` |
+| The two-stream training (W10) | `scripts/qlora_gemm.py::FusedQLoRAGEMMTrainLUTTwoStreams`; `docs/TWO_STREAM_ANALYSIS.md` |
+| The QLoRA wrapper | `scripts/qlora.py::attach_qlora` + `QLoRAConfig` |
+| The trainer | `scripts/trainer.py` (two-layer residency) |
+| The model loader | `scripts/eval_common.py::load_quant_model` |
 | The energy harness | `scripts/measure_energy.py::EnergyMeasurement` |
-| The paired per-document probe | `scripts/o1_baseline_check.py::score_docs` + `paired_diff` |
-| The calibration capture | `scripts/calibrate_real_text.py::CalibrationCapture` |
-| The palettizer | `scripts/palettize_qwen3_5_9b.py` |
-| The modeling (vendored Qwen3.5) | `scripts/modeling.py` |
-| The VRAM ledger | `scripts/vram_ledger.py` |
-| The geometry audit gate | `scripts/geometry_audit.py` |
-| The GPU contract gate | `scripts/check_gpu_contract.py` |
-| The atomic JSON dump | `scripts/eval_common.py::atomic_json_dump` |
-| The 32 deterministic prompts | `scripts/eval_greedy_match.py::PROMPTS` |
 | The kernel parity suite | `tests/test_kernel_status.py`, `tests/test_lut_gradients.py`, `tests/test_two_stream_training.py`, `tests/test_attn_kernel.py`, `tests/test_dequant_reference.py`, `tests/test_idxn_pack_cpu.py` |
-| The existing greedy match report (the sanity-check target) | `reports/greedy_equivalence_idx4.json` (2026-10-08: exact_match 0.0, +3.52% PPL, 0.571× dense throughput) |
+| The existing measurement | `reports/greedy_equivalence_idx4.json` (exact_match 0.0, +3.52% PPL, 0.571× dense throughput) |
+| Kimi Linear (KDA mechanics) | [arXiv:2510.26692](https://arxiv.org/abs/2510.26692) |
+| Kimi K3 (cache discipline) | [K3 platform docs](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart); [Semianalysis](https://inferencex.semianalysis.com/model/kimi-k3) |
+| Contiguity (edit-local repair) | [arXiv:2609.17983](https://arxiv.org/abs/2609.17983) |
+| LRU eviction | [arXiv:2609.28870](https://arxiv.org/abs/2609.28870) |
+| BoxOffice (measurement discipline) | [arXiv:2609.31415](https://arxiv.org/abs/2609.31415) |
+| KVShareArena (refuse cross-namespace) | [arXiv:2609.10266](https://arxiv.org/abs/2609.10266) |
+| PatchKV (comparison baseline) | [arXiv:2609.26219](https://arxiv.org/html/2609.26219v1) |
+| OfficeQA dataset | [databricks/officeqa on HuggingFace](https://huggingface.co/datasets/databricks/officeqa) |
+| OfficeQA Pro (34.1% frontier average) | [arXiv:2603.08655](https://arxiv.org/abs/2603.08655) |
+| The A10G spec | `docs/GPU_SPEC.md` (24 GiB, sm_86, 600 GB/s) |
+| The decode investigation | `docs/A10G_DECODE_INVESTIGATION.md` |
 | The handover OOM log | `scripts/HANDOVER.issue-2026-10-04.md` |
-| The A10G decode investigation | `docs/A10G_DECODE_INVESTIGATION.md` |
-| The GPU spec | `docs/GPU_SPEC.md` |
-| `ai_parse_document` (the production parser) | [Databricks docs](https://docs.databricks.com/aws/sql/language-manual/functions/ai_parse_document) |
 
 ---
 
 ## 9. Immediate next actions
 
-1. **Stand up Phase P0.** Clone the new repo (`rag-cache-engineering-qwen35-9b-flute`). Confirm A10G is on the GPU contract allowlist. Build the FLUTE idxN wheels. Run the kernel parity suite. Re-palettize with A10G-tuned knobs (or reuse the existing `/home/ubuntu/qwen3_5_9B_palettized` artifacts).
-2. **Implement `poc/officeqa_loader.py`.** Load `databricks/officeqa` from HuggingFace. Wire docling as the parser. Structure-based chunker. BAAI/bge-m3 embedder. Test on CPU with a 5-document subset.
-3. **Implement `poc/cache_engine.py`.** The three cache backends behind a common interface. The linear-attention state snapshot/restore hooks at the 8 boundary layers. Test on CPU with the `_tiny_hybrid_model()` fixture.
-4. **Implement `poc/run_poc.py`.** The round orchestrator. Test the round transitions on CPU.
-5. **Run Phase P1 (Round 1).** Dense FP16 baseline. W4+r32 baseline. OfficeQA accuracy on both. Meaningful-query filter. Record the cut list.
-6. **Run Phase P2 (Round 2).** Three cache backends. Two-oracle diagnostic. Energy harness. The central measurement: does the linear-attention state cache beat vLLM prefix cache at OfficeQA's context lengths?
-7. **Run Phase P3 (Round 3).** Four envelope axes. PatchKV comparison. The staleness envelope curves.
-8. **Produce `poc_verdict_<ts>.json`.** The single document the production proposal reads. The verdict is `go`, `no_go`, or `conditional_go` with measured numbers for every claim.
+1. **Phase P0 (3 days).** Clone the new repo. Confirm A10G on the GPU contract allowlist. Build the FLUTE idxN wheels. Run the kernel parity suite. Load the existing `/home/ubuntu/qwen3_5_9B_palettized` artifacts. Run the 32-prompt sanity check. Record the `quant_recipe_signature`.
+2. **Phase P1 (1 week).** Implement `poc/finetune.py`. Load OfficeQA. Attach QLoRA. Run the layerwise trainer (500 steps, two-layer residency). Export the fine-tuned LUTs. Measure PPL and OfficeQA accuracy before and after.
+3. **Phase P2 (1.5 weeks).** Implement `poc/state_cache.py` + `poc/global_cache.py`. Run 50 OfficeQA questions through three cache configurations. Measure the delta. Run the two-oracle diagnostic.
+4. **Phase P3 (1 week).** Run the staleness envelope on three axes (doc-edit, checkpoint-change, role-flip). Compare edit-local repair vs PatchKV.
+5. **Phase P4 (3 days).** Produce `poc_verdict_<ts>.json`. The verdict with measured numbers.
 
-**The PoC's single success criterion:** the production proposal's riskiest assumption (the linear-attention state matrix is the right cache asset, on this hardware, at this scale, with this model) is *measured*, not assumed. Whatever the measurement says, the PoC has done its job.
+**The PoC's single success criterion:** the K3-style cache (per-session linear-attention state + global cross-session pool) is *measured* to beat no-cache on throughput at equal accuracy, on the LUT model, on A10G, on OfficeQA. Whatever the measurement says, the PoC has done its job.
 
 ---
 
-## Appendix A — The OfficeQA dataset, concretely
+## Appendix A — The corrected cache arithmetic
 
-From the HuggingFace dataset page ([databricks/officeqa](https://huggingface.co/datasets/databricks/officeqa)):
+This appendix is the worked arithmetic for every number in this proposal, so any reviewer can recompute for a different GPU or model.
 
-- **License:** CC-BY-SA-4.0
-- **Format:** CSV (pandas-loadable)
-- **Size:** <1K questions (the v1 dataset; v2 is 90 questions over 120k pages)
-- **Corpus:** U.S. Treasury Bulletins, 1939–2025 (89,000 pages, 26M+ numerical values)
-- **Question types:** question–answer pairs requiring reasoning over dense financial tables, charts, and narrative text
-- **License obligation:** "By accessing this dataset, you agree not to use the answer keys to train models evaluated on OfficeQA or to artificially inflate benchmark scores."
+### A.1 The recurrent state per layer
 
-**Loading pattern (the PoC's `officeqa_loader.py`):**
+From `docs/MODEL_GEOMETRY.md` §1 and `scripts/modeling.py::Qwen3_5GatedDeltaNet`:
 
-```python
-from datasets import load_dataset
-import pandas as pd
+- `linear_num_value_heads = 32`
+- `linear_key_head_dim = 128`
+- The delta rule's recurrent state shape: `(batch, num_v_heads, head_k_dim, head_k_dim)` = `(1, 32, 128, 128)`
+- Elements: 32 × 128 × 128 = 524,288
+- Bytes (fp16): 524,288 × 2 = 1,048,576 = **1.0 MiB per layer**
 
-# The v1 dataset
-ds = load_dataset("databricks/officeqa", split="test")
-df = ds.to_pandas()  # CSV-shaped
+### A.2 The conv1d state per layer
 
-# The corpus documents are referenced by the questions; the documents
-# themselves are downloaded separately (the Treasury Bulletins are public
-# domain US government works). The PoC's loader fetches the referenced
-# documents from the dataset's metadata, parses them with docling, chunks
-# them structure-based, and embeds them with BAAI/bge-m3.
-```
+- `conv_dim = key_dim * 2 + value_dim = 2048*2 + 4096 = 8192`
+- `conv_kernel_dim = 4`
+- State shape: `(batch, conv_dim, conv_kernel_dim)` = `(1, 8192, 4)`
+- Elements: 8192 × 4 = 32,768
+- Bytes (fp16): 32,768 × 2 = 65,536 = **64 KiB per layer**
 
-**The OfficeQA Pro paper's corpus description (arXiv:2603.08655):** "89,000 pages and over 26 million numerical values. OfficeQA Pro consists of 133 questions that require precise document parsing, retrieval, and analytical reasoning across both unstructured text and tabular data."
+### A.3 Per-session totals (24 linear-attention layers)
 
-The PoC uses the v1 dataset's larger question set (not the Pro v2's 133/90 questions) because the v1 dataset is the one closest to the repo's existing eval infrastructure. The Pro paper's findings (the +16.1% layout-aware parse gain, the 34.1% frontier average) are the PoC's literature targets regardless of which dataset version is used.
+| Component | Per layer | × 24 | Total |
+|---|---|---|---|
+| Recurrent state | 1.0 MiB | 24 MiB | **24 MiB** |
+| Conv1d state | 64 KiB | 1.5 MiB | **1.5 MiB** |
+| **Total** | | | **25.5 MiB** |
 
----
+### A.4 A10G capacity (W4+r32, ~5.85 GiB weights)
 
-## Appendix B — The literature, by citation
+- Total HBM: 24 GiB (23,028 MiB usable per `nvidia-smi -q`)
+- Weights (W4+r32): ~5.85 GiB
+- Framework + CUDA context: ~1.5 GiB
+- Activations + intermediates: ~1.5 GiB
+- Safety margin: ~2.0 GiB
+- **Cache pool: ~13 GiB**
+- Concurrent session states (25.5 MiB each): 13 GiB / 25.5 MiB ≈ **530 sessions**
+- With full-attention KV at 8k context (~256 MiB per session): ~50 sessions at 8k context
 
-| Paper | arXiv | Key finding the PoC uses |
-|---|---|---|
-| OfficeQA Pro | [2603.08655](https://arxiv.org/abs/2603.08655) | +16.1% relative accuracy from layout-aware parsing; 34.1% frontier agent average |
-| BoxOffice (KV reuse accuracy) | [2609.31415](https://arxiv.org/abs/2609.31415) | 42% of F1 gains are metric artifacts; F1 flips 0.98 ↔ 0.00 on staleness |
-| KVShareArena | [2609.10266](https://arxiv.org/abs/2609.10266) | Free position rotation recovers only 50–66% of the gap; unrepaired reuse worse than no cache |
-| Contiguity (stale KV repair) | [2609.17983](https://arxiv.org/abs/2609.17983) | Edit-local repair recovers ≥0.94 of post-edit answer margin at 13–21× below re-prefill |
-| Prefix cache eviction (LRU) | [2609.28870](https://arxiv.org/abs/2609.28870) | 14 sophisticated policies fail to beat LRU; recency is unusually predictive under agentic load |
-| Chunking taxonomy | [2602.16974](https://arxiv.org/abs/2602.16974) | Structure-based wins corpus-wide; document order preserves prefixes; chunker comparisons are often size comparisons |
-| Kimi Linear (KDA) | [2510.26692](https://arxiv.org/abs/2510.26692) | KDA: −75% cache memory, 6× faster decoding at 1M context (the source's measurement condition) |
-| PatchKV | [2609.26219](https://arxiv.org/html/2609.26219v1) | Transport-based KV recovery for edited documents (the comparison baseline for Round 3's doc-edit axis) |
-| Speculative KV reuse | [ACL 2026](https://aclanthology.org/2026.acl-long.859) | 2.17–3.95× TTFT reduction with negligible accuracy loss (the throughput target) |
-| RelayCaching | [ICML 2026](https://icml.cc/virtual/2026/poster/66638) | Decoding-phase KV reuse across agents (the multi-turn reuse validation) |
-| Hybrid attention on NPUs | [2609.32114](https://arxiv.org/html/2609.32114v1) | Hybrid attention models (Qwen3.5, Kimi) on NPUs (the transferability note) |
+### A.5 v1's error (corrected)
+
+v1 claimed 576 KiB per session. v1 confused the K/V projection shape `(num_heads, head_dim)` = `(16, 128)` with the recurrent state matrix shape `(num_v_heads, head_k_dim, head_k_dim)` = `(32, 128, 128)`. The recurrent state is a matrix (the delta rule's outer-product accumulator), not a vector. The correct per-session size is **25.5 MiB**, not 576 KiB.
+
+This changes the capacity arithmetic: 530 concurrent sessions (not 23,000), and 50 at 8k context (not 26). The PoC's P2 measures whether the global cache (cross-session deduplication at shared-prefix boundaries) recovers the effective capacity by sharing state across sessions.
 
 ---
 
-## Appendix C — The PoC's diff against the production proposal (v1.1)
+## Appendix B — The diff from v1 (the PoC I wrote before)
 
-The PoC is the production proposal's serving lane, *measured*:
+v1 was wrong in three ways. This appendix records the corrections so any reviewer can verify.
 
-| Production proposal (v1.1) | PoC (this document) |
-|---|---|
-| Four lanes (corpus, permission, serving, evaluation) on Databricks | Three rounds (feasibility, cache delta, staleness envelope) on one A10G |
-| SharePoint corpus via Microsoft Graph | OfficeQA corpus via HuggingFace |
-| `ai_parse_document` for layout-aware parsing | docling (CPU-side proxy) |
-| Unity Catalog for ACL enforcement | Synthetic permission-flip (structural invariant test) |
-| Qwen3.5-9B native 3:1 hybrid + FLUTE idxN | Same model, same kernels |
-| Linear-attention state matrix as the cache asset (576 KiB per session) | Same cache asset, *measured* against vLLM prefix cache |
-| Namespace keyed by (checkpoint, recipe, context_class, corpus_version) | Same namespace, *measured* on the checkpoint-change axis |
-| Plain LRU eviction, pinned system prefix | Same, *measured* against the two-oracle diagnostic |
-| Edit-local repair on doc-edit | Same, *measured* against PatchKV |
-| Golden-set gate per checkpoint and per corpus version | The PoC's verdict JSON is the gate's measurement |
-| 96 GiB capacity (corrected to A10G's 13–16 GiB) | *Measured* on the A10G |
-| The KDA graft (removed in v1.1 — the model has it natively) | Confirmed: the model has it natively |
-| Stage 3 commissioning (the integration plan) | The PoC *is* Stage 3, measured |
+### B.1 Removed
 
-**The PoC is the production proposal's riskiest assumption, measured.** Whatever the measurement says, the production proposal is either validated or revised before any Databricks work is commissioned.
+- **The dense FP16/bf16 baseline** (v1 §2.2.3 Round 1). Removed per user directive. The PoC is LUT-model-only.
+- **Databricks, SharePoint, `ai_parse_document`, Unity Catalog, the corpus lane, the permission lane** (v1 §2.1, §2.2). Removed per user directive. Single-machine PoC.
+- **docling, BAAI/bge-m3, the chunker, the embedder** (v1 §2.2.1). Removed. OfficeQA's corpus is loaded as-is; the PoC does not build a corpus pipeline.
+- **The 3-round structure** (v1 §0: feasibility, cache delta, staleness). Replaced with the 5-phase structure (P0 env, P1 fine-tune, P2 cache measurement, P3 staleness, P4 verdict).
+
+### B.2 Corrected
+
+- **The cache asset size: 576 KiB → 25.5 MiB** (v1 §2.3.4). v1 confused the K/V projection shape with the recurrent state matrix shape. See Appendix A.5.
+- **The capacity arithmetic: 23,000 sessions → 530 sessions** (v1 §2.3.8). Consequence of the corrected cache asset size.
+- **The cache asset identity: "(K_state, V_state) at boundaries" → "the recurrent state matrix at boundaries"** (v1 §2.3.4). v1 described it abstractly; this version names the exact tensor (`cache_params.layers[L].recurrent_states[0]`) and its shape.
+
+### B.3 Added
+
+- **The global cache** (§1.3). v1 mentioned it in passing; this version makes it a first-class component with its own implementation (`poc/global_cache.py`), its own hit-rate targets (boundary 1: shared system prompt), and its own measurement (P2 measures the global cache's hit rate separately from the per-session cache).
+- **The fine-tune** (§1.4). v1 did not include a fine-tune step. This version adds the W10 LUT fine-tune on OfficeQA as Phase P1, with the K3-style cache-aware fine-tune as an optional research bet.
+- **The K3 discipline table** (§1.5). v1 referenced K3 but did not enumerate the standing rules. This version lists all 8 K3 rules and their PoC implementations.
