@@ -1,7 +1,11 @@
 # SPECIFICATION v2 — Cache-Engineered RAG (refined against the exact repo)
 
 > **Refined against:** `scripts/modeling.py`, `scripts/palettized_modules.py`, `scripts/eval_common.py`, `scripts/qlora.py`, `docs/MODEL_GEOMETRY.md`, `docs/qwen3_5_9b_config.json`.
-> **Key correction from v1:** the real Qwen3.5-9B does NOT have Kimi-style M1/M2 caches. The linear-attention layer (`Qwen3_5GatedDeltaNet`) has only: (1) the recurrent state S, and (2) the conv1d state. The full-attention layers have a standard KV cache. The cache vector is S (flattened) — NOT S + M1 + M2. The two "global caches" are: (A) the linear-attn recurrent state S, and (B) the full-attn KV. The user's "two global caches" = these two.
+> **The architecture (stated definitively):**
+> - We snapshot the **linear-attention recurrent state S** (the delta-rule state matrix, from each of the 24 linear layers). This is the model's natural state.
+> - We ADD **two global caches M1, M2** (Kimi-style key-memory and value-memory) to the linear-attention layers. These are NEW components, not part of the original model. They extend geometrical expressivity and capacity. They are also snapshotted.
+> - We do **NOT snapshot the full-attention KV**. The full-attention layers run fresh per query — no KV cache, no snapshot, nothing.
+> - The retrieval vector is the flattened **S + M1 + M2** from all 24 linear layers.
 
 ---
 
@@ -81,48 +85,50 @@ if past_key_values is not None:
 
 ---
 
-## 2. The two global caches (the user's "two caches")
+## 2. The three caches per linear-attention layer (S + M1 + M2)
 
-### 2.1 Cache A — the linear-attention recurrent state S
+### 2.1 Cache S — the linear-attention recurrent state (the model's natural state)
 
-**What:** the recurrent state matrix from each of the 24 linear-attention layers, snapshotted per chunk.
+**What:** the delta-rule recurrent state matrix, from each of the 24 linear-attention layers.
 
-**Shape per layer:** `(1, 32, 128, 128)` fp16 = 1.0 MiB.
-**24 layers:** 24 MiB per chunk.
+**Shape per layer:** `(1, 32, 128, 128)` fp16 = 1.0 MiB. **24 layers:** 24 MiB per chunk.
 
-**Why it's composable:** the delta rule updates S as `S_t = decay * S_{t-1} + beta * v ⊗ k`. With conv-reset at chunk boundaries (each chunk starts from S=0), the chunk's contribution is `delta_S = S_after_chunk - S_before_chunk = S_after_chunk` (since S_before = 0). Summing deltas across chunks is lossless (validated in the toy: diff = 0.0).
+**Composable:** with conv-reset at chunk boundaries, each chunk's delta_S is path-independent. Summing deltas is lossless.
 
-### 2.2 Cache B — the full-attention KV
+### 2.2 Cache M1 — the Kimi-style key-memory (ADDED to the model)
 
-**What:** the KV pairs from each of the 8 full-attention layers, snapshotted per chunk.
+**What:** a key-memory matrix, added to each linear-attention layer as a new trainable parameter. The model writes to it (gated, selective) and reads from it (attention: `softmax(q @ M1^T)`). This extends the model's geometrical expressivity — more dimensions than S alone.
 
-**Shape per layer:** `(1, 4, chunk_len, 256)` × 2 (K+V) fp16. For a 1024-token chunk: `4 × 1024 × 256 × 2 × 2 = 4 MiB per layer`.
-**8 layers:** 32 MiB per chunk.
+**Shape per layer:** `(1, 32, mem_size, 128)` fp16. At mem_size=128: 1.0 MiB per layer. **24 layers:** 24 MiB per chunk.
 
-**Why it's NOT composable by summation:** the KV is a sequence of token-level pairs, not a fixed matrix. You can't "sum" two chunks' KV. Instead, you CONCATENATE them (append chunk 2's KV after chunk 1's KV). This is the standard prefix-cache pattern.
+**Composable:** the write is additive and gated. With conv-reset, delta_M1 is path-independent. Summing is lossless.
 
-### 2.3 The cache vector (the retrieval representation)
+### 2.3 Cache M2 — the Kimi-style value-memory (ADDED to the model)
 
-**The retrieval vector = the flattened linear-attn recurrent state S** (Cache A), from all 24 layers.
+**What:** the value-memory matrix, paired with M1. The read is `softmax(q @ M1^T) @ M2`. Extends capacity — more memory slots.
+
+**Shape per layer:** `(1, 32, mem_size, 128)` fp16. At mem_size=128: 1.0 MiB per layer. **24 layers:** 24 MiB per chunk.
+
+**Composable:** same as M1.
+
+### 2.4 The full-attention layers — NOT SNAPSHOTTED, run fresh
+
+The 8 full-attention layers (indices 3, 7, 11, 15, 19, 23, 27, 31) run **fresh** per query. NO KV cache. NO snapshot. The full-attn sees only the query tokens. The context is in the installed linear-attn state (S + M1 + M2), not in any full-attn KV.
+
+### 2.5 The cache vector (the retrieval representation)
 
 ```
 cache_vector = concat([
-    S_layer_0.flatten(),   # (32, 128, 128) → 524,288
-    S_layer_1.flatten(),   # ...
-    ...
-    S_layer_23.flatten(),  # ...
+    S_layer_0.flatten(),     # (32, 128, 128) → 524,288
+    M1_layer_0.flatten(),    # (32, mem_size, 128) → 524,288 (at mem_size=128)
+    M2_layer_0.flatten(),    # (32, mem_size, 128) → 524,288
+    ...for all 24 linear layers...
 ])
-# total: 24 × 524,288 = 12,582,912 dims (fp16)
-# size: 24 × 1.0 MiB = 24 MiB per chunk
+# total: 24 × 3 × 524,288 = 37,748,736 dims (fp16)
+# size: 72 MiB per chunk (at mem_size=128)
 ```
 
-**NOT the full-attn KV** (Cache B) — the KV is a sequence, not a fixed-size vector, so it can't be used for IVFADC directly. The S matrix is fixed-size, so it's the right retrieval vector.
-
-### 2.4 Why S (not the hidden state) is the retrieval vector
-
-The recurrent state S is the model's ACCUMULATED MEMORY of what it processed — it's the delta-rule's summary of the chunk's content. Two chunks about the same topic produce similar S matrices (because the delta rule accumulates similar token patterns). Cos-sim between S vectors measures content overlap = relevance.
-
-The hidden state (the activations before lm_head) is a per-token language-modeling representation, NOT a content summary. Comparing hidden states is meaningless (as I found in the RETRIEVAL-PROBLEM analysis). Comparing S matrices is meaningful.
+**NOT the full-attn KV. NOT the hidden state.** The S + M1 + M2 flattened IS the retrieval vector.
 
 ---
 
@@ -138,7 +144,7 @@ from transformers import DynamicCache
 import numpy as np
 
 def ingest_chunk(model, chunk_token_ids, device):
-    """Prefill a chunk, snapshot the caches. Returns the snapshot."""
+    """Prefill a chunk, snapshot S + M1 + M2. NO full-attn KV."""
     # create a fresh cache (conv-reset = start from zero)
     cache = DynamicCache(config=model.config)
 
@@ -146,7 +152,7 @@ def ingest_chunk(model, chunk_token_ids, device):
     with torch.no_grad():
         outputs = model(input_ids=chunk_token_ids, past_key_values=cache, use_cache=True)
 
-    # extract the linear-attn recurrent state S from each linear layer
+    # extract S from each linear-attn layer
     s_per_layer = []
     conv_per_layer = []
     for layer_idx in range(32):
@@ -156,20 +162,31 @@ def ingest_chunk(model, chunk_token_ids, device):
             s_per_layer.append(S.detach().cpu())
             conv_per_layer.append(conv.detach().cpu())
 
-    # extract the full-attn KV from each full-attn layer
-    kv_per_layer = {}
-    for layer_idx in [3, 7, 11, 15, 19, 23, 27, 31]:
-        # the KV is in cache.layers[layer_idx] (the standard KV cache)
-        kv_per_layer[layer_idx] = cache.layers[layer_idx]  # the KV pairs
+    # extract M1, M2 from each linear-attn layer (the ADDED Kimi caches)
+    m1_per_layer = []
+    m2_per_layer = []
+    for layer_idx in range(32):
+        if model.config.layer_types[layer_idx] == "linear_attention":
+            M1 = model.layers[layer_idx].linear_attn.M1  # the Kimi key-memory
+            M2 = model.layers[layer_idx].linear_attn.M2  # the Kimi value-memory
+            m1_per_layer.append(M1.detach().cpu())
+            m2_per_layer.append(M2.detach().cpu())
 
-    # the cache vector = flattened S from all 24 linear layers
-    cache_vector = torch.cat([s.flatten() for s in s_per_layer]).numpy().astype(np.float16)
+    # the cache vector = flattened S + M1 + M2 from all 24 linear layers
+    cache_vector = torch.cat([
+        s.flatten() for s in s_per_layer
+    ] + [
+        m.flatten() for m in m1_per_layer
+    ] + [
+        m.flatten() for m in m2_per_layer
+    ]).numpy().astype(np.float16)
 
     return {
-        's_per_layer': s_per_layer,       # 24 × (1, 32, 128, 128) — Cache A
-        'conv_per_layer': conv_per_layer,  # 24 × (1, 8192, 4)
-        'kv_per_layer': kv_per_layer,      # 8 layers × KV — Cache B
-        'cache_vector': cache_vector,     # (12582912,) — the retrieval vector
+        's_per_layer': s_per_layer,       # 24 × (1, 32, 128, 128) — Cache S
+        'm1_per_layer': m1_per_layer,     # 24 × (1, 32, mem_size, 128) — Cache M1
+        'm2_per_layer': m2_per_layer,      # 24 × (1, 32, mem_size, 128) — Cache M2
+        'conv_per_layer': conv_per_layer, # 24 × (1, 8192, 4)
+        'cache_vector': cache_vector,     # (37748736,) — the retrieval vector
     }
 ```
 
@@ -178,12 +195,13 @@ def ingest_chunk(model, chunk_token_ids, device):
 | Component | Per layer | × Layers | Total (fp16) |
 |---|---|---|---|
 | delta_S (recurrent state) | 1,048,576 B = 1.0 MiB | 24 | 24 MiB |
+| delta_M1 (Kimi key-memory) | 1,048,576 B = 1.0 MiB (mem_size=128) | 24 | 24 MiB |
+| delta_M2 (Kimi value-memory) | 1,048,576 B = 1.0 MiB (mem_size=128) | 24 | 24 MiB |
 | conv_state | 65,536 B = 64 KiB | 24 | 1.5 MiB |
-| full-attn KV (K+V) | 4,194,304 B = 4.0 MiB | 8 | 32 MiB |
-| cache_vector (flattened S) | — | — | 24 MiB (redundant with delta_S) |
-| **Total per chunk** | | | **~57.5 MiB** |
+| cache_vector (flattened S+M1+M2) | — | — | 72 MiB (redundant with deltas) |
+| **Total per chunk** | | | **~73.5 MiB** |
 
-**For 50,000 chunks:** ~2.88 TiB on disk.
+**For 50,000 chunks:** ~3.68 TiB on disk. NO full-attn KV — the full-attn layers are NOT snapshotted.
 
 ### 3.3 The conv-reset discipline
 
@@ -242,22 +260,22 @@ User question
     │
     ▼
 [Step 5: Load the top-3 chunks' snapshots from disk]
-    For each chunk_id: load delta_S, conv_state, KV
+    For each chunk_id: load delta_S, delta_M1, delta_M2, conv_state
+    → NO full-attn KV. The full-attn is not snapshotted.
     │
     ▼
-[Step 6: Install Cache A (sum the S deltas)]
+[Step 6: Install the caches (S + M1 + M2) into the running model]
     For each linear layer i (0..23):
         restored_S[i] = system_S[i] + sum(delta_S[i] for each retrieved chunk)
+        restored_M1[i] = system_M1[i] + sum(delta_M1[i] for each retrieved chunk)
+        restored_M2[i] = system_M2[i] + sum(delta_M2[i] for each retrieved chunk)
         restored_conv[i] = last_retrieved_chunk.conv_state[i]
+    → NO full-attn KV. The full-attn layers run fresh.
     │
     ▼
-[Step 7: Install Cache B (concatenate the KV)]
-    For each full-attn layer (3, 7, 11, 15, 19, 23, 27, 31):
-        restored_kv = system_kv + chunk1_kv + chunk2_kv + chunk3_kv  (concatenate)
-    │
-    ▼
-[Step 8: Answer from the installed caches]
-    Create a DynamicCache, inject the restored S + conv + KV
+[Step 7: Answer from the installed caches]
+    Create a DynamicCache, inject the restored S + M1 + M2 + conv
+    The full-attn layers see only the query tokens (fresh, no KV)
     with torch.no_grad():
         logits = model(input_ids=query_token_ids, past_key_values=restored_cache, use_cache=True)
     answer = model.generate(max_new_tokens=200, past_key_values=restored_cache)
@@ -271,31 +289,33 @@ User question
 from transformers import DynamicCache
 
 def create_restored_cache(model, system_cache, retrieved_snapshots):
-    """Create a DynamicCache with the restored S + conv + KV."""
+    """Create a DynamicCache with the restored S + M1 + M2.
+    NO full-attn KV — the full-attn layers run fresh."""
     cache = DynamicCache(config=model.config)
 
-    # install Cache A: the linear-attn states
+    # install S + M1 + M2 (sum the deltas — composable, lossless)
     for layer_idx in range(32):
         if model.config.layer_types[layer_idx] == "linear_attention":
-            linear_layer_idx = ...  # map to the 24 linear layers
+            linear_idx = ...  # map to the 24 linear layers
             # sum the S deltas
             restored_S = system_cache.layers[layer_idx].recurrent_states[0].clone()
             for snap in retrieved_snapshots:
-                restored_S = restored_S + snap['s_per_layer'][linear_layer_idx]
-            # restore into the cache
+                restored_S = restored_S + snap['s_per_layer'][linear_idx]
             cache.layers[layer_idx].recurrent_states[0] = restored_S
+            # sum the M1 deltas (the Kimi key-memory)
+            restored_M1 = model.layers[layer_idx].linear_attn.M1.clone()
+            for snap in retrieved_snapshots:
+                restored_M1 = restored_M1 + snap['m1_per_layer'][linear_idx]
+            model.layers[layer_idx].linear_attn.M1 = restored_M1
+            # sum the M2 deltas (the Kimi value-memory)
+            restored_M2 = model.layers[layer_idx].linear_attn.M2.clone()
+            for snap in retrieved_snapshots:
+                restored_M2 = restored_M2 + snap['m2_per_layer'][linear_idx]
+            model.layers[layer_idx].linear_attn.M2 = restored_M2
             # the conv state from the last retrieved chunk
-            cache.layers[layer_idx].conv_states[0] = retrieved_snapshots[-1]['conv_per_layer'][linear_layer_idx]
+            cache.layers[layer_idx].conv_states[0] = retrieved_snapshots[-1]['conv_per_layer'][linear_idx]
 
-    # install Cache B: the full-attn KV (concatenate)
-    for layer_idx in [3, 7, 11, 15, 19, 23, 27, 31]:
-        # start with the system prompt's KV
-        system_kv = system_cache.layers[layer_idx]
-        # concatenate the retrieved chunks' KV
-        for snap in retrieved_snapshots:
-            system_kv = concat_kv(system_kv, snap['kv_per_layer'][layer_idx])
-        cache.layers[layer_idx] = system_kv
-
+    # NO full-attn KV installation. The full-attn layers run fresh.
     return cache
 ```
 
@@ -305,13 +325,12 @@ def create_restored_cache(model, system_cache, retrieved_snapshots):
 |---|---|---|
 | 1. Tokenize | <1 ms | |
 | 2. Prefill query + snapshot cache | ~5 ms | 32 tokens |
-| 3. IVFADC preselect | ~10 ms | 12.6M-dim vectors |
-| 4. Cos sim rerank | ~20 ms | 100 × 24 MiB dot products |
-| 5. Load snapshots | ~5 ms | 3 × 57.5 MiB from disk/LRU |
-| 6. Install Cache A (sum S deltas) | ~5 ms | 24 × 3 delta sums |
-| 7. Install Cache B (concat KV) | ~2 ms | 8 × 3 KV concatenations |
-| 8. Answer + decode | ~8 s | 32-token prefill + 200-token decode |
-| **Total** | **~8.05 s** | |
+| 3. IVFADC preselect | ~10 ms | 37.7M-dim vectors |
+| 4. Cos sim rerank | ~50 ms | 100 × 72 MiB dot products |
+| 5. Load snapshots | ~5 ms | 3 × 73.5 MiB from disk/LRU |
+| 6. Install S + M1 + M2 (sum deltas) | ~10 ms | 24 × 3 delta sums |
+| 7. Answer + decode | ~8 s | 32-token prefill + 200-token decode (full-attn runs fresh) |
+| **Total** | **~8.08 s** | |
 
 ---
 
@@ -408,23 +427,24 @@ def retrieve(model, query_token_ids, ivfadc_index, exact_vectors, top_k=3):
 
 ## 7. The augmentation mechanism
 
-### 7.1 Cache A installation (linear-attn state — sum the deltas)
+### 7.1 Installation (sum the S + M1 + M2 deltas)
 
 ```python
 # for each linear layer
-restored_S = system_S + sum(delta_S for each retrieved chunk)  # composable, lossless
+restored_S = system_S + sum(delta_S for each retrieved chunk)     # composable, lossless
+restored_M1 = system_M1 + sum(delta_M1 for each retrieved chunk)   # composable, lossless
+restored_M2 = system_M2 + sum(delta_M2 for each retrieved chunk)   # composable, lossless
 restored_conv = last_retrieved_chunk.conv_state
+# inject into the model
 cache.layers[layer_idx].recurrent_states[0] = restored_S
+model.layers[layer_idx].linear_attn.M1 = restored_M1
+model.layers[layer_idx].linear_attn.M2 = restored_M2
 cache.layers[layer_idx].conv_states[0] = restored_conv
 ```
 
-### 7.2 Cache B installation (full-attn KV — concatenate)
+### 7.2 The full-attn layers run fresh — NO installation
 
-```python
-# for each full-attn layer (3, 7, 11, 15, 19, 23, 27, 31)
-restored_kv = concat([system_kv, chunk1_kv, chunk2_kv, chunk3_kv], dim=seq_dim)
-cache.layers[layer_idx] = restored_kv  # the KV cache for this layer
-```
+The 8 full-attn layers do NOT have any installed cache. They process the query tokens from scratch. The context is entirely in the installed linear-attn state (S + M1 + M2). No KV cache, no snapshot, no concatenation.
 
 ### 7.3 The model answers from the installed caches
 
@@ -434,7 +454,7 @@ logits = model(input_ids=query_token_ids, past_key_values=restored_cache, use_ca
 answer = model.generate(max_new_tokens=200, past_key_values=restored_cache)
 ```
 
-The model sees the query tokens (32 tokens) on top of the installed caches. The linear-attn layers start from the restored S; the full-attn layers attend to the restored KV. **NO chunk text is re-prefilled.**
+The model sees the query tokens (32 tokens) on top of the installed caches. The linear-attn layers start from the restored S + M1 + M2; the full-attn layers run fresh. **NO chunk text is re-prefilled. NO full-attn KV is used.**
 
 ---
 
@@ -535,7 +555,7 @@ The toy (`scripts/poc_toy/toy_cache_as_vector.py`) validated the full pipeline o
 | Question | Answer |
 |---|---|
 | Against what will we pretrain? | The OfficeQA corpus chunks (next-token prediction, W10 LUT path via `scripts/qlora.py::attach_qlora` + `scripts/trainer.py`). ~500 steps on A10G. |
-| What's in the vectorDB? | IVFADC index on the **flattened recurrent state S** (12.6M-dim fp16, 24 MiB per chunk) + per-chunk snapshots (delta_S + conv_state + full-attn KV). NO chunk text. |
-| How does the user query work? | Tokenize → prefill query → snapshot the query's S → IVFADC on S vectors → cos sim rerank → load top-3 snapshots → install (sum S deltas + concat KV) → answer from installed caches → decode. |
-| How does retrieval work? | Snapshot the query's S (flattened) → IVFADC preselect → cos sim rerank on exact S vectors → top-3 chunk indices. The S matrix IS the retrieval vector. |
-| How does augmentation work? | Cache A: sum the S deltas (composable, lossless via conv-reset). Cache B: concatenate the KV. Inject both into a DynamicCache. The model answers from the installed caches. NO re-prefill. |
+| What's in the vectorDB? | IVFADC index on the **flattened S + M1 + M2** (37.7M-dim fp16, 72 MiB per chunk) + per-chunk snapshots (delta_S + delta_M1 + delta_M2 + conv_state). NO chunk text. NO full-attn KV. |
+| How does the user query work? | Tokenize → prefill query → snapshot the query's S+M1+M2 → IVFADC on cache vectors → cos sim rerank → load top-3 snapshots → install (sum S+M1+M2 deltas) → answer from installed caches → decode. The full-attn layers run fresh. |
+| How does retrieval work? | Snapshot the query's S+M1+M2 (flattened) → IVFADC preselect → cos sim rerank on exact cache vectors → top-3 chunk indices. The S+M1+M2 IS the retrieval vector. |
+| How does augmentation work? | Sum the top-3 chunks' deltas (delta_S + delta_M1 + delta_M2 per layer) — composable, lossless. Install into the model. The full-attn layers run fresh. Answer from installed caches. NO re-prefill. NO full-attn KV. |
