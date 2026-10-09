@@ -154,6 +154,7 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         self._handed_conv: Optional[torch.Tensor] = None
         self.reads = {"conv": 0, "s": 0}
         self.writes = {"conv": 0, "s": 0}
+        self._m1m2_tokens = 0  # tokens seen at this layer (M1/M2 write positions)
         # replace the plain state dicts with the dequantizing views
         self.conv_states = _StateView(self, "conv")
         self.recurrent_states = _StateView(self, "s")
@@ -310,6 +311,7 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         self._s_codes = None
         self._conv_codes = None
         self._handed_conv = None
+        self._m1m2_tokens = 0
         for i in range(self.number_of_states):
             self.has_previous_state[i] = False
             self.is_conv_states_initialized[i] = False

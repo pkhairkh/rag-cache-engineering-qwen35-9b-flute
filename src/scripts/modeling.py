@@ -758,9 +758,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             if _k.shape[1] != _q.shape[1]:
                 _k = _k.repeat_interleave(_q.shape[1] // _k.shape[1], dim=1)
             _v = value.transpose(1, 2)
+            # write positions: RUNNING token counter on the TQ cache layer —
+            # per-forward arange(T) would make every decode step write slot 0
+            # (wasting 127/128 of memory capacity); the counter resets with a
+            # fresh cache, so per-chunk ingestion deltas stay consistent
+            _tl = cache_params.layers[self.layer_idx] if hasattr(
+                cache_params, "layers") else None
+            _pos0 = getattr(_tl, "_m1m2_tokens", 0) if _tl is not None else 0
+            _positions = torch.arange(_pos0, _pos0 + seq_len,
+                                      device=value.device)
+            if _tl is not None:
+                _tl._m1m2_tokens = _pos0 + seq_len
             _read_out, _m1_new, _m2_new = _m1m2(
                 _q, _k, _v, _m1, _m2,
-                getattr(self, "m1m2_linear_ordinal", 0))
+                getattr(self, "m1m2_linear_ordinal", 0),
+                positions=_positions)
             core_attn_out = core_attn_out + _read_out.transpose(1, 2)
             cache_params.update_m1(_m1_new)
             cache_params.update_m2(_m2_new)
