@@ -121,7 +121,9 @@ class _StateView(dict):
                 return None
             t = layer._tq_s.dequant(codes, dtype=layer._s_dtype)
             return t.reshape(layer._s_shape)
-        return super().__getitem__(state_idx)
+        # offline mode: plain passthrough (None before the first write —
+        # the mixin's dicts are lazily filled, read-before-write is legal)
+        return dict.get(self, state_idx)
 
     def __setitem__(self, state_idx: int, value) -> None:
         if self._layer.online:
