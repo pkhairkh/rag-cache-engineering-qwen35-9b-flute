@@ -436,7 +436,8 @@ class TQCache(DynamicCache):
         self._m1_codes = codes
         if codes is not None:
             self._tq_m1 = resolve_quantizer("M1", codes.d, self._tq_bits)
-            self._m1_shape = (codes.d,)
+            if self._m1_shape is None:
+                self._m1_shape = (codes.d,)  # flat until a real shape is known
 
     def update_m2(self, tensor: torch.Tensor) -> torch.Tensor:
         if (self._tq_m2 is None or self._m2_codes is None
@@ -460,7 +461,8 @@ class TQCache(DynamicCache):
         self._m2_codes = codes
         if codes is not None:
             self._tq_m2 = resolve_quantizer("M2", codes.d, self._tq_bits)
-            self._m2_shape = (codes.d,)
+            if self._m2_shape is None:
+                self._m2_shape = (codes.d,)  # flat until a real shape is known
 
     # ------------------------------------------------------------ snapshot --
     def snapshot_codes(self) -> Dict[str, object]:
