@@ -1,0 +1,17 @@
+{
+  "correctness": {
+    "max_logit_diff_full_cache": 0.0,
+    "full_cache_lossless": true
+  },
+  "retrieval": {
+    "retrieval_hit_rate": 0.75,
+    "n_queries": 20,
+    "n_chunks": 16,
+    "top_k": 3
+  },
+  "latency": {
+    "no_cache_ms": 17.240703105926514,
+    "full_cache_ms": 3.4029364585876465,
+    "full_cache_speedup_vs_no_cache": 5.06641934568537
+  }
+}
