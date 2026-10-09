@@ -10,17 +10,12 @@ Backends:
                          layouts (register-direct dequant: no sW round
                          trip, 3-stage A pipeline, paired-LUT, m-major
                          grid) at bitwidths 1/2/3/4
-  - "cutlass_dense"    : CUTLASS GemmUniversal FP16 GEMM on a
-                         pre-dequantized W (dense baseline; needs CUTLASS)
 
 Public API:
     qgemm_per_group_lut(
         A, indices, lut, *, bitwidth=4, group_size,
         backend="auto", indices_layout="idx4"
     ) -> Tensor
-
-    # For the dense CUTLASS baseline only (benchmarking):
-    qgemm_dense(A, W_dense, *, group_size, backend="cutlass_dense") -> Tensor
 
 indices_layout:
     "idxN" (N in {1,2,3,4}, written "idx1"/"idx2"/"idx3"/"idx4"):
@@ -37,10 +32,7 @@ indices_layout:
 
 Environment:
     FLUTE_GS32_BK=64   opt group_size=32 layers into BK=64 K-tiles
-                        (deep-tile experiment; default is BK=32). See
-                        docs/PERFORMANCE.md.
-    FLUTE_DENSE_STREAMK=1
-                        dense baseline: ThreadblockSwizzleStreamK config.
+                        (deep-tile experiment; default is BK=32).
 """
 
 from __future__ import annotations
@@ -51,7 +43,6 @@ import torch
 from ._C import (
     qgemm_per_group_lut as _qgemm_per_group_lut,
     qgemm_debug_simple,
-    qgemm_cutlass_dense,
     qgemm_cutlass_streaming,
 )
 
@@ -102,7 +93,6 @@ except ImportError:            # pragma: no cover - pre-W29 extension
 
 Backend = Literal[
     "debug_simple",
-    "cutlass_dense",
     "cutlass_streaming",
     "auto",
 ]
@@ -167,38 +157,6 @@ def qgemm_per_group_lut(
     return _qgemm_per_group_lut(
         A, indices, lut, W_empty,
         int(bitwidth), int(group_size), backend, q_layout,
-    )
-
-
-def qgemm_dense(
-    A: torch.Tensor,
-    W_dense: torch.Tensor,
-    group_size: int = 32,
-    backend: Backend = "cutlass_dense",
-) -> torch.Tensor:
-    """Compute Y = X @ W^T using a DENSE FP16 weight matrix.
-
-    This is the CUTLASS dense baseline. It is for benchmarking only —
-    production code should use qgemm_per_group_lut with the palettized path.
-
-    Args:
-        A       : [M, K] FP16.
-        W_dense : [N, K] FP16 (dequantized W).
-        group_size: ignored at runtime (kept for API symmetry).
-        backend : must be "cutlass_dense".
-
-    Returns:
-        C : [M, N] FP16.
-    """
-    if backend != "cutlass_dense":
-        raise ValueError("qgemm_dense only supports backend='cutlass_dense'")
-
-    # Empty indices/lut placeholders
-    indices_empty = torch.empty(0, dtype=torch.uint8, device=A.device)
-    lut_empty = torch.empty(0, dtype=torch.float16, device=A.device)
-    return _qgemm_per_group_lut(
-        A, indices_empty, lut_empty, W_dense,
-        4, int(group_size), backend,
     )
 
 
@@ -848,9 +806,7 @@ def qgemm_gemv2_stream(
 
 __all__ = [
     "qgemm_per_group_lut",
-    "qgemm_dense",
     "qgemm_debug_simple",
-    "qgemm_cutlass_dense",
     "qgemm_cutlass_streaming",
     "qgemm_dual_stream",
     "dual_stream_available",

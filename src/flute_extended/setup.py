@@ -6,25 +6,14 @@ Backends compiled into the extension:
                          streaming kernel; bring-up/debugging only)
   - cutlass_streaming : always built (raw mma.m16n8k16 PTX + cp.async +
                          prmt dequant merge, double-buffered pipeline)
-  - cutlass_dense     : active if CUTLASS is found (dense FP16 baseline,
-                         device::GemmUniversal classic API, ArchTag=Sm80
-                         policy tag, all-explicit template args)
   - fht               : always built (Fast Walsh-Hadamard Transform — the
                          Hadamard boundary-fold rotation replacement; smem
                          butterfly, fp32 accumulation, block-diagonal K;
                          see include/flute/fht.cuh)
 
-CUTLASS discovery order:
-  1. $FLUTE_CUTLASS_HOME
-  2. /home/ubuntu/cutlass
-  3. $CUTLASS_HOME
-  4. /opt/cutlass
-
 Usage:
   python setup.py build_ext --inplace         # build
   pip install -e .                            # editable install
-  python test_flute.py                         # correctness suite
-  python benchmark_kernel.py                  # L2-flush benchmark
 
 Target SM:
   SM_86 (A10G / RTX 3090 / A6000, Ampere GA102) is the primary target.
@@ -36,7 +25,6 @@ check the register count of flute_kernel_streaming (~200 expected; if
 ptxas reports spills, see docs/DEPLOY.md).
 """
 
-import os
 from pathlib import Path
 
 from setuptools import setup
@@ -51,41 +39,11 @@ INCLUDE_DIR = PROJECT_ROOT / "include"
 
 
 # ---------------------------------------------------------------------------
-# CUTLASS discovery
-# ---------------------------------------------------------------------------
-def find_cutlass() -> Path | None:
-    candidates = []
-    env = os.environ.get("FLUTE_CUTLASS_HOME")
-    if env:
-        candidates.append(Path(env))
-    candidates.append(Path("/home/ubuntu/cutlass"))
-    env2 = os.environ.get("CUTLASS_HOME")
-    if env2:
-        candidates.append(Path(env2))
-    candidates.append(Path("/opt/cutlass"))
-
-    for p in candidates:
-        if (p / "include" / "cutlass" / "cutlass.h").is_file():
-            return p
-    return None
-
-
-CUTLASS_DIR = find_cutlass()
-print(f"[flute_extended] CUTLASS: {CUTLASS_DIR or 'NOT FOUND (cutlass_dense backend disabled)'}")
-if CUTLASS_DIR is not None:
-    print("[flute_extended] cutlass_dense backend: ENABLED "
-          "(classic GemmUniversal API, ArchTag=Sm80 policy tag, all-explicit "
-          "template args — CUTLASS 2.x through 4.8+)")
-
-
-# ---------------------------------------------------------------------------
-# Source list — always compile every .cu/.cpp; dense kernel self-guards with
-# #if defined(FLUTE_HAVE_CUTLASS) and emits a stub when the macro is absent.
+# Source list — always compile every .cu/.cpp.
 # ---------------------------------------------------------------------------
 sources = [
     "src/kernel_debug_simple.cu",
     "src/kernel_cutlass_streaming.cu",
-    "src/kernel_cutlass_dense.cu",  # Compiles to stub when FLUTE_HAVE_CUTLASS not defined
     "src/kernel_fht.cu",           # FLUTE Extension: Fast Hadamard Transform
     "src/bindings.cpp",
 ]
@@ -122,20 +80,6 @@ cxx_flags = [
     "-std=c++20",
     f"-I{INCLUDE_DIR}",
 ]
-
-if CUTLASS_DIR is not None:
-    cutlass_includes = [
-        str(CUTLASS_DIR / "include"),
-        str(CUTLASS_DIR / "tools" / "util" / "include"),
-    ]
-    nvcc_flags += [f"-I{p}" for p in cutlass_includes]
-    cxx_flags  += [f"-I{p}" for p in cutlass_includes]
-    # Defined globally; only the dense kernel checks it. The dense TU uses
-    # the classic device::GemmUniversal API with every template argument
-    # explicit (ArchTag=Sm80 policy tag), which compiles against CUTLASS
-    # 2.x through 4.8+ alike — no version pinning required.
-    nvcc_flags.append("-DFLUTE_HAVE_CUTLASS=1")
-    cxx_flags.append("-DFLUTE_HAVE_CUTLASS=1")
 
 
 # ---------------------------------------------------------------------------

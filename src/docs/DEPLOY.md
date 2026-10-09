@@ -4,11 +4,16 @@ Target: NVIDIA A10G (SM_86), CUDA 12.0+, PyTorch 2.x. The same steps work
 on any SM_80+ GPU (A100 / L40 / H100) with the appropriate clocks and
 peak expectations.
 
-Section 4 (ptxas register audit) is a HARD GATE: do not proceed to
-benchmarking until it shows zero spills for all three instantiations of
-the streaming kernel. Section 5 is the first-silicon bisection ladder -
-walk it in order; each step isolates a failure class before the next one
-runs.
+Section 3 (ptxas register audit) is a HARD GATE: do not proceed to any
+model work until it shows zero spills for all three instantiations of the
+streaming kernel.
+
+NOTE — repo scope: the dense CUTLASS baseline kernel, the benchmark
+harness, and the kernel test-suite (test_flute.py /
+test_qwen_weights.py) were removed with the cleanup; the canonical
+palettizer is intentionally absent (the palettized model + heads
+artifacts are provided pre-built). Correctness spot-checks below use the
+`debug_simple` differential backend against `cutlass_streaming`.
 
 ## 1. Prerequisites
 
@@ -16,10 +21,8 @@ runs.
   SM_86 — 80 SM, 300 W; see docs/HARDWARE.md)
 - CUDA toolkit 12.0+
 - PyTorch 2.x (requires a C++20 compiler for the extension headers)
-- Optional: CUTLASS checkout (2.x through 4.8+ all work) for the
-  `cutlass_dense` baseline at `/home/ubuntu/cutlass` (or
-  `$FLUTE_CUTLASS_HOME`, `$CUTLASS_HOME`, `/opt/cutlass`). NOT required -
-  the production `cutlass_streaming` kernel is raw-PTX and dependency-free.
+- Python deps: `pip install -r requirements.txt` (known-good pins:
+  requirements.lock.txt)
 
 Verify the environment:
 
@@ -37,25 +40,13 @@ python setup.py build_ext --inplace
 ```
 
 Expected: no warnings or errors; the extension lands at
-`flute_extended/_C.cpython-*.so`. The console prints
-`[flute_extended] CUTLASS: <path or NOT FOUND ...>` plus, when found,
-`cutlass_dense backend: ENABLED` - the build succeeds either way; only the
-`cutlass_dense` baseline needs CUTLASS.
-
-The dense TU uses the classic `cutlass::gemm::device::GemmUniversal` API
-with EVERY template argument explicit (ArchTag = `arch::Sm80` policy tag -
-the canonical choice for SM_86; the SASS target still comes from the
-`-gencode ... sm_86` flag). Nothing instantiates
-`DefaultGemmConfiguration`, which has no Sm86 specialization in ANY
-CUTLASS release (2.11 through 4.8 - verified by grep) and was the root
-cause of the original `device::Gemm<..., Sm86, ...>` build break.
-`FLUTE_DENSE_STREAMK=1` switches the baseline to the Stream-K swizzle at
-runtime (helps wave quantization at small M).
+`flute_extended/_C.cpython-*.so`. No external dependencies — the
+production `cutlass_streaming` kernel is raw-PTX and dependency-free.
 
 Build configuration notes:
 
 - `-std=c++20` for nvcc AND the host compiler (PyTorch 2.x requirement).
-- Absolute `-I<repo>/include` - nvcc runs from a scratch build directory,
+- Absolute `-I<repo>/include` — nvcc runs from a scratch build directory,
   so relative include paths do not resolve.
 - gencode set SM_80 / SM_86 (primary) / SM_89 / SM_90. SM_75 is excluded:
   the f16 mma.m16n8k16 operation requires SM_80+ (PTX ISA target notes).
@@ -67,26 +58,18 @@ rm -rf build flute_extended/_C*.so
 python setup.py build_ext --inplace
 ```
 
-## 2b. W17: verify the REBUILT module is the LOADED one (the stale-.so trap)
+## 2b. Verify the REBUILT module is the LOADED one (the stale-.so trap)
 
 `python setup.py build_ext --inplace` updates the .so in the SOURCE tree
 only. If `flute_extended` was installed non-editably (`pip install .`
 rather than `pip install -e .`), `import flute_extended` resolves to the
-site-packages COPY — which stays stale after the rebuild, and the
-palettizer's runtime GS probe will keep reporting "stale-kernel" and
-capping the sweep at GS<=512 (W17: the run now aborts BEFORE the model
-load, naming the loaded module's path). After rebuilding:
+site-packages COPY — which stays stale after the rebuild. After
+rebuilding:
 
 ```bash
 python - <<'EOF'
 import flute_extended as fx
 print("loaded module:", fx.__file__)
-# the probe the palettizer runs (tiny GS=2048 qgemm):
-import torch
-from flute_extended import qgemm_per_group_lut
-import numpy as np
-# ... or simply rerun the palettizer: it probes at startup and prints
-# the module path + verdict before any expensive work.
 EOF
 ```
 
@@ -120,103 +103,55 @@ Used NNN registers, 0 spill stores, 0 spill loads
   aggressively (try `--ptxas-options=-O3` or `-maxrregcount=255`), or the
   compiler refusing `__launch_bounds__(128, 2)`. Last-resort remedy:
   relax `__launch_bounds__(128, 2)` to `(128, 1)` and accept 1 block/SM
-  for the BK=64 configs. Do not benchmark a spilling build.
+  for the BK=64 configs. Do not run model work on a spilling build.
 
 Also sanity-check the reported dynamic shared memory: 42,240 / 50,432 /
 49,920 bytes for the three instantiations, matching the header of
 `src/kernel_cutlass_streaming.cu`.
 
-## 4. Correctness - first-silicon bisection ladder
+## 4. Correctness spot-check (differential)
 
-Walk these steps in order. Each one isolates a failure class before the
-next runs:
+The full test-suite was removed with the cleanup; the fastest
+on-box correctness check is the built-in differential: run the same
+palettized GEMM through the production streaming kernel and its
+scalar-staging twin (`debug_simple`) and require bit-exact agreement,
+then compare both against a pure-torch dequant reference on a real
+layer shape:
 
-```bash
-# 4.1 scalar-staging twin (validates PTX fragment mapping + mma on real HW)
-python test_flute.py --backend debug_simple
+```python
+import torch, numpy as np
+import flute_extended as fx
+from flute_extended.idxN import pack_idxn
 
-# 4.2 production kernel vs reference (the multi-backend suite)
-python test_flute.py
+torch.manual_seed(0)
+M, K, N, b, gs = 256, 4096, 4096, 4, 32
+A  = torch.randn(M, K, dtype=torch.float16, device="cuda") * 0.1
+W  = (torch.randn(N, K, dtype=torch.float16, device="cuda") * 0.1)
+lut = torch.randn(N // gs, 1 << b, dtype=torch.float16, device="cuda") * 0.1
+idx = torch.randint(0, 16, (N, K), device="cuda")
+indices = pack_idxn(idx.cpu().numpy(), b)          # flat idxN blob
+indices = torch.from_numpy(indices).to("cuda")
 
-# 4.3 real-weights oracle (streaming kernel vs pure-torch dequant)
-python test_qwen_weights.py
+y_stream = fx.qgemm_per_group_lut(A, indices, lut, bitwidth=b,
+                                  group_size=gs, backend="cutlass_streaming")
+y_debug  = fx.qgemm_per_group_lut(A, indices, lut, bitwidth=b,
+                                  group_size=gs, backend="debug_simple")
+# pure-torch reference (dequant W per group, then GEMM)
+Wq = lut.reshape(-1)[ (torch.arange(N, device="cuda")[:, None] // gs) * (1 << b) + idx ].half()
+y_ref = (A.float() @ Wq.float().T).half()
+print("streaming == debug_simple:", torch.equal(y_stream, y_debug))
+print("max |streaming - ref|    :", (y_stream.float() - y_ref.float()).abs().max().item())
 ```
 
-Expected: every line `[PASS]`, final line
+Expected: `streaming == debug_simple: True` (bit-exact — this gate
+re-proves the BM repartition, the ldmatrix/swizzle staging and the
+cp.async pipeline); the torch reference agrees to fp16 rounding
+(dequant-order differences are expected, magnitude ~1e-2 at these
+scales). Bisection: if debug_simple also misses the reference, the bug
+is in the shared dequant contract (docs/DEQUANT_SPEC.md); if only
+streaming misses, it is in the staging machinery.
 
-```
-RESULT: n/n checks passed; differential gates: nibble=PASS,
-streaming==debug_simple=PASS, guards=PASS
-```
-
-(exit code 0). The suite covers both group sizes, unaligned N, thin M,
-single-K-tile cases, the tile tails (BM=128 and BM=64), the K=4128
-dispatch-fallback shape, and the real Qwen3.5-9B layer shapes.
-
-The three differential gates and what a failure means:
-
-- **nibble gate** - bit-exact LSB-first unpacking (LUT=[0..15],
-  A=identity means C equals the raw nibble values). A failure here means
-  the packed-index format is misunderstood somewhere; no other result
-  matters until it passes.
-- **streaming == debug_simple** - bit-exact equality between the
-  production kernel and its scalar-staging twin, which uses a different
-  BM tiling, so the gate re-proves the BM repartition too. If this fails
-  while both loosely match the torch reference, the bug is isolated to
-  the production staging machinery (ldmatrix / swizzle / cp.async
-  pipeline).
-- **guards** - degenerate shapes return zeros/empty; misaligned
-  storage-offset views are staged via .clone() and stay correct.
-
-Bisection map: naive fails -> data plumbing or test harness;
-debug_simple fails -> PTX fragment mapping or mma semantics; streaming
-fails the reference check -> run the streaming==debug_simple gate to
-separate staging bugs from dispatch bugs; only the deep-tile A/B fails ->
-the `<64,128,64,32>` path (cp.async tile shape or the 5-group LUT).
-
-The original quick suite also works:
-
-```bash
-python test_flute.py                    # quick multi-backend check
-python test_flute.py --layer gate_proj  # real shape, single backend
-```
-
-## 5. Performance
-
-```bash
-python benchmark_kernel.py                       # default sweep (BK=32)
-python benchmark_kernel.py --gs32-bk 64          # deep-tile A/B - run BOTH
-python benchmark_kernel.py --compare-cublas      # dense FP16 upper bound
-python benchmark_kernel.py --no-flush-l2         # optimistic upper bound
-python benchmark_kernel.py --output results.json # machine-readable
-```
-
-TFLOPS is computed as `2*M*K*N / time`; the report prints `%peak` against
-the 125 TFLOPS A10G FP16 Tensor Core dense peak (use `--peak` for other
-GPUs or locked clocks). Expected bands, acceptance criteria, and the
-miss-diagnosis guide: docs/PERFORMANCE.md.
-
-### The BK/GS A/B experiment
-
-`--gs32-bk 64` (or `FLUTE_GS32_BK=64` in the environment) opts gs=32
-layers into `<64,128,64,32>` deep K-tiles where `K % 64 == 0`: half the
-K-iterations, same one-barrier double-buffered pipeline, shared memory
-50,432 B (2 blocks/SM still fits). Measure gate/up_proj at M >= 4096
-both ways and keep the winner. Shapes with `K % 64 != 0` (e.g. K=4128)
-automatically stay on the BK=32 path.
-
-## 6. Profiling
-
-```bash
-bash tools/ncu_profile.sh 4096 gate_proj
-```
-
-Collects the four success gates (tensor-pipe >= 70%, bank conflicts
-<= 1%, registers <= 255 + zero local-memory traffic, occupancy >= 50%)
-plus `lts__t_sector_hit_rate` for the Q re-read analysis of the BM=64
-configs. Gate thresholds and interpretation: docs/PERFORMANCE.md.
-
-## 7. Using the library
+## 5. Using the library
 
 ```python
 import flute_extended
@@ -226,22 +161,23 @@ C = flute_extended.qgemm_per_group_lut(
     lut,               # [ceil(N/group_size), 16] fp16
     bitwidth=4,
     group_size=32,     # 32 (MLP gate/up) or 64 (attention + down)
-    backend="cutlass_streaming",   # or "auto" / "naive" / "optimized"
+    backend="cutlass_streaming",   # or "auto" / "debug_simple"
 )   # -> [M, N] fp16, Y = X @ W^T
 
 # Deep-tile experiment for gs=32 layers (read once per process):
 import os; os.environ["FLUTE_GS32_BK"] = "64"   # before the first call
 ```
 
-See `example.py` for a complete run with a built-in correctness check.
-
-## 8. Weight format
+## 6. Weight format
 
 The palettized weight format (packed 4-bit indices, per-group 16-entry
 LUT, LSB-first nibble order) is specified in docs/DEQUANT_SPEC.md. The
-kernels and the test suite treat that document as the contract.
+kernels treat that document as the contract. The model artifacts
+(metadata.json + per-tensor .idx/.lut files + norm_gain_edits.json) are
+provided pre-built and loaded by `scripts/eval_common.py::
+load_quant_model` / `scripts/palettized_modules.py`.
 
-## 9. Troubleshooting
+## 7. Troubleshooting
 
 - **Build fails with "C++20 or later compatible compiler is required"**:
   the host compiler defaults to an older standard; ensure g++ >= 11 or
@@ -253,13 +189,13 @@ kernels and the test suite treat that document as the contract.
   expose the requested dynamic shared memory (100 KB needs SM_86+ with
   the opt-in; the launch helper requests it once per process).
 - **Correctness fails only on multi-N-block shapes (N > 128)**: inspect
-  the epilogue's block N-offset (`n0`) in the address math - every
+  the epilogue's block N-offset (`n0`) in the address math — every
   N-block must add its own n0.
-- **Correctness fails only for `--gs32-bk 64`**: the deep-tile dispatch
-  guard (`K % 64 == 0`) or the 5-group LUT staging of
+- **Correctness fails only with `FLUTE_GS32_BK=64`**: the deep-tile
+  dispatch guard (`K % 64 == 0`) or the 5-group LUT staging of
   `<64,128,64,32>`.
-- **Performance 2-3x below the bands**: re-run the ptxas audit (section
-  3); spills are the usual cause.
-- **Bank-conflict gate fails in ncu**: compare the swizzle functions in
+- **Performance 2-3x below expectations**: re-run the ptxas audit
+  (section 3); spills are the usual cause.
+- **Bank-conflict-like stalls**: compare the swizzle functions in
   `mma.cuh` against the store-side indexing in the kernel's dequant and
   staging paths.

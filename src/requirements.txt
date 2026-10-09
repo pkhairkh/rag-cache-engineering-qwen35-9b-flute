@@ -1,15 +1,17 @@
-# Full repository dependencies (model-side scripts + tests).
-# The kernel package's own minimal set lives in flute_extended/requirements.txt;
-# scripts/provision_env_cpu.sh installs the latest stable set and records
-# the resolved environment in reports/env_coding_box.txt.
+# Minimal dependency set of the cleaned repo (verified by import trace
+# over the surviving scripts). The exact known-good pins live in
+# requirements.lock.txt (the source box's full freeze).
 torch>=2.0
 numpy
-transformers>=4.40
-datasets
+# Qwen3.5 hybrid modeling: needs cache_utils / masking_utils / models.qwen3_5
+transformers>=5.0
 safetensors
+datasets          # scripts/capture.py (teacher text corpus loader)
 huggingface_hub
-nvidia-ml-py
-pytest
-# SM86 attention kernel vehicle (PROMPT.md §3): importable and
-# interpreter-mode-runnable without a GPU; JIT-compiles on the GPU box.
+# linear-attention decode ops for modeling.py (guarded imports with
+# pure-torch fallbacks; install for speed)
+flash-linear-attention==0.5.2
+causal_conv1d==1.7.0
+# SM86 attention kernel vehicle: importable and interpreter-mode-runnable
+# without a GPU; JIT-compiles on the GPU box.
 triton

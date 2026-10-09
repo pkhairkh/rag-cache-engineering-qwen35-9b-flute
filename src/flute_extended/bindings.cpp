@@ -47,19 +47,18 @@
  *     <= 32; the plain entry takes the rotated row, the fused entry
  *     runs the boundary fold as the split-CTA prologue).
  *
- * backend is one of {"debug_simple", "cutlass_dense", "cutlass_streaming", "auto"}
+ * backend is one of {"debug_simple", "cutlass_streaming", "auto"}
  *
  * Notes:
  *   - "debug_simple"     : always available; scalar-load differential twin
  *                         of cutlass_streaming (bring-up/debugging only)
- *   - "cutlass_dense"    : requires FLUTE_HAVE_CUTLASS; takes a DENSE FP16 W
- *                         instead of indices+LUT (baseline, benchmarking)
  *   - "cutlass_streaming": always available (raw mma.m16n8k16 PTX, no
  *                         CUTLASS dependency); production kernel
  *
- * "auto" picks the best available backend for the given inputs:
- *   - If indices+LUT are provided  → cutlass_streaming
- *   - If a dense W is provided      → cutlass_dense
+ * "auto" resolves to cutlass_streaming (the dense CUTLASS baseline was
+ * removed together with the benchmarking plane — production is
+ * palettized-only; W_dense stays in the signature as an always-empty
+ * placeholder for API stability).
  */
 
 #include <torch/extension.h>
@@ -68,10 +67,6 @@
 // Forward declarations of the per-backend entrypoints (defined in other TUs).
 torch::Tensor qgemm_debug_simple(
     torch::Tensor A, torch::Tensor indices, torch::Tensor lut,
-    int64_t bitwidth, int64_t group_size);
-
-torch::Tensor qgemm_cutlass_dense(
-    torch::Tensor A, torch::Tensor W_dense,
     int64_t bitwidth, int64_t group_size);
 
 torch::Tensor qgemm_cutlass_streaming(
@@ -160,22 +155,18 @@ torch::Tensor qgemm_per_group_lut(
     int64_t q_layout
 ) {
     if (backend == "auto") {
-        if (W_dense.numel() > 0) backend = "cutlass_dense";
-        else                      backend = "cutlass_streaming";
+        backend = "cutlass_streaming";
     }
 
     if (backend == "debug_simple") {
         return qgemm_debug_simple(A, indices, lut, bitwidth, group_size);
-    } else if (backend == "cutlass_dense") {
-        return qgemm_cutlass_dense(A, W_dense, bitwidth, group_size);
     } else if (backend == "cutlass_streaming") {
         return qgemm_cutlass_streaming(A, indices, lut, bitwidth, group_size,
                                        q_layout);
     }
 
     TORCH_CHECK(false, "Unknown backend: '", backend, "'. "
-                "Expected one of: debug_simple, cutlass_dense, "
-                "cutlass_streaming, auto.");
+                "Expected one of: debug_simple, cutlass_streaming, auto.");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -190,9 +181,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("backend") = "auto",
           py::arg("q_layout") = 1);
 
-    // Direct per-backend entrypoints (useful for benchmarking)
+    // Direct per-backend entrypoints (useful for differential testing)
     m.def("qgemm_debug_simple",     &qgemm_debug_simple);
-    m.def("qgemm_cutlass_dense",    &qgemm_cutlass_dense);
     m.def("qgemm_cutlass_streaming", &qgemm_cutlass_streaming,
           py::arg("A"),
           py::arg("indices"),

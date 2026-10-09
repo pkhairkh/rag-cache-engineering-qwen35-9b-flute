@@ -1,4 +1,0 @@
-# scripts/gpu_contract_allowlist.txt — the W3-T03 R2 device-literal
-# allowlist. Every line: <file>:<line> # <justification>. Empty at
-# creation; entries are exceptions with written reasons, never
-# conveniences.

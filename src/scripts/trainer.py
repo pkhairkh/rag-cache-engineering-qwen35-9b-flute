@@ -2048,10 +2048,12 @@ def _report_dequant_paths(root, layer_idx, attn_impl=None):
 
 def _run_o1_probe(args, out_dir, layer, device, n_done):
     """The F8 corrective: run the existing O-1 paired probe (a subprocess
-    of o1_baseline_check.py against the CURRENT assembled adapter dir)
-    every --o1-even completed layers. Non-fatal (a probe failure is
-    logged loudly, the run continues); skipped with a notice when CUDA
-    is unavailable (the CPU toy box) — the probe needs the real model."""
+    against the CURRENT assembled adapter dir) every --o1-even completed
+    layers. Non-fatal (a probe failure is logged loudly, the run
+    continues); skipped with a notice when CUDA is unavailable (the CPU
+    toy box) — the probe needs the real model. The default probe script
+    (o1_baseline_check.py) is not shipped in this repo — supply
+    --o1-probe-cmd to wire an external probe."""
     if not torch.cuda.is_available():
         if not getattr(_run_o1_probe, "_noted", False):
             _run_o1_probe._noted = True
@@ -2061,6 +2063,14 @@ def _run_o1_probe(args, out_dir, layer, device, n_done):
     probe_dir = os.path.join(out_dir, "o1_probes")
     os.makedirs(probe_dir, exist_ok=True)
     log_path = os.path.join(probe_dir, f"probe_L{layer:02d}.log")
+    default_script = os.path.join(_HERE, "o1_baseline_check.py")
+    if not args.o1_probe_cmd and not os.path.isfile(default_script):
+        if not getattr(_run_o1_probe, "_no_script", False):
+            _run_o1_probe._no_script = True
+            print("  [o1] o1_baseline_check.py is not part of this repo — "
+                  "the O-1 inter-stage probe is skipped (pass "
+                  "--o1-probe-cmd to wire an external probe)", flush=True)
+        return
     tmpl = args.o1_probe_cmd or (
         "{python} scripts/o1_baseline_check.py --model {model} "
         "--artifacts-dir {artifacts} --adapters-dir {out} --device "
@@ -2592,7 +2602,7 @@ def _run_qlora_layer_job(L, cfg, teacher_source, store, args, metadata,
                     skip.append("*")
                 continue
             skip.append(pat)
-        import spectrum  # noqa: E402  (lazy: spectrum is a sibling module)
+        spectrum = _spectrum()  # noqa: E402  (absent in this repo: loud error)
         spectrum._apply_warm_starts(
             shell, args.warm_start, ctx=f"L{L}",
             skip=tuple(skip),
@@ -3677,12 +3687,34 @@ def _load_weights_alignment(path):
 # ---------------------------------------------------------------------------
 
 def _palettizer():
-    """Import the ground-truth producer module (import-safe on CPU: every
-    CUDA-touching path is function-level). Used only for
-    write_palettized_tensor so trained LUTs are written with the exact
-    canonical writer."""
-    import palettize_qwen3_5_9b as pal
-    return pal
+    """The ground-truth producer module (the canonical artifact writer).
+
+    INTENTIONALLY ABSENT in this repo: the palettized model + heads
+    artifacts exist pre-built and are deployed as-is — re-palettization
+    is out of scope. The canonical artifact export (write_layer_artifacts
+    / the `export` subcommand) is therefore unavailable here; serve
+    fine-tuned weights through the adapter channel instead
+    (qlora_adapters.pt + qlora_config.json ->
+    eval_common.load_quant_model(qlora_adapters=...))."""
+    raise SystemExit(
+        "trainer: the canonical palettizer (palettize_qwen3_5_9b.py) is "
+        "intentionally absent from this repo — the palettized model and "
+        "heads artifacts are provided pre-built. The canonical artifact "
+        "export path is unavailable; use the QLoRA adapter channel "
+        "(qlora_adapters.pt + qlora_config.json) and load it with "
+        "eval_common.load_quant_model(qlora_adapters=...).")
+
+
+def _spectrum():
+    """spectrum.py (warm-start factors + the fold-scale reader) — a
+    sibling module of the source repo, intentionally not shipped here.
+    The --warm-start path and the canonical export's fold-ratio step
+    require it; default runs never touch this path."""
+    raise SystemExit(
+        "trainer: spectrum.py was not carried into this repo — the "
+        "--warm-start path and the canonical export's fold-ratio step "
+        "are unavailable. Run without --warm-start and serve the "
+        "fine-tune through the QLoRA adapter channel instead.")
 
 
 def _module_logical_indices(mod):
@@ -4245,7 +4277,7 @@ def _export_layer_artifacts(L, cfg, teacher_source, snap, met, rank_map,
 
     # the fold ratios THROUGH the one helper (spectrum's own reader —
     # the next sweep over the exported dir sees exactly these scales)
-    import spectrum  # noqa: E402  (lazy: spectrum is a sibling module)
+    spectrum = _spectrum()  # noqa: E402  (absent in this repo: loud error)
     folds = {}
     for var, rec_f in spectrum._fold_scales(L, sd, out_dir,
                                             layer_vars).items():
@@ -5522,8 +5554,8 @@ def cmd_train(args):
         label = L if isinstance(L, str) else f"L{L:02d}"
         print(f"  {label:>4s} [{str(bt):16s}]  {c0:.6f} -> {c1:.6f}   "
               f"({'+' if c1 >= c0 else ''}{(c1 - c0) * 1e4:.1f}e-4)")
-    print(f"\nAdapter dir (generate.py / eval_* / qlora_merge ready): "
-          f"{out_dir}")
+    print(f"\nAdapter dir (serve via eval_common.load_quant_model"
+          f"(qlora_adapters=...)): {out_dir}")
     print(f"Provenance: {prov_path}")
     print(f"Total wall: {(time.time() - t_start) / 60:.1f} min")
 
