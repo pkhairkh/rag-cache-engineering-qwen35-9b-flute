@@ -73,6 +73,13 @@ def pack_bits(idx: np.ndarray, bits: int) -> np.ndarray:
     ceil(n * bits / 8) bytes."""
     if bits not in range(1, 9):
         raise ValueError(f"pack_bits: bits must be 1..8, got {bits}")
+    idx = np.asarray(idx)
+    if idx.size and idx.dtype != np.uint8:
+        # range-check BEFORE any dtype cast (wide dtypes would wrap mod 256)
+        if int(idx.max()) >= (1 << bits) or int(idx.min()) < 0:
+            raise ValueError(
+                f"pack_bits: index out of {bits}-bit range "
+                f"[{int(idx.min())}, {int(idx.max())}]")
     idx = np.ascontiguousarray(idx, dtype=np.uint8)
     if idx.size == 0:
         return np.zeros(0, dtype=np.uint8)
@@ -193,6 +200,13 @@ class TurboQuant:
                 f"contract), got {self.d}")
         if not (0 < bits <= 8):
             raise ValueError(f"TurboQuant: bits must be in (0, 8], got {bits}")
+        # codebooks are solved per integer bit-width 1..4 (the paper's range)
+        eff_bits = (int(bits), int(bits) + 1) if not float(bits).is_integer() \
+            else (int(bits), int(bits))
+        if eff_bits[0] < 1 or eff_bits[1] > 4:
+            raise ValueError(
+                f"TurboQuant: realized bit-widths {eff_bits} exceed the "
+                f"Lloyd-Max codebook range (1..4) — see codebooks.py")
         self.bits_spec = float(bits)
         if float(bits).is_integer():
             self.bits_lo = self.bits_hi = int(bits)
