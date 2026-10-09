@@ -283,6 +283,11 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
                     self._conv_shape = (codes.d,)  # flat until a real shape is known
                 self._conv_dtype = torch.float16
                 self.is_conv_states_initialized[0] = True
+            # kernel size from the window shape when known (reseeded layers
+            # skip lazy init — conv_kernel_size must not stay None)
+            if self._conv_shape is not None and len(self._conv_shape) >= 1 \
+                    and self.conv_kernel_size.get(0) is None:
+                self.conv_kernel_size[0] = int(self._conv_shape[-1])
             self.has_previous_state[0] = True
 
     def snapshot_codes(self) -> Dict[str, Optional[TQCodes]]:
