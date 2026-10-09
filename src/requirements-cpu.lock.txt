@@ -1,8 +1,5 @@
-# CPU coding-box verification environment (TASKS.md §3, Wave 0).
-# Interpreter: Python 3.12.14 (/home/z/.venv/bin/python3)
-# Installed latest-stable per the TASKS.md latest-stable rule; GPU-bound deps
-# (triton / flash-linear-attention / causal-conv1d / flute extension) are NOT in this
-# set — they follow src/requirements.lock.txt on the GPU box (documented exception).
+# CPU coding-box verification environment (TASKS.md v2 W3).
+# Interpreter: Python 3.12.14
 faiss-cpu==1.15.1
 numpy==2.1.3
 pytest==9.0.2

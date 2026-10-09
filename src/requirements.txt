@@ -1,18 +1,18 @@
-# Minimal dependency set of the cleaned repo (verified by import trace
-# over the surviving scripts). The exact known-good pins live in
-# requirements.lock.txt (the source box's full freeze).
+# Base synced from the main project (qwen3_5_9B_flute_qlora_v1.3 @ ab78893)
+# plus this repo's corrections:
+#   transformers>=5.0 — modeling.py needs the 5.x linear-attention cache
+#     protocol (layers[].recurrent_states, update_*_state) 
+#   faiss-cpu — the IVFADC index (SPECIFICATION §8/§10, CPU RAM, mmap'd)
+#   datasets dropped — capture.py is not part of this repo
 torch>=2.0
 numpy
-# Qwen3.5 hybrid modeling: needs cache_utils / masking_utils / models.qwen3_5
 transformers>=5.0
 safetensors
 huggingface_hub
-# IVFADC retrieval index (SPECIFICATION.md §8/§10) — lives in CPU RAM, mmap'd
 faiss-cpu
-# linear-attention decode ops for modeling.py (guarded imports with
-# pure-torch fallbacks; install for speed)
+# SM86 attention kernel vehicle: importable without a GPU; JIT-compiles on
+# the GPU box.
+triton
+# linear-attention decode ops (guarded imports, pure-torch fallbacks)
 flash-linear-attention==0.5.2
 causal_conv1d==1.7.0
-# SM86 attention kernel vehicle: importable and interpreter-mode-runnable
-# without a GPU; JIT-compiles on the GPU box.
-triton
