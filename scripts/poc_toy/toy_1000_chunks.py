@@ -429,7 +429,7 @@ def main():
     ap.add_argument('--n-chunks', type=int, default=1000)
     ap.add_argument('--n-queries', type=int, default=100)
     ap.add_argument('--top-k', type=int, default=3)
-    ap.add_argument('--out', default='/home/z/my-project/scripts/poc_toy/test_1000_results.json')
+    ap.add_argument('--out', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test_1000_results.json'))
     ap.add_argument('--work-dir', default='/home/z/my-project/scripts/poc_toy/test_1000')
     args = ap.parse_args()
     results = run_test(n_chunks=args.n_chunks, n_queries=args.n_queries, top_k=args.top_k,

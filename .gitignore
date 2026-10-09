@@ -3,3 +3,7 @@ __pycache__/
 *.so
 build/
 *.egg-info/
+
+# toy run artifacts (script-relative, generated)
+scripts/poc_toy/*_results.json
+scripts/poc_toy/test_1000/

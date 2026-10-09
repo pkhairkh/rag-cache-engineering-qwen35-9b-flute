@@ -487,7 +487,7 @@ def test_latency(model, device, n_chunks=32, chunk_len=16, query_len=8,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--out', default='/home/z/my-project/scripts/poc_toy/ivfadc_cache_results.json')
+    ap.add_argument('--out', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ivfadc_cache_results.json'))
     args = ap.parse_args()
 
     torch.manual_seed(0)

@@ -305,7 +305,7 @@ def main():
     ap.add_argument('--n-queries', type=int, default=50)
     ap.add_argument('--top-k', type=int, default=3)
     ap.add_argument('--pretrain-steps', type=int, default=1500)
-    ap.add_argument('--out', default='/home/z/my-project/scripts/poc_toy/cache_as_vector_results.json')
+    ap.add_argument('--out', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cache_as_vector_results.json'))
     args = ap.parse_args()
 
     torch.manual_seed(0)
