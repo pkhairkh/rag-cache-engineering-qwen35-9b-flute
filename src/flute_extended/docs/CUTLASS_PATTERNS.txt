@@ -1,0 +1,91 @@
+================================================================================
+CUTLASS_PATTERNS.txt - design patterns drawn from NVIDIA CUTLASS documentation
+================================================================================
+Source:
+  https://raw.githubusercontent.com/NVIDIA/cutlass/v3.3.0/media/docs/
+  efficient_gemm.md
+  (also mirrored at the split-K GEMV.11.0 tag; the file was relocated off `main`).
+
+--------------------------------------------------------------------------------
+PATTERN 1 - Hierarchical blocking (threadblock -> warp -> mma instruction)
+--------------------------------------------------------------------------------
+Quote: "Warp-level GEMMs may be implemented either by TensorCores issuing
+mma.sync ... For maximum performance, access to shared memory should be bank
+conflict free. To maximize data reuse within the warp, a large warp-level GEMM
+tile should be chosen."
+
+CUTLASS SM80-style mapping used by the streaming kernel:
+    Threadblock tile : 128 x 128 x BK      (BK = 32 or 64, decoupled from
+                                            group_size; BM = 64 when BK = 64)
+    Warp tile        : 64 x 64 / 32 x 64   (4 warps in 2x2)
+    Instruction      : mma.m16n8k16        (32 mma per warp per K-tile)
+This matches cutlass::gemm::GemmShape<128,128,32> / <64,64,32> / <16,8,16> -
+the same shapes kernel_cutlass_dense.cu instantiates through the CUTLASS 2.x
+device::Gemm API (Sm86, OpClassTensorOp, 2 stages).
+
+--------------------------------------------------------------------------------
+PATTERN 2 - Software pipelining / double buffering (verbatim extract)
+--------------------------------------------------------------------------------
+"To mitigate the effects of memory latency, CUTLASS uses software pipelining
+to overlap memory accesses with other computation within a thread. CUTLASS
+accomomplishes this by double buffering at the following scopes.
+
+ - Threadblock-scoped shared memory tiles: two tiles are allocated in shared
+   memory. One is used to load data for the current matrix operation, while
+   the other tile is used to buffer data loaded from global memory for the
+   next mainloop iteration.
+
+ - Warp-scoped matrix fragments: two fragments are allocated within registers.
+   One fragment is passed to CUDA and TensorCores during the current matrix
+   computation, while the other is used to receive shared memory fetch
+   returns for the next warp-level matrix operation."
+
+Applied in the streaming kernel:
+  * sA and sW are BOTH double-buffered for every tile config (BK=64 uses
+    BM=64 so two 64 x 128 x 64 buffers fit the 100 KB/SM budget at
+    2 blocks/SM: 100,864 B total);
+  * the A tile for i+1 is copied by cp.async before the MMA phase of tile i
+    (no registers held for the copy in flight);
+  * Q-index rows are prefetched into registers ahead of the MMA phase;
+  * dequant stores for i+1 are issued after the mma instructions (they
+    target the other sW buffer, so no race), followed by a single
+    __syncthreads() per K-tile.
+
+--------------------------------------------------------------------------------
+PATTERN 3 - Operand layouts <-> PTX-level equivalents
+--------------------------------------------------------------------------------
+For Y[M,N] = X[M,K] @ W[N,K]^T (the exact problem shape of this project):
+    CUTLASS LayoutA = RowMajor      (X row-major)      -> A fragments: row = groupID, K-pairs packed
+    CUTLASS LayoutB = ColumnMajor   (W^T is [K,N] col-major == W [N,K] row-major)
+                                                             -> B fragments: col = groupID, K-pairs packed
+    CUTLASS LayoutC = RowMajor      (Y row-major)
+Both operands therefore want K-contiguous shared-memory rows and NON-trans
+ldmatrix - the analysis in include/flute/mma.cuh implements exactly this.
+(This is the "Crosswise vs Congruous" distinction in CUTLASS
+cutlass/gemm/warp/mma_tensor_op_fragment_iterator.h: for f16 m16n8k16 with
+both operands K-major in smem, fragments are loaded with plain ldmatrix.x4
+and per-16B-block XOR swizzles.)
+
+--------------------------------------------------------------------------------
+PATTERN 4 - Threadblock rasterization / L2 reuse (quote)
+--------------------------------------------------------------------------------
+"Threadblock rasterization ... order the threadblocks such that consecutive
+blocks reuse data in L2." The launcher keeps the natural grid (x = N/BN,
+y = M/BM); at the model shapes (N,K in [4096,12288]) the resident-block
+working set per K-tile (~1 MB) fits the L2, and the dominant traffic (A tiles
+re-read across N-blocks, Q re-read across M-blocks) is absorbed by L2 as in
+CUTLASS's identity-swizzle baseline. Grid re-ordering is left as a tuning
+knob; it does not affect correctness.
+
+--------------------------------------------------------------------------------
+PATTERN 5 - Epilogue (quote + application)
+--------------------------------------------------------------------------------
+"The epilogue is a separate phase in which threads exchange data through
+shared memory then cooperatively access global memory using efficient striped
+access patterns."
+The kernel's epilogue is minimal (f32 -> f16 conversion + bounds-checked
+row-major stores matching the mma C-fragment layout, vectorized to 32-bit
+stores on adjacent column pairs), which is sufficient because the
+C-fragment thread mapping (row = groupID, col = 2*(lane%4)) is already
+coalesced within each 16x8 output tile.
+================================================================================

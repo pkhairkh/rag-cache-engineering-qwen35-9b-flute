@@ -10,7 +10,7 @@
  *   fht_backward(g, signs)    -> gx = g @ T^T         (autograd adjoint)
  *   fht_inplace_(x, signs)    -> x  <- x @ T          (in-place variant)
  *   fht_forward_awq(x, signs, s) -> out = ((x*s) @ T) / s
- *                              (W26: the legacy rotate-then-AWQ fold's
+ *                              (the legacy rotate-then-AWQ fold's
  *                              compensated transform, one kernel — see
  *                              fht_forward_awq_kernel)
  *
@@ -29,8 +29,7 @@
  * is safe because a segment is fully staged into shared memory before
  * any of its columns are written back.
  *
- * Resource accounting (sm_86, docs/PTX_NOTES.md section 1 — the W5
- * checklist):
+ * Resource accounting (sm_86, docs/PTX_NOTES.md section 1 — the * checklist):
  *   * one CUDA block per row (grid.x = M), THREADS in {128..1024}
  *     chosen from the largest segment (>= 4 elements per thread);
  *   * dynamic smem = 4 * b_max bytes: 16 KiB (K=4096), 32 KiB
@@ -67,8 +66,7 @@ namespace {
 // In-place use: pass out == x (safe — each segment is staged in smem
 // before its stores; segments touch disjoint column ranges).
 template <typename scalar_t, int THREADS>
-__global__ void __launch_bounds__(THREADS) fht_forward_kernel(
-    const scalar_t* __restrict__ x,      // (M, K)
+__global__ void __launch_bounds__(THREADS) fht_forward_kernel(const scalar_t* __restrict__ x,      // (M, K)
     const float*    __restrict__ signs,  // (K,)  +-1
     scalar_t*       __restrict__ out,    // (M, K)  == x allowed
     int K, flute::FhtSegs segs) {
@@ -87,15 +85,11 @@ __global__ void __launch_bounds__(THREADS) fht_forward_kernel(
         }
         __syncthreads();
 
-        for (int len = 1; len < b; len <<= 1) {
-            flute::fht_stage<THREADS>(smem, b, len);
-            __syncthreads();
-        }
+        flute::fht_block<THREADS>(smem, b);   // shift/mask + local stages
 
         // epilogue: output-side sign (T is COLUMN-scaled) + 1/sqrt(b)
         for (int j = threadIdx.x; j < b; j += THREADS) {
-            orow[off + j] = static_cast<scalar_t>(
-                smem[j] * signs[off + j] * inv_sqrt_b);
+            orow[off + j] = static_cast<scalar_t>(smem[j] * signs[off + j] * inv_sqrt_b);
         }
         __syncthreads();   // smem reused by the next segment
     }
@@ -105,8 +99,7 @@ __global__ void __launch_bounds__(THREADS) fht_forward_kernel(
 // (Hadamard is symmetric and self-inverse up to b; the sign moves to the
 // input side because the adjoint of H diag(s) is diag(s) H.)
 template <typename scalar_t, int THREADS>
-__global__ void __launch_bounds__(THREADS) fht_backward_kernel(
-    const scalar_t* __restrict__ g,      // (M, K)
+__global__ void __launch_bounds__(THREADS) fht_backward_kernel(const scalar_t* __restrict__ g,      // (M, K)
     const float*    __restrict__ signs,  // (K,)  +-1
     scalar_t*       __restrict__ gx,     // (M, K)
     int K, flute::FhtSegs segs) {
@@ -126,10 +119,7 @@ __global__ void __launch_bounds__(THREADS) fht_backward_kernel(
         }
         __syncthreads();
 
-        for (int len = 1; len < b; len <<= 1) {
-            flute::fht_stage<THREADS>(smem, b, len);
-            __syncthreads();
-        }
+        flute::fht_block<THREADS>(smem, b);   // shift/mask + local stages
 
         for (int j = threadIdx.x; j < b; j += THREADS) {
             gxrow[off + j] = static_cast<scalar_t>(smem[j] * inv_sqrt_b);
@@ -138,12 +128,12 @@ __global__ void __launch_bounds__(THREADS) fht_backward_kernel(
     }
 }
 
-// Forward + AWQ compensation (W26): out = ((x * s) @ T) / s — the exact
+// Forward + AWQ compensation : out = ((x * s) @ T) / s — the exact
 // compensated transform x @ (D T D^-1) the legacy rotate-then-AWQ
 // artifacts require (palettized_modules._rotate_input), folded into ONE
 // kernel instead of the five-op eager chain
 //     x.float() -> *s -> fht(fp32) -> /s -> .to(x.dtype)
-// (INSPECTION §3.5 item 4). Numerics are BIT-IDENTICAL to that chain:
+// (item 4). Numerics are BIT-IDENTICAL to that chain:
 //   * prologue   smem[j] = float(x[off+j]) * s[off+j]
 //     (float(x) is the exact x.float() cast; the multiply is the same
 //     fp32 op in the same order);
@@ -156,8 +146,7 @@ __global__ void __launch_bounds__(THREADS) fht_backward_kernel(
 // chain's fp32 round-trip tensors never exist, halving the transform's
 // global traffic.
 template <typename scalar_t, int THREADS>
-__global__ void __launch_bounds__(THREADS) fht_forward_awq_kernel(
-    const scalar_t* __restrict__ x,      // (M, K)
+__global__ void __launch_bounds__(THREADS) fht_forward_awq_kernel(const scalar_t* __restrict__ x,      // (M, K)
     const float*    __restrict__ signs,  // (K,)  +-1
     const float*    __restrict__ s,      // (K,)  positive AWQ scales
     scalar_t*       __restrict__ out,    // (M, K)
@@ -177,10 +166,7 @@ __global__ void __launch_bounds__(THREADS) fht_forward_awq_kernel(
         }
         __syncthreads();
 
-        for (int len = 1; len < b; len <<= 1) {
-            flute::fht_stage<THREADS>(smem, b, len);
-            __syncthreads();
-        }
+        flute::fht_block<THREADS>(smem, b);   // shift/mask + local stages
 
         for (int j = threadIdx.x; j < b; j += THREADS) {
             const float t = smem[j] * signs[off + j] * inv_sqrt_b;
@@ -215,17 +201,14 @@ void launch_fht(const scalar_t* in, const float* signs, scalar_t* out,
         ? reinterpret_cast<const void*>(&fht_backward_kernel<scalar_t, THREADS>)
         : reinterpret_cast<const void*>(&fht_forward_kernel<scalar_t, THREADS>);
     if (smem_bytes > kMaxDefaultSmem) {
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
     }
     if (kBackward) {
         fht_backward_kernel<scalar_t, THREADS>
-            <<<M, THREADS, smem_bytes, stream>>>(
-                in, signs, out, K, segs);
+            <<<M, THREADS, smem_bytes, stream>>>(in, signs, out, K, segs);
     } else {
         fht_forward_kernel<scalar_t, THREADS>
-            <<<M, THREADS, smem_bytes, stream>>>(
-                in, signs, out, K, segs);
+            <<<M, THREADS, smem_bytes, stream>>>(in, signs, out, K, segs);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -256,7 +239,7 @@ void fht_dispatch(const scalar_t* in, const float* signs, scalar_t* out,
     }
 }
 
-// W26: the compensated forward (see fht_forward_awq_kernel above). Same
+// the compensated forward (see fht_forward_awq_kernel above). Same
 // THREADS ladder and > 48 KiB opt-in discipline as the plain forward.
 template <typename scalar_t, int THREADS>
 void launch_fht_awq(const scalar_t* in, const float* signs, const float* s,
@@ -270,8 +253,7 @@ void launch_fht_awq(const scalar_t* in, const float* signs, const float* s,
     const void* kfn = reinterpret_cast<const void*>(
         &fht_forward_awq_kernel<scalar_t, THREADS>);
     if (smem_bytes > kMaxDefaultSmem) {
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
     }
     fht_forward_awq_kernel<scalar_t, THREADS>
         <<<M, THREADS, smem_bytes, stream>>>(in, signs, s, out, K, segs);
@@ -341,10 +323,8 @@ torch::Tensor fht_forward(torch::Tensor x, torch::Tensor signs) {
     const int K = static_cast<int>(x.size(1));
     torch::Tensor out = torch::empty_like(x);
     auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, x.scalar_type(), "fht_forward", [&] {
-            fht_dispatch<scalar_t, false>(
-                x.data_ptr<scalar_t>(), signs.data_ptr<float>(),
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "fht_forward", [&] {
+            fht_dispatch<scalar_t, false>(x.data_ptr<scalar_t>(), signs.data_ptr<float>(),
                 out.data_ptr<scalar_t>(), M, K, stream);
         });
     return out;
@@ -356,10 +336,8 @@ torch::Tensor fht_backward(torch::Tensor grad_out, torch::Tensor signs) {
     const int K = static_cast<int>(grad_out.size(1));
     torch::Tensor gx = torch::empty_like(grad_out);
     auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, grad_out.scalar_type(), "fht_backward", [&] {
-            fht_dispatch<scalar_t, true>(
-                grad_out.data_ptr<scalar_t>(), signs.data_ptr<float>(),
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, grad_out.scalar_type(), "fht_backward", [&] {
+            fht_dispatch<scalar_t, true>(grad_out.data_ptr<scalar_t>(), signs.data_ptr<float>(),
                 gx.data_ptr<scalar_t>(), M, K, stream);
         });
     return gx;
@@ -370,16 +348,14 @@ torch::Tensor fht_inplace(torch::Tensor x, torch::Tensor signs) {
     const int M = static_cast<int>(x.size(0));
     const int K = static_cast<int>(x.size(1));
     auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, x.scalar_type(), "fht_inplace", [&] {
-            fht_dispatch<scalar_t, false>(
-                x.data_ptr<scalar_t>(), signs.data_ptr<float>(),
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "fht_inplace", [&] {
+            fht_dispatch<scalar_t, false>(x.data_ptr<scalar_t>(), signs.data_ptr<float>(),
                 x.data_ptr<scalar_t>(), M, K, stream);
         });
     return x;
 }
 
-// W26: the compensated forward — out = ((x * s) @ T) / s (one kernel;
+// the compensated forward — out = ((x * s) @ T) / s (one kernel;
 // bit-identical to the eager five-op chain it replaces; see
 // fht_forward_awq_kernel above). `s` must be a (K,) contiguous float32
 // CUDA tensor (the module validates finite/positive at load; a zero or
@@ -398,10 +374,8 @@ torch::Tensor fht_forward_awq(torch::Tensor x, torch::Tensor signs,
     const int K = static_cast<int>(x.size(1));
     torch::Tensor out = torch::empty_like(x);
     auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16, x.scalar_type(), "fht_forward_awq", [&] {
-            fht_dispatch_awq<scalar_t>(
-                x.data_ptr<scalar_t>(), signs.data_ptr<float>(),
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "fht_forward_awq", [&] {
+            fht_dispatch_awq<scalar_t>(x.data_ptr<scalar_t>(), signs.data_ptr<float>(),
                 s.data_ptr<float>(), out.data_ptr<scalar_t>(), M, K, stream);
         });
     return out;

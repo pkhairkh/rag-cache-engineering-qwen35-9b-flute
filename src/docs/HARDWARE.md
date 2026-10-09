@@ -1,73 +1,80 @@
-# HARDWARE.md — the AWS A10G, verified
+# Hardware — the A10G deployment target
 
-Every performance number in this repo is calibrated against the actual
-deployment target: the **NVIDIA A10G as deployed in AWS EC2 G5 instances**
-(24 GB, single-slot, 8-pin EPS). This is NOT the 150 W A10 PCIe card.
-Facts below were verified against AWS's own G5 announcement, real
-`nvidia-smi` output from G5 instances, and the TechPowerUp GPU database.
+The facts every performance claim in this repo is calibrated against.
+Target: one AWS g5.xlarge — the **NVIDIA A10G as deployed in EC2 G5**
+(24 GB, single-slot, 300 W), NOT the 150 W A10 PCIe card.
 
-## Specification
+## 1. Specification
 
-| Attribute | Value | Source |
+| Item | Value |
+|---|---|
+| GPU | NVIDIA A10G (AWS g5), GA102, SM_86 |
+| SMs | **80** (320 third-gen tensor cores ÷ 4; cross-checked against CUDA core count 10,240 = 80 × 128) |
+| CUDA cores | 10,240 |
+| L2 cache | 6 MB |
+| DRAM | 24 GB GDDR6, 384-bit, **~600 GB/s** |
+| Shared memory | 100 KB/SM (dynamic smem opt-in; the streaming kernel's 42-50 KB tiles fit 2 CTAs/SM) |
+| Board power | 300 W (expect ~80-90% of the power limit under decode load) |
+| Visible memory | ≈22.06 GiB to the process |
+| FP16/BF16 tensor, FP32-acc | 69.8 TFLOPS @ 1710 MHz boost; **~62.5 TFLOPS sustained** (~1.53 GHz) |
+| FP16 tensor, FP16-acc | 139.6 TFLOPS boost (the 2x-rate — not this repo's regime; every kernel here and cuBLAS default accumulate in FP32) |
+
+Peak-efficiency percentages in the docs use **62.5 TFLOPS** (FP32-acc
+sustained). Sustained clock droop under memory load is real; lock
+clocks for A/B comparisons (`flute_extended/tools/lock_clocks.sh`).
+
+## 2. The memory-wall arithmetic
+
+The decode regime (M = 1) is bandwidth-bound, and the wall is simple:
+
+- Per-SM bandwidth share = 600/80 = **7.5 GB/s**. A kernel that leaves
+  an SM without a resident CTA donates that 7.5 GB/s to nobody — which
+  is why the split-K grid policy targets ≥ 160 CTAs (2 waves).
+- DRAM latency through L2 ≈ 600-900 ns. To saturate 7.5 GB/s an SM
+  needs ~(7.5 GB/s × 700 ns) ≈ **5.3 KB of loads in flight,
+  sustained** — with 16 B/thread loads that is ~330 in-flight lanes,
+  i.e. ≥ 10 warps issuing back-to-back or explicit prefetch. This is
+  the number behind the double-buffered K loop design.
+- L2 = 6 MB: every LUT (2-24 KB per module) and every resB (≤ 131 KB)
+  is L2-resident after the first touch; the streams themselves (0.5-25
+  MB per module) are not — they are the traffic.
+- The crossover: below ~104 FP32-acc MAC-equivalents per streamed byte,
+  every GEMM is bandwidth-bound and the ceiling is bytes/time. Dense
+  FP16 moves 2.0 B/param; the deployed palettized model ~0.5-0.6 B/param
+  + LUT — the format's ceiling advantage is ~3.5-4x, and the 2x target
+  lives comfortably inside it.
+
+Floors at the wall (5.38 GiB of streams per token):
+
+| stream | at 600 GB/s | at 492 GB/s (demonstrated) |
 |---|---|---|
-| GPU | GA102 (Ampere, SM_86) | TechPowerUp / Modal |
-| SMs | **80** (= 320 Tensor Cores = 80 RT cores / 4) | AWS News Blog (320 TC, 80 RT) |
-| Board power limit | **300 W** (not the 150 W of A10 PCIe) | nvidia-smi on G5: "Power Limit : 300.00 W" |
-| Memory | 24 GB GDDR6, ECC | AWS / Modal |
-| Memory bandwidth | 600 GB/s | AWS / Baseten |
-| Memory clock | 12.5 Gbps effective | TechPowerUp |
-| Boost clock | 1710 MHz | TechPowerUp |
-| Sustained TC clock | ~1.53 GHz (derived from AWS's "250 TOPS INT8") | AWS blog + arithmetic |
-| L2 cache | 6 MB | GA102 family |
-| Shared memory | 100 KB/SM, 99 KB max/block (SM86 class) | CUDA Ampere tuning guide |
+| 5.38 GiB | 9.6 ms/token | 11.7 ms/token |
+| dense ~16.9 GiB | 28.5 ms/token | — |
 
-## Throughput ceilings (80 SM — derived from GA102 per-SM rates)
+Dense decode at 41.6 ms/token runs at ~1.46x ITS floor; the palettized
+model at 40.7 ms/token runs at ~4.2x its floor. The difference is
+kernel efficiency, not physics — see [PERFORMANCE.md](PERFORMANCE.md).
 
-Per SM per clock: FP16-acc TC 1024 ops, FP32-acc TC 512 ops, INT8 2048 ops,
-FP32 CUDA 256 ops.
+## 3. sm_86 kernel engineering facts
 
-| Metric | @ boost 1710 MHz | @ sustained ~1.53 GHz |
-|---|---|---|
-| FP16 TC dense, **FP16 accumulate** | 139.6 TFLOPS | ~125 TFLOPS |
-| FP16 TC dense, **FP32 accumulate** | 69.8 TFLOPS | ~62.5 TFLOPS |
-| INT8 TC dense | 279 TOPS | 250 TOPS (AWS's number) |
-| FP32 (CUDA cores) | 34.9 TFLOPS | ~31.3 TFLOPS |
+The constraints the kernels are built against:
 
-Three consequences that the earlier benchmarking missed:
+| Resource | sm_86 limit |
+|---|---|
+| Registers/thread | 255 (the streaming kernel targets 130-210; zero spills is a hard gate) |
+| Shared memory/SM | 100 KB (opt-in via `cudaFuncSetAttribute`, requested once per process) |
+| Max threads/SM | 1536 (2 CTAs of 128 threads × 4 warps design) |
+| `mma.m16n8k16` f16 | requires SM_80+ (SM_75 is excluded from the gencode set) |
+| `ld.global.nc` | legal; `evict_first` L2 hint is ILLEGAL on Ampere (SM_80-89) — not emitted |
 
-1. **The 142 TFLOPS figure in the original kernel notes is explained** — it
-   is the A10G FP16-ACCUMULATE dense rate at full boost. It is NOT
-   attainable by this kernel, by cuBLAS fp16 with default settings, or by
-   `torch.matmul`: they all accumulate in FP32, whose honest ceiling is
-   **62.5 TFLOPS sustained / ~70 at boost**. `benchmark_kernel.py` defaults
-   `--peak 62.5` accordingly (use `--peak 125` only for FP16-acc kernels).
-2. **The measured 60.38 TFLOPS (MLP-32) was ~97 % of the FP32-acc
-   sustained peak** — the v5 streaming kernel was already near that
-   roofline; the remaining prefill gap vs dense was dequant overhead and
-   clock behavior, not HMMA scheduling.
-3. **The 239–272 W power readings are physical**: 80–91 % of the 300 W
-   limit. The earlier "impossible on a 150 W A10, must be an RTX 3090"
-   hypothesis was wrong — it compared against the wrong A10 variant.
+The full worked occupancy arithmetic and the ptxas audit commands:
+[BUILD.md](BUILD.md) §4; the design patterns applied from the CUTLASS
+docs: `flute_extended/docs/CUTLASS_PATTERNS.txt`.
 
-## Verify on your box
+## 4. Other GPUs
 
-```bash
-nvidia-smi -q -i 0 | grep -A4 "Power"        # Power Limit : 300.00 W
-nvidia-smi --query-gpu=name,clocks.max.sm --format=csv
-deviceQuery | grep -E "multiprocessors|Shared mem"   # 80 SMs, 100 KB smem/SM
-sudo tools/lock_clocks.sh status
-```
-
-For reproducible A/B numbers, lock clocks for the WHOLE comparison:
-`sudo tools/lock_clocks.sh 1530 <max-mem-clock>` (suggested sustained
-point — see the script header), and re-measure with
-`benchmark_kernel.py --energy` for the power/energy columns.
-
-## Decode-regime physics (unchanged, now grounded)
-
-600 GB/s of bandwidth and 2.0 (dense) vs 0.5 (4-bit) bytes per weight put
-the compute-vs-weight-stream crossover at M ≈ 62.5e12 / 600e9 ≈ 104
-FP32-acc MAC-equivalents per weight byte. Below that (decode, M = 1..32),
-throughput is weight-stream-bound and the 4-bit model's ceiling advantage
-is the byte ratio, ~4x. That regime is what
-`benchmark_kernel.py --decode-sweep` measures.
+The same kernels build for any SM_80+ part (A100 / L40 / H100) via
+`FLUTE_CUDA_ARCHES` ([BUILD.md](BUILD.md)) — with adjusted clocks and
+peak expectations. The routing policy's CTA targets (≥ 160 CTAs) are
+A10G-calibrated (80 SMs × 2 waves); re-derive for a different SM count
+before trusting a bandwidth number off-target.

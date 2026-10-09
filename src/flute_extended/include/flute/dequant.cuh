@@ -34,8 +34,7 @@ __device__ __forceinline__ uint8_t decode_nibble(const uint8_t* byte_ptr, int la
 
 // Decode a full uint8_t containing two nibbles into two FP16 values
 // using a 16-entry FP16 LUT. Returns both values via pointers.
-__device__ __forceinline__ void decode_pair(
-    uint8_t packed,
+__device__ __forceinline__ void decode_pair(uint8_t packed,
     const __half* lut_row,   // 16 FP16 entries for this group
     __half& lo,              // index = packed & 0x0F
     __half& hi               // index = (packed >> 4) & 0x0F
@@ -78,8 +77,7 @@ __device__ __forceinline__ int group_of(int n, int group_size) {
 // field never crosses the row end, so the window never reads past the
 // row).
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ void decode_pair_b1(
-    const uint8_t* row, int k, uint8_t& v0, uint8_t& v1
+__device__ __forceinline__ void decode_pair_b1(const uint8_t* row, int k, uint8_t& v0, uint8_t& v1
 ) {
     const uint8_t b = row[k >> 3];
     const int off = k & 7;               // k even => off in {0,2,4,6}
@@ -87,8 +85,7 @@ __device__ __forceinline__ void decode_pair_b1(
     v1 = uint8_t((b >> (off + 1)) & 0x1);
 }
 
-__device__ __forceinline__ void decode_pair_b2(
-    const uint8_t* row, int k, uint8_t& v0, uint8_t& v1
+__device__ __forceinline__ void decode_pair_b2(const uint8_t* row, int k, uint8_t& v0, uint8_t& v1
 ) {
     const uint8_t b = row[k >> 2];
     const int off = 2 * (k & 3);         // k even => off in {0,2,4,6}
@@ -96,8 +93,7 @@ __device__ __forceinline__ void decode_pair_b2(
     v1 = uint8_t((b >> (off + 2)) & 0x3);
 }
 
-__device__ __forceinline__ void decode_pair_b3(
-    const uint8_t* row, int k, uint8_t& v0, uint8_t& v1
+__device__ __forceinline__ void decode_pair_b3(const uint8_t* row, int k, uint8_t& v0, uint8_t& v1
 ) {
     const int bit = 3 * k;               // k even => bit mod 8 in {0,6,4,2}
     const int byte = bit >> 3;

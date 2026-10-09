@@ -1,0 +1,19 @@
+# Source
+include README.md
+include LICENSE
+include requirements.txt
+include setup.py
+include example.py
+include test_flute.py
+include test_qwen_weights.py
+include benchmark_kernel.py
+recursive-include include *.cuh
+recursive-include src *.cu *.cpp
+recursive-include flute_extended *.py
+recursive-include docs *.md *.txt
+recursive-include tools *.sh
+# NEVER ship prebuilt binaries or caches:
+global-exclude *.so
+global-exclude *.pyc
+global-exclude __pycache__
+global-exclude build

@@ -1,7 +1,7 @@
 /**
  * src/kernel_debug_simple.cu
  *
- * Differential-testing twin of kernel_cutlass_streaming.cu: the same GEMM,
+ * Differential-testing twin of kernel_streaming.cu: the same GEMM,
  * the same mma.sync.m16n8k16 (f32 accumulate) instruction, the same
  * fragment mapping and the same epilogue — with deliberately simple
  * staging:
@@ -61,7 +61,7 @@ struct SimpleConfig {
     static constexpr int BM = 128;
     static constexpr int BN = 128;
     static constexpr int BK = BK_;                  // K-tile depth (32/64)
-    static constexpr int GS = GS_;                  // LUT group size (W12: 16..512, decoupled from BK)
+    static constexpr int GS = GS_;                  // LUT group size (16..512, decoupled from BK)
 
     static constexpr int WM = 64;
     static constexpr int WN = 64;
@@ -74,7 +74,7 @@ struct SimpleConfig {
     static constexpr int N_TILES = WN / 8;          // 8
     static constexpr int K_TILES = BK / 16;         // 2 (BK=32) or 4 (BK=64)
 
-    // W12: LUT groups from GS (not BK) — GS <= BN: BN/GS + 1; GS > BN: the
+    // LUT groups from GS (not BK) — GS <= BN: BN/GS + 1; GS > BN: the
     // 128-row N-tile straddles at most one group boundary -> 2.
     static constexpr int LUT_GRPS = ((BN + GS - 1) / GS) + 1;
 
@@ -92,8 +92,7 @@ struct debug_gs_supported : std::bool_constant<
 // Kernel
 // ---------------------------------------------------------------------------
 template <typename Cfg>
-__global__ void flute_kernel_debug_simple(
-    const __half*    __restrict__ A,    // [M, K] row-major
+__global__ void flute_kernel_debug_simple(const __half*    __restrict__ A,    // [M, K] row-major
     const uint8_t*   __restrict__ Q,    // [N, (K+1)/2] packed 4-bit
     const __half*    __restrict__ LUT,  // [ceil(N/GS), 16]
     __half*          __restrict__ C,    // [M, N] row-major
@@ -144,7 +143,7 @@ __global__ void flute_kernel_debug_simple(
     const int drow     = tid;                    // 0..BN-1
     const int drow_abs = n0 + drow;
     const bool drow_ok = drow_abs < N;
-    // W12: group row from the ABSOLUTE row (== drow/GS when n0 is
+    // group row from the ABSOLUTE row (== drow/GS when n0 is
     // GS-aligned; handles the GS > BN straddle).
     const int g_lut    = (n0 + drow) / Cfg::GS - grp_first;
     const uint8_t* q_row = drow_ok ? Q + (size_t)drow_abs * row_stride : Q;
@@ -281,8 +280,7 @@ __global__ void flute_kernel_debug_simple(
 namespace {
 
 template <typename Cfg, int B>
-__global__ void flute_kernel_debug_simple_sub4(
-    const __half*    __restrict__ A,    // [M, K] row-major
+__global__ void flute_kernel_debug_simple_sub4(const __half*    __restrict__ A,    // [M, K] row-major
     const uint8_t*   __restrict__ Q,    // [N, K*B/8] packed b-bit, LSB-first
     const __half*    __restrict__ LUT,  // [ceil(N/GS), 2^B]
     __half*          __restrict__ C,    // [M, N] row-major
@@ -333,7 +331,7 @@ __global__ void flute_kernel_debug_simple_sub4(
     const int drow     = tid;                    // 0..BN-1
     const int drow_abs = n0 + drow;
     const bool drow_ok = drow_abs < N;
-    // W12: absolute-row group (see the 4-bit debug kernel above).
+    // absolute-row group (see the 4-bit debug kernel above).
     const int g_lut    = (n0 + drow) / Cfg::GS - grp_first;
     const uint8_t* q_row = drow_ok ? Q + (size_t)drow_abs * row_stride : Q;
 
@@ -456,8 +454,7 @@ __global__ void flute_kernel_debug_simple_sub4(
 // Host-side dispatch (public entrypoint; mirrors the streaming dispatcher's
 // validation but without the 16-byte alignment requirement — scalar loads)
 // ---------------------------------------------------------------------------
-torch::Tensor qgemm_debug_simple(
-    torch::Tensor A,
+torch::Tensor qgemm_debug_simple(torch::Tensor A,
     torch::Tensor indices,
     torch::Tensor lut,
     int64_t bitwidth,
@@ -473,7 +470,7 @@ torch::Tensor qgemm_debug_simple(
     TORCH_CHECK(group_size == 16 || group_size == 32 || group_size == 64 ||
                 group_size == 128 || group_size == 256 || group_size == 512,
                 "group_size must be one of 16/32/64/128/256/512 "
-                "(W12 full-GS-range kernels)");
+                "(full-GS-range kernels)");
     TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, K]");
     TORCH_CHECK(indices.dim() == 2, "indices must be 2-D [N, K*bitwidth/8]");
     const int B = (int)bitwidth;
@@ -487,7 +484,7 @@ torch::Tensor qgemm_debug_simple(
                 "A, indices, lut must be contiguous");
     TORCH_CHECK(K % 32 == 0,
                 "K must be a multiple of 32 (the debug twin's BK constraint; "
-                "GS no longer constrains K — the W12 decoupling)");
+                "GS no longer constrains K — the decoupling)");
     TORCH_CHECK(indices.size(1) == row_bytes,
                 "indices must have shape [N, K*bitwidth/8]");
     TORCH_CHECK(lut.size(0) == (N + group_size - 1) / group_size,
@@ -503,7 +500,7 @@ torch::Tensor qgemm_debug_simple(
     dim3 block(128);
     dim3 grid((N + 127) / 128, (M + 127) / 128);
 
-    // W12: BK decoupled from GS (the streaming kernel's rule): GS <= 32 ->
+    // BK decoupled from GS (the streaming kernel's rule): GS <= 32 ->
     // BK=32; GS >= 64 -> BK=64 whenever K % 64 == 0, else BK=32. The GS
     // arm is a hard TORCH_CHECK by construction (the default case).
 #define FLUTE_LAUNCH_DEBUG_SIMPLE(KER)                                        \

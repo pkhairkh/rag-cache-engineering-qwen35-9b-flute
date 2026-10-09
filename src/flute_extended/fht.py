@@ -158,8 +158,7 @@ def build_rotation_matrix(K: int, seed: int) -> torch.Tensor:
         return hadamard_matrix(K) * s.view(1, K) / math.sqrt(K)
     T = torch.zeros(K, K, dtype=torch.float32)
     for off, b in segments(K):
-        T[off:off + b, off:off + b] = (
-            hadamard_matrix(b) * s[off:off + b].view(1, b) / math.sqrt(b))
+        T[off:off + b, off:off + b] = (hadamard_matrix(b) * s[off:off + b].view(1, b) / math.sqrt(b))
     return T
 
 
@@ -190,8 +189,7 @@ def _butterfly(v: torch.Tensor) -> torch.Tensor:
 
 def _check_shape(x: torch.Tensor, signs: torch.Tensor) -> Tuple[int, int]:
     if signs.dim() != 1 or signs.numel() != x.shape[-1]:
-        raise ValueError(
-            f"fht: signs must be a (K,) vector matching x's last dim "
+        raise ValueError(f"fht: signs must be a (K,) vector matching x's last dim "
             f"(got signs {tuple(signs.shape)}, x {tuple(x.shape)})")
     if not torch.is_floating_point(x):
         raise TypeError(f"fht: x must be floating point, got {x.dtype}")
@@ -252,8 +250,7 @@ def fht_matmul(x: torch.Tensor, signs: torch.Tensor,
         s = signs.float()
     T = torch.zeros(K, K, dtype=torch.float32)
     for off, b in segments(K):
-        T[off:off + b, off:off + b] = (
-            hadamard_matrix(b) * s[off:off + b].view(1, b) / math.sqrt(b))
+        T[off:off + b, off:off + b] = (hadamard_matrix(b) * s[off:off + b].view(1, b) / math.sqrt(b))
     return (x.reshape(M, K).float() @ T).reshape(*x.shape[:-1], K).to(x.dtype)
 
 
@@ -322,8 +319,7 @@ def kernel_available(x: Optional[torch.Tensor] = None) -> bool:
 
 def _resolve_backend(backend: FhtBackend, x: torch.Tensor) -> str:
     if backend not in ("auto", "kernel", "reference", "matmul"):
-        raise ValueError(
-            f"fht: unknown backend {backend!r} (expected 'auto', 'kernel', "
+        raise ValueError(f"fht: unknown backend {backend!r} (expected 'auto', 'kernel', "
             f"'reference' or 'matmul')")
     if backend in ("reference", "matmul"):
         return backend
@@ -351,8 +347,7 @@ def _raw_kernel_apply(x2d: torch.Tensor, signs: torch.Tensor,
         # the kernel's segment table + thread geometry contract; fall to
         # the reference rather than refusing (auto mode only reaches
         # here for exotic K; "kernel" mode is validated above)
-        return (fht_reference_adjoint if transpose else fht_reference)(
-            x2d, signs)
+        return (fht_reference_adjoint if transpose else fht_reference)(x2d, signs)
     signs_f = signs if (signs.is_cuda and signs.dtype == torch.float32
                         and signs.is_contiguous()) else \
         signs.detach().to(x2d.device, torch.float32).contiguous()
@@ -389,21 +384,18 @@ class _FhtFn(torch.autograd.Function):
                             device=x2d.device)
             s = signs.float()
             for off, b in segments(K):
-                T[off:off + b, off:off + b] = (
-                    hadamard_matrix(b).to(x2d.device)
+                T[off:off + b, off:off + b] = (hadamard_matrix(b).to(x2d.device)
                     * s[off:off + b].view(1, b) / math.sqrt(b))
             return (x2d.float() @ (T.t() if transpose else T)).to(x2d.dtype)
         # reference
-        return (fht_reference_adjoint if transpose else fht_reference)(
-            x2d, signs)
+        return (fht_reference_adjoint if transpose else fht_reference)(x2d, signs)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         signs, = ctx.saved_tensors
         g = grad_out.contiguous()
         # the adjoint of the adjoint is the forward and vice versa
-        gx = _FhtFn.apply(
-            g, signs, not ctx.transpose, ctx.backend)
+        gx = _FhtFn.apply(g, signs, not ctx.transpose, ctx.backend)
         return gx, None, None, None
 
 
@@ -452,16 +444,15 @@ def _check_scale(x: torch.Tensor, s: torch.Tensor) -> None:
     load; the kernel divides honestly — a bad entry yields inf/NaN
     outputs, never a silent clamp)."""
     if s.dim() != 1 or s.numel() != x.shape[-1]:
-        raise ValueError(
-            f"fht_awq: s must be a (K,) vector matching x's last dim "
+        raise ValueError(f"fht_awq: s must be a (K,) vector matching x's last dim "
             f"(got s {tuple(s.shape)}, x last dim {x.shape[-1]})")
     if not torch.is_floating_point(s):
         raise TypeError(f"fht_awq: s must be floating point, got {s.dtype}")
 
 
 def _awq_kernel_available() -> bool:
-    """True when the built extension exports fht_forward_awq (a W26+
-    build). A pre-W26 extension keeps the compensated fold on the torch
+    """True when the built extension exports fht_forward_awq (a +
+    build). A older extension keeps the compensated fold on the torch
     chain — a performance fallback, never a correctness one."""
     C = _load_kernel()
     return C is not None and hasattr(C, "fht_forward_awq")
@@ -470,11 +461,11 @@ def _awq_kernel_available() -> bool:
 def fht_apply_awq(x: torch.Tensor, signs: torch.Tensor, s: torch.Tensor,
                   backend: FhtBackend = "auto") -> torch.Tensor:
     """out = ((x * s) @ T) / s — the AWQ-compensated boundary-fold rotation
-    (the legacy rotate-then-AWQ artifacts' x @ (D T D^-1); W26).
+    (the legacy rotate-then-AWQ artifacts' x @ (D T D^-1); ).
 
     ONE CUDA kernel on the "kernel"/"auto" path (fht_forward_awq: the
     scale multiply folded into the butterfly's prologue, the unscale
-    division into its epilogue) — replacing the pre-W26 five-op eager
+    division into its epilogue) — replacing the older five-op eager
     chain `fht_apply(x.float() * s, signs) / s` (INSPECTION §3.3 item 5,
     the 99 AWQ-consumer modules' fp32 cast-multiply-divide chains). The
     kernel is bit-identical to that chain: same fp32 cast, same
@@ -484,16 +475,15 @@ def fht_apply_awq(x: torch.Tensor, signs: torch.Tensor, s: torch.Tensor,
     x: (..., K) fp16/bf16/fp32 (read natively — the fp32 round-trip
     tensors of the eager chain never exist). s: (K,) float32, x's device.
     Autograd flows through (the eager chain's backward). backends:
-    "auto" (kernel when the W26 extension + CUDA input, the torch chain
+    "auto" (kernel when the extension + CUDA input, the torch chain
     otherwise), "kernel" (loud refusal when either the extension or the
-    W26 binding is missing), "reference" (the torch chain, CPU-legal),
+     binding is missing), "reference" (the torch chain, CPU-legal),
     "matmul" (the explicit (x*s) @ T / s — differential testing only).
     """
     M, K = _check_shape(x, signs)
     _check_scale(x, s)
     if backend not in ("auto", "kernel", "reference", "matmul"):
-        raise ValueError(
-            f"fht_awq: unknown backend {backend!r} (expected 'auto', "
+        raise ValueError(f"fht_awq: unknown backend {backend!r} (expected 'auto', "
             f"'kernel', 'reference' or 'matmul')")
 
     x2d = x.reshape(M, K)
@@ -507,8 +497,7 @@ def fht_apply_awq(x: torch.Tensor, signs: torch.Tensor, s: torch.Tensor,
             or not s.is_contiguous():
         s = s.to(x2d.device, torch.float32).contiguous()
 
-    use_kernel = (
-        backend in ("auto", "kernel")
+    use_kernel = (backend in ("auto", "kernel")
         and x2d.is_cuda
         and K >= 32 and K % 32 == 0 and K <= (1 << 16) - 32
         and _awq_kernel_available()
@@ -516,7 +505,7 @@ def fht_apply_awq(x: torch.Tensor, signs: torch.Tensor, s: torch.Tensor,
     if backend == "kernel" and not use_kernel:
         raise RuntimeError(
             "fht_apply_awq(backend='kernel'): the compensated-FHT CUDA "
-            "kernel is unavailable (not built, a pre-W26 extension, a "
+            "kernel is unavailable (not built, an older extension, a "
             "non-CUDA input, or K outside the kernel contract). Rebuild "
             "with `cd flute_extended && python setup.py build_ext "
             "--inplace`, or use backend='auto'/'reference'. Never a "
@@ -529,12 +518,11 @@ def fht_apply_awq(x: torch.Tensor, signs: torch.Tensor, s: torch.Tensor,
         T = torch.zeros(K, K, dtype=torch.float32, device=x2d.device)
         sf = signs.float()
         for off, b in segments(K):
-            T[off:off + b, off:off + b] = (
-                hadamard_matrix(b).to(x2d.device)
+            T[off:off + b, off:off + b] = (hadamard_matrix(b).to(x2d.device)
                 * sf[off:off + b].view(1, b) / math.sqrt(b))
         out = ((x2d.float() * s) @ T / s).to(x2d.dtype)
     else:
-        # reference: the exact pre-W26 torch chain (bit-identical math —
+        # reference: the exact older torch chain (bit-identical math —
         # fp32 in/out butterfly, the /s as an fp32 division, the final
         # cast to x.dtype). Autograd flows through it.
         out = fht_reference(x2d.float() * s, signs).float() / s
@@ -581,8 +569,7 @@ def build_rotation_matrix_from_signs(signs: torch.Tensor, K: int,
     T = torch.zeros(K, K, dtype=torch.float32)
     s = signs.detach().float().cpu()
     for off, b in segments(K):
-        T[off:off + b, off:off + b] = (
-            hadamard_matrix(b) * s[off:off + b].view(1, b) / math.sqrt(b))
+        T[off:off + b, off:off + b] = (hadamard_matrix(b) * s[off:off + b].view(1, b) / math.sqrt(b))
     return T.to(device) if device is not None else T
 
 

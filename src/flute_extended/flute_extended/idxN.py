@@ -95,19 +95,16 @@ def check_bits(bits: int) -> int:
     """Validate and normalize a bit width of the idxN family."""
     b = int(bits)
     if b not in BITS_SUPPORTED:
-        raise ValueError(
-            f"idxN supports bit widths {BITS_SUPPORTED}, got bits={bits}")
+        raise ValueError(f"idxN supports bit widths {BITS_SUPPORTED}, got bits={bits}")
     return b
 
 
 def check_eligible(N: int, K: int) -> None:
     """Raise ValueError unless the shape can be stored in the idxN layout."""
     if N % ROWS_PER_TILE != 0:
-        raise ValueError(
-            f"idxN layout requires N % 128 == 0, got N={N}")
+        raise ValueError(f"idxN layout requires N % 128 == 0, got N={N}")
     if K % K_PER_GROUP != 0:
-        raise ValueError(
-            f"idxN layout requires K % 64 == 0, got K={K}")
+        raise ValueError(f"idxN layout requires K % 64 == 0, got K={K}")
 
 
 def blob_bytes(N: int, K: int, bits: int) -> int:
@@ -250,8 +247,7 @@ def pack_idxn(indices: np.ndarray, bits: int) -> np.ndarray:
     max_val = np.iinfo(np.uint8).max if idx.size else 0
     del max_val
     if idx.size and int(idx.max(initial=0)) >= (1 << b):
-        raise ValueError(
-            f"idx{b} indices must be < {1 << b}, got max "
+        raise ValueError(f"idx{b} indices must be < {1 << b}, got max "
             f"{int(idx.max())}")
     row_map, col_map = _chunk_element_map(b)
 
@@ -278,8 +274,7 @@ def unpack_idxn(blob: np.ndarray, N: int, K: int, bits: int) -> np.ndarray:
     blob = np.ascontiguousarray(blob, dtype=np.uint8).reshape(-1)
     expected = blob_bytes(N, K, b)
     if blob.size != expected:
-        raise ValueError(
-            f"idx{b} blob has {blob.size} bytes, expected N*K*{b}/8 = "
+        raise ValueError(f"idx{b} blob has {blob.size} bytes, expected N*K*{b}/8 = "
             f"{expected} (N={N}, K={K})")
     row_map, col_map = _chunk_element_map(b)
 
@@ -312,8 +307,7 @@ def pack_idxn_from_packed(q: np.ndarray, bits: int) -> np.ndarray:
     return pack_idxn(idx.reshape(N, K), b)
 
 
-def self_test(
-    shapes=((128, 64), (256, 128), (384, 192), (1024, 512)),
+def self_test(shapes=((128, 64), (256, 128), (384, 192), (1024, 512)),
     bits_all=BITS_SUPPORTED,
 ) -> bool:
     """CPU round-trip check: pack -> unpack must reproduce the input
@@ -348,10 +342,8 @@ def self_test(
     if _m is not None:
         for N, K in shapes:
             idx = rng.integers(0, 16, size=(N, K), dtype=np.uint8)
-            assert np.array_equal(
-                pack_idxn(idx, 4), _m.pack_idx4(idx)), (N, K)
-            assert np.array_equal(
-                unpack_idxn(pack_idxn(idx, 4), N, K, 4), idx), (N, K)
+            assert np.array_equal(pack_idxn(idx, 4), _m.pack_idx4(idx)), (N, K)
+            assert np.array_equal(unpack_idxn(pack_idxn(idx, 4), N, K, 4), idx), (N, K)
     return True
 
 

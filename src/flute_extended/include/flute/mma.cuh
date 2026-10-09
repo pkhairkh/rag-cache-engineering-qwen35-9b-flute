@@ -81,8 +81,7 @@ namespace flute {
 // a: 4 x b32 (packed f16x2 fragments, e.g. straight from ldmatrix.x4)
 // b: 2 x b32 (packed f16x2 fragments)
 // c: 4 x f32 in/out accumulator
-__device__ __forceinline__ void mma_m16n8k16_f32acc(
-    const uint32_t (&a)[4],
+__device__ __forceinline__ void mma_m16n8k16_f32acc(const uint32_t (&a)[4],
     const uint32_t (&b)[2],
           float    (&c)[4]
 ) {
@@ -103,8 +102,7 @@ __device__ __forceinline__ void mma_m16n8k16_f32acc(
 
 // ---- f16 accumulator variant (kept for completeness/API parity) -------------
 // c: 4 x f16 in/out (2 packed b32)
-__device__ __forceinline__ void mma_m16n8k16_f16acc(
-    const __half a[8],
+__device__ __forceinline__ void mma_m16n8k16_f16acc(const __half a[8],
     const __half b[4],
           __half c[4]
 ) {
@@ -145,8 +143,7 @@ __device__ __forceinline__ void mma_m16n8k16_f16acc(
 //   b[1] = sW[n_base + lane/4][k_base + 2*(lane%4) + 1]
 //   b[2] = sW[n_base + lane/4][k_base + 2*(lane%4) + 8]
 //   b[3] = sW[n_base + lane/4][k_base + 2*(lane%4) + 9]
-__device__ __forceinline__ void mma_m16n8k16_f32acc_half(
-    const __half a[8],
+__device__ __forceinline__ void mma_m16n8k16_f32acc_half(const __half a[8],
     const __half b[4],
           float  (&c)[4]
 ) {
@@ -166,8 +163,7 @@ __device__ __forceinline__ void mma_m16n8k16_f32acc_half(
 
 // ldmatrix.x4: load 4 x (8x8 f16) tiles -> 4 b32 per thread.
 // `smem` must be this thread's row address (16B aligned, 8 contiguous halves).
-__device__ __forceinline__ void ldmatrix_x4(
-    uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3,
+__device__ __forceinline__ void ldmatrix_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3,
     const __half* smem
 ) {
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
@@ -180,8 +176,7 @@ __device__ __forceinline__ void ldmatrix_x4(
 }
 
 // ldmatrix.x2 (non-trans): 2 tiles -> 2 b32 per thread.
-__device__ __forceinline__ void ldmatrix_x2(
-    uint32_t& r0, uint32_t& r1,
+__device__ __forceinline__ void ldmatrix_x2(uint32_t& r0, uint32_t& r1,
     const __half* smem
 ) {
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
@@ -196,8 +191,7 @@ __device__ __forceinline__ void ldmatrix_x2(
 // ldmatrix.x2.trans: 2 tiles loaded COLUMN-major (transposed distribution).
 // NOT used for the B operand of this project (sW is [N,K] row-major, whose
 // non-trans distribution already matches the B fragment). Kept as a utility.
-__device__ __forceinline__ void ldmatrix_x2_trans(
-    uint32_t& r0, uint32_t& r1,
+__device__ __forceinline__ void ldmatrix_x2_trans(uint32_t& r0, uint32_t& r1,
     const __half* smem
 ) {
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
@@ -236,8 +230,7 @@ __device__ __forceinline__ int swz_word(int row, int w, int xor_mask) {
 //   threads  8-15 -> rows row_base+8..15 @ col_base      (matrix 1 -> r1)
 //   threads 16-23 -> rows row_base+0..7  @ col_base+8    (matrix 2 -> r2)
 //   threads 24-31 -> rows row_base+8..15 @ col_base+8    (matrix 3 -> r3)
-__device__ __forceinline__ const __half* ldmatrix_a_addr(
-    const __half* tile, int ld, int row_base, int col_base,
+__device__ __forceinline__ const __half* ldmatrix_a_addr(const __half* tile, int ld, int row_base, int col_base,
     int lane, int xor_mask
 ) {
     const int r = row_base + ((lane >> 3) & 1) * 8 + (lane & 7);
@@ -254,8 +247,7 @@ __device__ __forceinline__ const __half* ldmatrix_a_addr(
 //   threads 24-31 -> rows row_base+8..15 @ col_base+8   (matrix 3 -> r3 = b1')
 // Because B fragments pack K-pairs and sW is K-contiguous per row, the
 // NON-trans distribution is exactly the mma B-fragment layout.
-__device__ __forceinline__ const __half* ldmatrix_b_addr(
-    const __half* tile, int ld, int row_base, int col_base,
+__device__ __forceinline__ const __half* ldmatrix_b_addr(const __half* tile, int ld, int row_base, int col_base,
     int lane, int xor_mask
 ) {
     const int r = row_base + (lane >> 4) * 8 + (lane & 7);
@@ -316,8 +308,7 @@ __device__ __forceinline__ void cp_async_wait_1() {
 // by this kernel — true for Q). On Hopper (SM_90+), an L2::evict_first hint
 // can be added to mark the line for early eviction, but this is ILLEGAL on
 // Ampere (SM_80-89), so we use the plain .nc load for compatibility.
-__device__ __forceinline__ void ldg_nc_evict_first_v4(
-    uint4& r, const void* gmem
+__device__ __forceinline__ void ldg_nc_evict_first_v4(uint4& r, const void* gmem
 ) {
     // Plain nc load — works on all architectures SM_70+
     asm volatile(
@@ -330,8 +321,7 @@ __device__ __forceinline__ void ldg_nc_evict_first_v4(
 // Scalar u32 variant for the sub-4-bit idxN Q prefetches, whose K-tile
 // halves are 4 B- but not 16 B-aligned (e.g. b=1 BK=32: 8 B halves,
 // b=3 BK=32: 24 B halves). Same .nc path, same compatibility note.
-__device__ __forceinline__ void ldg_nc_evict_first_u32(
-    uint32_t& r, const void* gmem
+__device__ __forceinline__ void ldg_nc_evict_first_u32(uint32_t& r, const void* gmem
 ) {
     asm volatile(
         "ld.global.nc.u32 %0, [%1];\n"
