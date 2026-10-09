@@ -1,0 +1,1058 @@
+{
+  "n_sessions": 30,
+  "sweeps": [
+    {
+      "overlap": 0.0,
+      "sys_len": 32,
+      "cache_kb": 4,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2048,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 4608,
+          "evictions": 0,
+          "prefill_saved": 928
+        }
+      }
+    },
+    {
+      "overlap": 0.0,
+      "sys_len": 32,
+      "cache_kb": 4,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2048,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 4608,
+          "evictions": 0,
+          "prefill_saved": 928
+        }
+      }
+    },
+    {
+      "overlap": 0.0,
+      "sys_len": 32,
+      "cache_kb": 64,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2048,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 4608,
+          "evictions": 0,
+          "prefill_saved": 928
+        }
+      }
+    },
+    {
+      "overlap": 0.0,
+      "sys_len": 32,
+      "cache_kb": 64,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2048,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 4608,
+          "evictions": 0,
+          "prefill_saved": 928
+        }
+      }
+    },
+    {
+      "overlap": 0.0,
+      "sys_len": 256,
+      "cache_kb": 4,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 16384,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 18944,
+          "evictions": 0,
+          "prefill_saved": 7424
+        }
+      }
+    },
+    {
+      "overlap": 0.0,
+      "sys_len": 256,
+      "cache_kb": 4,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 16384,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 18944,
+          "evictions": 0,
+          "prefill_saved": 7424
+        }
+      }
+    },
+    {
+      "overlap": 0.0,
+      "sys_len": 256,
+      "cache_kb": 64,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 16384,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 18944,
+          "evictions": 0,
+          "prefill_saved": 7424
+        }
+      }
+    },
+    {
+      "overlap": 0.0,
+      "sys_len": 256,
+      "cache_kb": 64,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 16384,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 18944,
+          "evictions": 0,
+          "prefill_saved": 7424
+        }
+      }
+    },
+    {
+      "overlap": 0.0,
+      "sys_len": 1024,
+      "cache_kb": 4,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 65536,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 68096,
+          "evictions": 0,
+          "prefill_saved": 29696
+        }
+      }
+    },
+    {
+      "overlap": 0.0,
+      "sys_len": 1024,
+      "cache_kb": 4,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 65536,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 68096,
+          "evictions": 0,
+          "prefill_saved": 29696
+        }
+      }
+    },
+    {
+      "overlap": 0.0,
+      "sys_len": 1024,
+      "cache_kb": 64,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 65536,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 68096,
+          "evictions": 0,
+          "prefill_saved": 29696
+        }
+      }
+    },
+    {
+      "overlap": 0.0,
+      "sys_len": 1024,
+      "cache_kb": 64,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 65536,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 68096,
+          "evictions": 0,
+          "prefill_saved": 29696
+        }
+      }
+    },
+    {
+      "overlap": 0.5,
+      "sys_len": 32,
+      "cache_kb": 4,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2048,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 4608,
+          "evictions": 0,
+          "prefill_saved": 928
+        }
+      }
+    },
+    {
+      "overlap": 0.5,
+      "sys_len": 32,
+      "cache_kb": 4,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2048,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 4608,
+          "evictions": 0,
+          "prefill_saved": 928
+        }
+      }
+    },
+    {
+      "overlap": 0.5,
+      "sys_len": 32,
+      "cache_kb": 64,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2048,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 4608,
+          "evictions": 0,
+          "prefill_saved": 928
+        }
+      }
+    },
+    {
+      "overlap": 0.5,
+      "sys_len": 32,
+      "cache_kb": 64,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2048,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 4608,
+          "evictions": 0,
+          "prefill_saved": 928
+        }
+      }
+    },
+    {
+      "overlap": 0.5,
+      "sys_len": 256,
+      "cache_kb": 4,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 16384,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 18944,
+          "evictions": 0,
+          "prefill_saved": 7424
+        }
+      }
+    },
+    {
+      "overlap": 0.5,
+      "sys_len": 256,
+      "cache_kb": 4,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 16384,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 18944,
+          "evictions": 0,
+          "prefill_saved": 7424
+        }
+      }
+    },
+    {
+      "overlap": 0.5,
+      "sys_len": 256,
+      "cache_kb": 64,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 16384,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 18944,
+          "evictions": 0,
+          "prefill_saved": 7424
+        }
+      }
+    },
+    {
+      "overlap": 0.5,
+      "sys_len": 256,
+      "cache_kb": 64,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 16384,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 18944,
+          "evictions": 0,
+          "prefill_saved": 7424
+        }
+      }
+    },
+    {
+      "overlap": 0.5,
+      "sys_len": 1024,
+      "cache_kb": 4,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 65536,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 68096,
+          "evictions": 0,
+          "prefill_saved": 29696
+        }
+      }
+    },
+    {
+      "overlap": 0.5,
+      "sys_len": 1024,
+      "cache_kb": 4,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 65536,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 68096,
+          "evictions": 0,
+          "prefill_saved": 29696
+        }
+      }
+    },
+    {
+      "overlap": 0.5,
+      "sys_len": 1024,
+      "cache_kb": 64,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 65536,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 68096,
+          "evictions": 0,
+          "prefill_saved": 29696
+        }
+      }
+    },
+    {
+      "overlap": 0.5,
+      "sys_len": 1024,
+      "cache_kb": 64,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 65536,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 68096,
+          "evictions": 0,
+          "prefill_saved": 29696
+        }
+      }
+    },
+    {
+      "overlap": 1.0,
+      "sys_len": 32,
+      "cache_kb": 4,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2048,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 4608,
+          "evictions": 0,
+          "prefill_saved": 928
+        }
+      }
+    },
+    {
+      "overlap": 1.0,
+      "sys_len": 32,
+      "cache_kb": 4,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2048,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 4608,
+          "evictions": 0,
+          "prefill_saved": 928
+        }
+      }
+    },
+    {
+      "overlap": 1.0,
+      "sys_len": 32,
+      "cache_kb": 64,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2048,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 4608,
+          "evictions": 0,
+          "prefill_saved": 928
+        }
+      }
+    },
+    {
+      "overlap": 1.0,
+      "sys_len": 32,
+      "cache_kb": 64,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2048,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 928
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 4608,
+          "evictions": 0,
+          "prefill_saved": 928
+        }
+      }
+    },
+    {
+      "overlap": 1.0,
+      "sys_len": 256,
+      "cache_kb": 4,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 16384,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 18944,
+          "evictions": 0,
+          "prefill_saved": 7424
+        }
+      }
+    },
+    {
+      "overlap": 1.0,
+      "sys_len": 256,
+      "cache_kb": 4,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 16384,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 18944,
+          "evictions": 0,
+          "prefill_saved": 7424
+        }
+      }
+    },
+    {
+      "overlap": 1.0,
+      "sys_len": 256,
+      "cache_kb": 64,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 16384,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 18944,
+          "evictions": 0,
+          "prefill_saved": 7424
+        }
+      }
+    },
+    {
+      "overlap": 1.0,
+      "sys_len": 256,
+      "cache_kb": 64,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 16384,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 7424
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 18944,
+          "evictions": 0,
+          "prefill_saved": 7424
+        }
+      }
+    },
+    {
+      "overlap": 1.0,
+      "sys_len": 1024,
+      "cache_kb": 4,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 65536,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 68096,
+          "evictions": 0,
+          "prefill_saved": 29696
+        }
+      }
+    },
+    {
+      "overlap": 1.0,
+      "sys_len": 1024,
+      "cache_kb": 4,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 65536,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 68096,
+          "evictions": 0,
+          "prefill_saved": 29696
+        }
+      }
+    },
+    {
+      "overlap": 1.0,
+      "sys_len": 1024,
+      "cache_kb": 64,
+      "n_unique_chunks": 4,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 65536,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 68096,
+          "evictions": 0,
+          "prefill_saved": 29696
+        }
+      }
+    },
+    {
+      "overlap": 1.0,
+      "sys_len": 1024,
+      "cache_kb": 64,
+      "n_unique_chunks": 16,
+      "configs": {
+        "kv_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 65536,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "state_only": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 2560,
+          "evictions": 0,
+          "prefill_saved": 29696
+        },
+        "both": {
+          "hit_rate": 0.9667,
+          "cross_session": 0.9667,
+          "bytes": 68096,
+          "evictions": 0,
+          "prefill_saved": 29696
+        }
+      }
+    }
+  ],
+  "summary": {
+    "n_configs": 36,
+    "state_wins_on_hitrate_and_bytes": 24,
+    "state_wins_pct": 66.7,
+    "both_beats_either": 0,
+    "both_beats_pct": 0.0,
+    "state_total_bytes_saved_vs_kv": 915456,
+    "configs_where_state_evicts_more": 0
+  }
+}
