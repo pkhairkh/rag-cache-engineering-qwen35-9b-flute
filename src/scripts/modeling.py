@@ -738,6 +738,33 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if cache_params is not None:
             cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
 
+        # M1/M2 read/write (SPECIFICATION §2.2): the two global memories,
+        # attached by Qwen3_5TextModel when config.use_m1m2 is set (default
+        # off — this block is skipped entirely, zero code-path change).
+        # The state lives in the TQ cache (dequantize-on-read /
+        # quantize-on-write, §3.2); with zero-init write gates the whole
+        # block is a bit-identical no-op (read of zero memories = exact
+        # zeros; writes return the state unchanged — PROPOSAL P3).
+        _m1m2 = getattr(self, "m1m2", None)
+        if _m1m2 is not None and cache_params is not None and hasattr(cache_params, "read_m1"):
+            _m1 = cache_params.read_m1(dtype=value.dtype)
+            _m2 = cache_params.read_m2(dtype=value.dtype)
+            if _m1 is None:
+                _m1 = _m1m2.init_state(dtype=value.dtype, device=value.device)
+            if _m2 is None:
+                _m2 = _m1m2.init_state(dtype=value.dtype, device=value.device)
+            _q = query.transpose(1, 2)  # (B, H, T, D)
+            _k = key.transpose(1, 2)
+            if _k.shape[1] != _q.shape[1]:
+                _k = _k.repeat_interleave(_q.shape[1] // _k.shape[1], dim=1)
+            _v = value.transpose(1, 2)
+            _read_out, _m1_new, _m2_new = _m1m2(
+                _q, _k, _v, _m1, _m2,
+                getattr(self, "m1m2_linear_ordinal", 0))
+            core_attn_out = core_attn_out + _read_out.transpose(1, 2)
+            cache_params.update_m1(_m1_new)
+            cache_params.update_m2(_m2_new)
+
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -1128,6 +1155,38 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        # M1/M2: the two global memories (SPECIFICATION §2.2), shared
+        # across ALL linear layers — added behind the config flag
+        # `use_m1m2` (default OFF: zero code-path change for parity; the
+        # RAG build turns it on). The M1/M2 STATE lives in the TQ cache
+        # (rag/tq_cache.py); this module holds only the read/write gates
+        # (zero-init writes — bit-identical no-op until the §7 fine-tune
+        # opens them). Lazy path-anchored import: the model code must not
+        # hard-depend on the RAG package at module import.
+        if getattr(config, "use_m1m2", False):
+            import os as _os
+            import sys as _sys
+            _rag = _os.path.normpath(_os.path.join(
+                _os.path.dirname(_os.path.abspath(__file__)), "..", "rag"))
+            if _rag not in _sys.path:
+                _sys.path.insert(0, _rag)
+            import m1m2 as _m1m2
+            _n_linear = sum(1 for _lt in config.layer_types
+                            if _lt == "linear_attention")
+            self.m1m2 = _m1m2.M1M2(
+                num_heads=config.linear_num_value_heads,
+                head_dim=config.linear_value_head_dim,
+                mem_size=getattr(config, "m1m2_mem_size", 128),
+                num_linear_layers=max(1, _n_linear),
+            )
+            _ordinal = 0
+            for _layer in self.layers:
+                if _layer.block_type == "linear_attention":
+                    # plain-object reference (NOT a submodule registration):
+                    # one shared instance, registered once on this model
+                    object.__setattr__(_layer.linear_attn, "m1m2", self.m1m2)
+                    _layer.linear_attn.m1m2_linear_ordinal = _ordinal
+                    _ordinal += 1
         # Initialize weights and apply final processing
         self.post_init()
 
