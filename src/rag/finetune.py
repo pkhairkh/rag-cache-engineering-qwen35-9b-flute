@@ -10,7 +10,7 @@ Trainables (three groups, spec §7):
   3. luts — the W10 LUTs via `PalettizedLinear.make_trainable()` on the
      REFERENCE path (`forward="reference"` per the loader) — the
      straight-through primitive this repo kept for exactly this (the
-     parent project's QLoRA/distillation trainer is NOT part of this repo).
+     parent project's distillation trainer is NOT part of this repo).
 
 ~500 steps, AdamW + cosine (fp32 LUT masters — make_trainable promotes
 them; everything else stays fp16/bf16). After training: `freeze_lut()`
