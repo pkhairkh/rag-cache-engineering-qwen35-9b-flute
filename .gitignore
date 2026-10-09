@@ -7,3 +7,5 @@ build/
 # toy run artifacts (script-relative, generated)
 scripts/poc_toy/*_results.json
 scripts/poc_toy/test_1000/
+# evals artifacts
+src/rag/evals_out/
