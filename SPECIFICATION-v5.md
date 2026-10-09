@@ -1,6 +1,6 @@
-# SPECIFICATION v5 — Cache-Engineered RAG with TurboQuant
+# SPECIFICATION v5 — Cache-Engineered RAG with Online TurboQuant
 
-> **What changed from v4:** we apply **TurboQuant** (arXiv:2504.19874) to all caches (S per-layer + M1/M2 global) for **lossless compression**. TurboQuant is a data-oblivious, online vector quantization method that achieves near-optimal distortion with provable guarantees. At 3.5 bits per channel it's quality-neutral (identical to full precision); at 2.5 bits it's marginally degraded. We use the MSE-optimized variant (`TurboQuant_mse`) for the S snapshots and M1/M2, since we need reconstruction fidelity (MSE), not inner-product estimation.
+> **What changed from v4:** we apply **TurboQuant** (arXiv:2504.19874) as an **online** quantizer integrated INTO the model's forward pass. The cache states (S per-layer + M1/M2 global) are ALWAYS stored as TurboQuant codes — during ingestion, during the model's own forward, during installation, on disk. The quantization happens on WRITE (when the state is updated); dequantization happens on READ (when the state is consumed). No separate post-processing step. No fp16 cache at any point.
 
 ---
 
@@ -40,16 +40,153 @@ For any vector x on the unit sphere S^{d-1}, `TurboQuant_mse` at bit-width b ach
 - **vs int8/int4:** scalar quantizers don't account for the vector's geometry. TurboQuant's random rotation + optimal per-coordinate quantization achieves provably better distortion.
 - **Lossless at 3.5 bits:** the paper proved quality neutrality at 3.5 bits. We use this.
 
-### 1.4 What we apply TurboQuant to
+### 1.4 Online integration (NOT a sidechain)
 
-| Cache object | Dimensions | TurboQuant bit-width | Compression vs fp16 |
-|---|---|---|---|
-| S per linear layer (24 layers) | (32, 128, 128) = 524,288 dims | 3.5 bits | 16/3.5 ≈ 4.6× |
-| M1 global (1) | (32, mem_size, 128) | 3.5 bits | 4.6× |
-| M2 global (1) | (32, mem_size, 128) | 3.5 bits | 4.6× |
-| conv_state per layer (24) | (8192, 4) = 32,768 dims | 3.5 bits | 4.6× |
+TurboQuant is **online** — it runs INSIDE the model's forward pass, not as a post-processing step. The cache is ALWAYS compressed:
 
-**Total compression: ~4.6× vs fp16.** The 27.5 MiB per-chunk (fp16) becomes ~6 MiB per chunk (TurboQuant 3.5-bit). For 50k chunks: ~300 GiB instead of 1.375 TiB.
+```
+The model's forward pass (per linear-attn layer):
+
+1. READ the recurrent state S from the cache
+   → cache stores TurboQuant codes (b-bit indices)
+   → dequantize on read: S_fp16 = TurboQuant.dequant(cache.codes)
+   → the delta rule uses S_fp16
+
+2. COMPUTE the delta rule update (standard Qwen3_5GatedDeltaNet forward)
+   → produces last_recurrent_state (fp16)
+
+3. WRITE the updated state back to the cache
+   → cache_params.update_recurrent_state() is MONKEY-PATCHED
+   → instead of storing fp16, it calls TurboQuant.quant(last_state)
+   → the cache stores TurboQuant codes, NOT fp16
+
+4. Same for M1/M2: the write gates call TurboQuant.quant() before writing
+   → M1/M2 are ALWAYS TurboQuant codes
+   → reads call TurboQuant.dequant() before using
+```
+
+**This means:**
+- During ingestion: the prefill produces S → TurboQuant.quant() → codes stored in cache → codes snapshotted to disk. No fp16 cache at any point.
+- During query: the retrieved TurboQuant codes are installed into the cache → the model's forward dequantizes on read → the delta rule runs on the dequantized state → re-quantizes on write. The model never sees fp16 cache.
+- On disk: only TurboQuant codes. No fp16 snapshots.
+- The quantization is transparent — the model's forward pass doesn't know it's using quantized caches (the monkey-patch handles it).
+
+**The monkey-patch:**
+
+```python
+# poc/online_turboquant.py
+import torch
+import numpy as np
+
+class OnlineTurboQuantCache:
+    """Monkey-patches the cache so that recurrent_states and conv_states
+    are ALWAYS stored as TurboQuant codes. Dequantizes on read, quantizes on write.
+    
+    The model's forward pass (Qwen3_5GatedDeltaNet) calls:
+    - cache_params.layers[L].recurrent_states[0]  (READ)
+    - cache_params.update_recurrent_state(state, L)  (WRITE)
+    
+    We intercept BOTH:
+    - READ: dequantize the TurboQuant codes → return fp16
+    - WRITE: quantize the fp16 state → store TurboQuant codes
+    """
+
+    def __init__(self, cache, turboquant_s, turboquant_conv, turboquant_m1, turboquant_m2):
+        self.cache = cache  # the original DynamicCache
+        self.tq_s = turboquant_s       # TurboQuant for S (dim=524,288)
+        self.tq_conv = turboquant_conv  # TurboQuant for conv_state (dim=32,768)
+        self.tq_m1 = turboquant_m1      # TurboQuant for M1
+        self.tq_m2 = turboquant_m2      # TurboQuant for M2
+        
+        # the codes storage (replaces the fp16 recurrent_states)
+        self.s_codes = {}   # layer_idx → (indices, outlier_mask, norm)
+        self.conv_codes = {} # layer_idx → (indices, outlier_mask, norm)
+    
+    def get_recurrent_state(self, layer_idx):
+        """READ: dequantize TurboQuant codes → fp16 tensor."""
+        if layer_idx not in self.s_codes:
+            return None  # no previous state (first forward)
+        indices, outlier_mask, norm = self.s_codes[layer_idx]
+        flat = self.tq_s.dequantize(indices, outlier_mask, norm)
+        return torch.from_numpy(flat).reshape(1, 32, 128, 128)
+    
+    def update_recurrent_state(self, state, layer_idx):
+        """WRITE: quantize fp16 state → store TurboQuant codes."""
+        flat = state.flatten().cpu().numpy().astype(np.float32)
+        indices, outlier_mask, norm = self.tq_s.quantize(flat)
+        self.s_codes[layer_idx] = (indices, outlier_mask, norm)
+    
+    def get_conv_state(self, layer_idx):
+        """READ: dequantize conv_state codes → fp16."""
+        if layer_idx not in self.conv_codes:
+            return None
+        indices, outlier_mask, norm = self.conv_codes[layer_idx]
+        flat = self.tq_conv.dequantize(indices, outlier_mask, norm)
+        return torch.from_numpy(flat).reshape(1, 8192, 4)
+    
+    def update_conv_state(self, mixed_qkv, layer_idx, conv_kernel_size):
+        """WRITE: the conv_state update (the stock cache_params.update_conv_state
+        produces the new conv_state; we intercept and quantize it)."""
+        # run the stock conv_state update
+        new_conv = self.cache.update_conv_state(mixed_qkv, layer_idx, conv_kernel_size)
+        # quantize the result
+        flat = new_conv.flatten().cpu().numpy().astype(np.float32)
+        indices, outlier_mask, norm = self.tq_conv.quantize(flat)
+        self.conv_codes[layer_idx] = (indices, outlier_mask, norm)
+        return new_conv  # return the fp16 version for the current step's use
+    
+    def snapshot_codes(self):
+        """Return all TurboQuant codes (for saving to disk)."""
+        return {
+            's_codes': dict(self.s_codes),
+            'conv_codes': dict(self.conv_codes),
+        }
+    
+    def install_codes(self, s_codes, conv_codes):
+        """Install TurboQuant codes (from retrieved chunks, after summing).
+        The codes are already summed — just store them."""
+        self.s_codes = dict(s_codes)
+        self.conv_codes = dict(conv_codes)
+```
+
+**The same pattern for M1/M2:**
+
+```python
+class OnlineTurboQuantGlobalCaches:
+    """Wraps the model's global M1/M2 so they're ALWAYS TurboQuant codes."""
+    
+    def __init__(self, turboquant_m1, turboquant_m2):
+        self.tq_m1 = turboquant_m1
+        self.tq_m2 = turboquant_m2
+        self.m1_codes = None  # (indices, outlier_mask, norm)
+        self.m2_codes = None
+    
+    def read_m1(self):
+        """Dequantize M1 codes → fp16 for the forward pass."""
+        if self.m1_codes is None:
+            return None
+        indices, outlier_mask, norm = self.m1_codes
+        flat = self.tq_m1.dequantize(indices, outlier_mask, norm)
+        return torch.from_numpy(flat).reshape(1, 32, mem_size, 128)
+    
+    def write_m1(self, m1_fp16):
+        """Quantize the updated M1 → store codes."""
+        flat = m1_fp16.flatten().cpu().numpy().astype(np.float32)
+        self.m1_codes = self.tq_m1.quantize(flat)
+    
+    # same for M2
+```
+
+### 1.5 What this changes vs the sidechain approach
+
+| | Sidechain (v5 draft) | Online (correct) |
+|---|---|---|
+| When does quantization happen? | After the prefill, as a post-processing step | DURING the forward pass, on every state write |
+| Is there an fp16 cache? | Yes — the model runs on fp16, then TurboQuant compresses the output | **NO** — the cache is ALWAYS TurboQuant codes. The model dequantizes on read. |
+| What's on disk? | TurboQuant codes (compressed from fp16) | TurboQuant codes (the same codes the model uses) |
+| At query time | Load codes → dequantize → install fp16 → model runs | Load codes → install codes → model runs (dequantizes on read) |
+| The model knows about TurboQuant? | No — it runs on fp16, TurboQuant is external | **Yes** — the monkey-patched cache dequantizes on every read |
+| Is the model's behavior affected? | No (lossless post-processing) | **Slightly** — the dequantized state has TurboQuant's MSE distortion (~0.015 at 3.5 bits). The paper proved this is quality-neutral for KV cache. |
 
 ---
 
