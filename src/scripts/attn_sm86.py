@@ -941,15 +941,14 @@ def reference_attention_forward(q, k, v, sm_scale):
 
 
 # ---------------------------------------------------------------------------
-# The autograd Function gluing the kernels. Mirrors the repo's
-# autograd-Function style (scripts/qlora_gemm.py): frozen tensors as plain
-# ctx attributes (NOT save_for_backward), an escape-hatch env flag, and a
-# NaN debug env flag.
+# The autograd Function gluing the kernels (repo autograd-Function
+# convention): frozen tensors as plain ctx attributes (NOT
+# save_for_backward), an escape-hatch env flag, and a NaN debug env flag.
 # ---------------------------------------------------------------------------
 
 
 def _debug_nan_enabled() -> bool:
-    """FLUTE_ATTN_DEBUG_NAN=1 → backward grad NaNs raise (qlora_gemm's
+    """FLUTE_ATTN_DEBUG_NAN=1 → backward grad NaNs raise (the
     FLUTE_DEBUG_NAN pattern: off by default, zero overhead when off)."""
     return os.environ.get("FLUTE_ATTN_DEBUG_NAN", "") == "1"
 
@@ -960,7 +959,7 @@ _attn_escape_banner = False
 def _attn_kernel_enabled() -> bool:
     """Escape hatch for flute_sm86_attention: FLUTE_ATTN_KERNEL in
     ("", "0") disables the Triton kernel path (loud one-time banner,
-    qlora_gemm's FLUTE_FUSED_BWD pattern) — forward and backward fall
+    the FLUTE_FUSED_BWD pattern) — forward and backward fall
     back to the reference autograd path. Default ("1"): kernel on."""
     global _attn_escape_banner
     if os.environ.get("FLUTE_ATTN_KERNEL", "1") in ("", "0"):
@@ -980,11 +979,11 @@ class Sm86AttentionFn(torch.autograd.Function):
     Forward: (out, lse) = sm86_attention_forward(q, k, v, sm_scale,
     need_lse=True); returns out ONLY — lse is internal (the backward's
     recompute key, never part of the public output). q/k/v/out/lse/
-    sm_scale are saved as PLAIN ctx attributes (qlora_gemm's frozen-tensor
+    sm_scale are saved as PLAIN ctx attributes (the frozen-tensor
     style: they survive checkpoint recompute and skip save_for_backward's
     version bookkeeping; the tradeoff — an in-place mutation of q/k/v
     between forward and backward is not detected — is the documented
-    qlora_gemm contract). Operand dtype is kept AS-IS: fp16 and bf16 are
+    contract). Operand dtype is kept AS-IS: fp16 and bf16 are
     both first-class kernel operand dtypes (bf16 is NOT cast to fp16).
 
     Backward: dq from sm86_attention_backward_dq, (dk, dv) from
@@ -1004,7 +1003,7 @@ class Sm86AttentionFn(torch.autograd.Function):
             f"k {tuple(k.shape)}, v {tuple(v.shape)})")
         out, lse = sm86_attention_forward(q, k, v, sm_scale,
                                           need_lse=True)
-        # Frozen tensors as plain ctx attributes (qlora_gemm style — see
+        # Frozen tensors as plain ctx attributes (see
         # the class docstring); lse detached (it is fp32, graph-free
         # anyway — detach is the belt-and-braces contract).
         ctx.q = q

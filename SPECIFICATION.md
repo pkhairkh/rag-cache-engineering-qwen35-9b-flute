@@ -6,7 +6,7 @@
 
 ## 1. The model
 
-Qwen3.5-9B (FLUTE idxN W4+r32), loaded via `scripts/eval_common.py::load_quant_model`.
+Qwen3.5-9B (FLUTE idxN W4+r32), loaded via `scripts/loader.py::load_quant_model`.
 
 32 layers: 24 linear-attention (`Qwen3_5GatedDeltaNet`) + 8 full-attention (`Qwen3_5Attention`).
 
@@ -249,11 +249,14 @@ def install_and_answer(model, query_token_ids, retrieved_code_snapshots, system_
 ## 7. Pretraining
 
 Next-token prediction on the OfficeQA corpus via the W10 LUT path:
-- `scripts/eval_common.py::load_quant_model` — loads the W4+r32 model
-- `scripts/qlora.py::attach_qlora(r=64, alpha=16)` — W10 trainable LUTs
-- `scripts/trainer.py` — the layerwise distillation trainer (fits on A10G)
+- `scripts/loader.py::load_quant_model` — loads the W4+r32 model
+- A lean training loop written as part of the RAG build on the GPU box
+  (the parent project's QLoRA/distillation trainer is NOT part of this
+  repo); straight-through LUTs via `PalettizedLinear.make_trainable()`
+  on the reference path (`forward="reference"`)
 - Trains: the 24 per-layer linear-attn params (so S is discriminative) + the M1/M2 read/write gates (so the global caches carry info) + the LUTs (W10)
 - ~500 steps on A10G. The real model is already trained by Qwen — this is a fine-tune.
+- The fine-tuned LUTs are served as full LUT artifacts (`pretrained_luts/`, §11) — not as QLoRA adapters.
 
 ---
 
@@ -331,10 +334,7 @@ disk/
 
 | File | Function | Role |
 |---|---|---|
-| `scripts/eval_common.py` | `load_quant_model(...)` | Loads the W4+r32 LUT model |
-| `scripts/qlora.py` | `attach_qlora(model, metadata, r=64, alpha=16)` | W10 trainable LUTs |
-| `scripts/qlora_gemm.py` | `FusedQLoRAGEMMTrainLUTTwoStreams` | The W10 autograd Function |
-| `scripts/trainer.py` | `Trainer` | The layerwise distillation trainer |
+| `scripts/loader.py` | `load_quant_model(...)` | Loads the W4+r32 LUT model |
 | `scripts/modeling.py` | `Qwen3_5GatedDeltaNet` | The linear-attn layer (produces S) |
 | `scripts/modeling.py` | `cache_params.layers[L].recurrent_states[0]` | Access S (monkey-patched for TQ) |
 | `scripts/modeling.py` | `cache_params.layers[L].conv_states[0]` | Access conv_state (monkey-patched) |

@@ -17,26 +17,29 @@ SPECIFICATION.md            the definitive spec (the contract)
 scripts/poc_toy/            the validated CPU toys (§12) + their deps
 src/
   scripts/                  model-side code: modeling (Qwen3.5-9B hybrid),
-                            loader (eval_common), W10 QLoRA training stack
-                            (qlora, qlora_gemm, trainer, capture, loss,
-                            muon_optimizer), palettized_modules, attn_sm86
-  flute_extended/           the W4/W10 inference CUDA extension
+                            loader (the pre-built-model loader),
+                            palettized_modules (W4 LUT forward),
+                            attn_sm86 (SM86 attention kernel vehicle)
+  flute_extended/           the W4 inference CUDA extension
                             (cutlass_streaming + debug_simple + FHT kernels)
-  flute_train_kernels/      the W10 training CUDA extension
-                            (backward GEMM + LUT-grad)
   docs/                     format + build contracts (DEQUANT_SPEC,
-                            KERNEL_SPEC_DLDLUT, QUANTIZATION_FORMAT, FHT,
-                            MODEL_GEOMETRY, TRAINING_LIMITATION, DEPLOY)
+                            QUANTIZATION_FORMAT, FHT, MODEL_GEOMETRY,
+                            HARDWARE, DEPLOY)
   requirements*.txt         minimal deps + the known-good pin set
 ```
 
 ## Scope notes (post-cleanup)
 
 - The palettized model + heads artifacts are provided pre-built and
-  loaded via `src/scripts/eval_common.py::load_quant_model`; the
-  canonical palettizer is intentionally NOT part of this repo.
-- Fine-tuned weights are served through the QLoRA adapter channel
-  (`qlora_adapters.pt` + `qlora_config.json`), not re-palettization.
+  loaded via `src/scripts/loader.py::load_quant_model`; the palettizer
+  and the eval plane are intentionally NOT part of this repo.
+- No QLoRA: the parent project's training stack (qlora, qlora_gemm,
+  qlora_fallback, trainer, capture/loss/muon_optimizer,
+  flute_train_kernels) is not part of this repo. The §7 fine-tune is
+  written on the GPU box as part of the RAG build — the straight-through
+  LUT primitive is `PalettizedLinear.make_trainable()` via the reference
+  path; fine-tuned LUTs are served as full LUT artifacts
+  (`pretrained_luts/`, SPECIFICATION.md §11).
 - Kernel bring-up on the GPU box: `src/docs/DEPLOY.md` (build, ptxas
   gate, differential spot-check).
 - The RAG pipeline itself (TurboQuant online cache wrapper, M1/M2

@@ -6,7 +6,6 @@ numpy
 # Qwen3.5 hybrid modeling: needs cache_utils / masking_utils / models.qwen3_5
 transformers>=5.0
 safetensors
-datasets          # scripts/capture.py (teacher text corpus loader)
 huggingface_hub
 # linear-attention decode ops for modeling.py (guarded imports with
 # pure-torch fallbacks; install for speed)

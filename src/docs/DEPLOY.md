@@ -174,7 +174,7 @@ The palettized weight format (packed 4-bit indices, per-group 16-entry
 LUT, LSB-first nibble order) is specified in docs/DEQUANT_SPEC.md. The
 kernels treat that document as the contract. The model artifacts
 (metadata.json + per-tensor .idx/.lut files + norm_gain_edits.json) are
-provided pre-built and loaded by `scripts/eval_common.py::
+provided pre-built and loaded by `scripts/loader.py::
 load_quant_model` / `scripts/palettized_modules.py`.
 
 ## 7. Troubleshooting

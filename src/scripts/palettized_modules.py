@@ -378,9 +378,10 @@ class PalettizedLinear(nn.Module):
         caches the unpacked logical indices (int64, on the LUT's
         device). The reference forward then backprops into codebook entries
         only — indices remain frozen constants. freeze_lut() demotes back
-        to the deployment buffer (fp16-snapped). The kernel path refuses to
-        run while ANY LUT is trainable (loud error, never silent fp32
-        numerics through a contractually-fp16 artifact).
+        to the deployment buffer (fp16-snapped). The kernel path requires
+        frozen fp16 LUTs — a promoted fp32 master fails the dtype gate
+        below loudly (never silent fp32 numerics through a
+        contractually-fp16 artifact).
 
     Rotation (Hadamard boundary fold, W13): the palettizer folds
     W_rot = W @ T (T = blockdiag H_b diag(s_b)/sqrt(b), (seed, k)
@@ -724,7 +725,7 @@ class PalettizedLinear(nn.Module):
 
         Idempotent. Allocates the int64 logical-index caches (N, K) per
         stream, on each LUT's device — only call this for modules you
-        actually train (the trainer calls it per-scope, per-layer).
+        actually train.
         """
         if not isinstance(self.lut, nn.Parameter):
             lut32 = self.lut.detach().float().clone()
@@ -1021,9 +1022,6 @@ class PalettizedLinear(nn.Module):
         if self._rotation_backend() != "auto":
             # FLUTE_ROTATION=reference/matmul pins the explicit rotation
             return None
-        if self.lut_trainable or self.lut2_trainable:
-            # the W10 train route needs the rotated x through qlora_gemm
-            return None
         if x.requires_grad:
             return None
         try:
@@ -1251,62 +1249,6 @@ class PalettizedLinear(nn.Module):
                     self._row_groups2, bits=self.bitwidth2).t()
             output = y.to(x.dtype)
         else:
-            trainable = ["lut"] if self.lut_trainable else []
-            if self.lut2_trainable:
-                trainable.append("lut2")
-            if trainable and x.is_cuda:
-                # W10 (HANDOVER "Two-Stream Training"): the trainable-LUT
-                # kernel route — the qlora_gemm train Functions carry
-                # dL/dLUT (the fp16 operand is RECOMPUTED in backward
-                # from the fp32 master, never saved). Both LUTs
-                # trainable (or lut alone on a two-stream module with a
-                # frozen lut2) route through the two-stream Function;
-                # the single-stream Function otherwise. A None return
-                # (FLUTE kernel unavailable) falls to the loud refusal
-                # below — never a silent reference fallback.
-                _qg_path = _HERE      # scripts/ — qlora_gemm.py's home
-                if _qg_path not in sys.path:
-                    sys.path.insert(0, _qg_path)
-                import qlora_gemm     # lazy, same style as qlora.py
-                if self.has_stream2:
-                    y_train = qlora_gemm.fused_qlora_gemm_train_lut_two_streams(
-                        x, self.indices, self.lut, self.bitwidth,
-                        self.indices2, self.lut2, self.bitwidth2,
-                        self.group_size, self.N, self.K)
-                else:
-                    y_train = qlora_gemm.fused_qlora_gemm_train_lut(
-                        x, self.indices, self.lut, self.bitwidth,
-                        self.group_size, self.N, self.K)
-                if y_train is not None:
-                    if self.resA is not None and self.resB is not None:
-                        y_train = y_train + (
-                            (x.half() @ self.resB.t())
-                            @ self.resA.t()).to(y_train.dtype)
-                    # W13: NO post-GEMM rotation here. The input was
-                    # already rotated once at the top of forward
-                    # (x <- x @ T, the fold-space input the GEMM and the
-                    # residual branch above both consume). The pre-W13
-                    # `y_train @ self.rot_T` applied T a SECOND time —
-                    # to the OUTPUT (batch, N) — which is wrong for
-                    # every shape and a hard shape error whenever
-                    # N != K (down_proj: (M, 4096) @ (12288, 12288)).
-                    if self.bias is not None:
-                        y_train = y_train + self.bias
-                    if len(original_shape) == 3:
-                        y_train = y_train.view(
-                            original_shape[0], original_shape[1], self.N)
-                    return y_train
-                # else: the loud refusal below (kernel went away).
-            if trainable:
-                raise ValueError(
-                    "PalettizedLinear(kernel path): trainable LUT "
-                    f"({', '.join(trainable)}) — the idxN kernel contract "
-                    "requires a frozen fp16 LUT, and the FLUTE forward "
-                    "kernel is unavailable for the W10 train route. Use "
-                    "reference=True for training (CPU or kernel-less "
-                    "CUDA), freeze_lut() first, or rebuild: cd "
-                    "flute_extended && python setup.py build_ext "
-                    "--inplace.")
             bad_dtype = []
             if self.lut.dtype != torch.float16:
                 bad_dtype.append(("lut", self.lut.dtype))
@@ -1825,8 +1767,7 @@ def fold_input_gram(signs, awq_scale, fold_order, H):
     grams/<name>.gram.npy is pre-fold — the capture hooks tap the
     pristine module input; the producer transforms it internally through
     the same congruences, W14 makes them explicit for the consumers that
-    re-fit weights in the fold frame: the trainer's export polish and
-    qlora_merge's re-palettization).
+    re-fit weights in the fold frame).
 
       legacy order (W' = W @ T @ D):   fold(x) = x T D^-1
           ->  D^-1 (T^T H T) D^-1
