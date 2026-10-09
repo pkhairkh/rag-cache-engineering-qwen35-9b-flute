@@ -1,0 +1,15 @@
+# Full repository dependencies (model-side scripts + tests).
+# The kernel package's own minimal set lives in flute_extended/requirements.txt;
+# scripts/provision_env_cpu.sh installs the latest stable set and records
+# the resolved environment in reports/env_coding_box.txt.
+torch>=2.0
+numpy
+transformers>=4.40
+datasets
+safetensors
+huggingface_hub
+nvidia-ml-py
+pytest
+# SM86 attention kernel vehicle (PROMPT.md §3): importable and
+# interpreter-mode-runnable without a GPU; JIT-compiles on the GPU box.
+triton
