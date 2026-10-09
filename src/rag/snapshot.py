@@ -36,6 +36,21 @@ bit-streams, entropy coding rejected at ~5% gain for b=4 per PROPOSAL):
     m1_{f}, m2_{f}  same for the global memories (omitted when None)
     vector          1-D fp32 — ONLY when include_vector=True (DEBUG; D5)
 
+W9.2 OPTIONAL qjl MEMBERS: codes quantized with TurboQuant(qjl=True)
+additionally carry {s,conv,m1,m2}_{...}_qjl_signs (d int8 ±1) +
+{...}_gamma (fp32) per unit — written only when present, so pre-W9.2
+files round-trip unchanged (fields load as None) and the integrity digest
+of a qjl-free unit is BYTE-IDENTICAL to the v1 formula (the sketch bytes
+are appended to the digest only when present).
+
+W9.2 `use_mmap` LOAD OPTION (P7 hardening flag, DEFAULT OFF): a load-time
+flag on load_chunk/verify_chunk. OFF: exactly the pre-W9.2 reader
+(np.load, eager) — byte-identical loads (the parity gate). ON: members
+are returned as READ-ONLY np.memmap views into the snapshot FILE — see
+_MmapNpz's docstring for precisely what that does and does NOT mean (the
+flag never lies: np.load(npz, mmap_mode=...) itself silently IGNORES the
+flag in numpy 2.x, which is why the dedicated reader exists).
+
 INTEGRITY: the meta's `sha256` digests ALL code bytes (the packed idx
 streams, the fp32 norms and every scalar field of every unit, in canonical
 order S layers ascending -> conv layers ascending -> M1 -> M2, each unit
@@ -79,11 +94,15 @@ import hashlib
 import json
 import os
 import re
+import struct
+import warnings
+import zipfile
 from dataclasses import dataclass, field, fields as _dc_fields
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Union
 
 import numpy as np
+import numpy.lib.format as _npformat
 
 import _paths  # noqa: F401  (house convention: anchors src/rag, src/scripts, src/flute_extended)
 from turboquant import TQCodes
@@ -102,9 +121,17 @@ PROTOCOLS = ("delta-v1", "absolute")
 
 _NPZ_EXT = ".npz"
 
-# The TQCodes serialization surface (exactly the to_arrays()/from_arrays
-# keys — derived from the dataclass so a field change fails loudly here).
-_CODE_FIELDS: tuple = tuple(f.name for f in _dc_fields(TQCodes))
+# The TQCodes serialization surface: the REQUIRED keys (exactly the
+# pre-W9.2 to_arrays() surface) + the OPTIONAL W9.2 qjl sketch keys
+# (present only when the codes were quantized with qjl=True; a unit
+# carrying exactly ONE of the pair is a corruption signal, refused
+# loudly in _read_unit). Still derived from the dataclass so a REQUIRED
+# field change fails loudly here; the optional pair is carved out and
+# mirrored by hand.
+_OPTIONAL_CODE_FIELDS: tuple = ("qjl_signs", "gamma")
+_CODE_FIELDS: tuple = tuple(f.name for f in _dc_fields(TQCodes)
+                            if f.name not in _OPTIONAL_CODE_FIELDS)
+assert set(_OPTIONAL_CODE_FIELDS) <= {f.name for f in _dc_fields(TQCodes)}
 
 # meta JSON keys (the §5 format contract).
 _META_KEYS = ("chunk_id", "protocol", "system_ref", "extra", "version",
@@ -225,6 +252,10 @@ def _unit_digest_bytes(tag: str, codes: TQCodes) -> bytes:
     unambiguous — no field may contain '|' or NUL) + NUL, then the 4 exact
     fp32 norm bytes, then the idx_lo/idx_hi bit-stream bytes (their lengths
     are derivable from the head, so the stream parses unambiguously).
+    W9.2: when the unit carries the QJL sketch (BOTH qjl_signs and gamma),
+    the d int8 sign bytes + the 4 fp32 gamma bytes are appended — a
+    qjl-free unit digests BYTE-IDENTICALLY to the pre-W9.2 formula, so
+    v1 files stay verifiable and the digest stays call-invariant.
     """
     head = "|".join((
         tag, str(codes.kind), str(int(codes.d)),
@@ -235,7 +266,11 @@ def _unit_digest_bytes(tag: str, codes: TQCodes) -> bytes:
     norm = np.asarray(codes.norm, dtype=np.float32).tobytes()
     lo = np.ascontiguousarray(codes.idx_lo, dtype=np.uint8).tobytes()
     hi = np.ascontiguousarray(codes.idx_hi, dtype=np.uint8).tobytes()
-    return head + b"\x00" + norm + lo + hi
+    out = head + b"\x00" + norm + lo + hi
+    if codes.qjl_signs is not None and codes.gamma is not None:
+        out += np.ascontiguousarray(codes.qjl_signs, dtype=np.int8).tobytes()
+        out += np.asarray(codes.gamma, dtype=np.float32).tobytes()
+    return out
 
 
 def _digest_codes(s_codes: Mapping[int, TQCodes],
@@ -509,16 +544,22 @@ def _unit_state(z: np.lib.npyio.NpzFile, name: str) -> bool:
 def _check_members(z: np.lib.npyio.NpzFile, s_layers: List[int],
                    conv_layers: List[int], has_m1: bool, has_m2: bool) -> None:
     """The npz member set must be EXACTLY the §5 layout — stray members
-    (which the sha256 digest does not cover) are a tampering signal."""
+    (which the sha256 digest does not cover) are a tampering signal.
+    W9.2: the optional qjl pair is allowed per unit (present or absent,
+    never partial — _read_unit refuses the partial case)."""
     allowed = {"meta", "vector"}
     for layer_idx in s_layers:
         allowed.update(f"s_{layer_idx}_{f}" for f in _CODE_FIELDS)
+        allowed.update(f"s_{layer_idx}_{f}" for f in _OPTIONAL_CODE_FIELDS)
     for layer_idx in conv_layers:
         allowed.update(f"conv_{layer_idx}_{f}" for f in _CODE_FIELDS)
+        allowed.update(f"conv_{layer_idx}_{f}" for f in _OPTIONAL_CODE_FIELDS)
     if has_m1:
         allowed.update(f"m1_{f}" for f in _CODE_FIELDS)
+        allowed.update(f"m1_{f}" for f in _OPTIONAL_CODE_FIELDS)
     if has_m2:
         allowed.update(f"m2_{f}" for f in _CODE_FIELDS)
+        allowed.update(f"m2_{f}" for f in _OPTIONAL_CODE_FIELDS)
     stray = sorted(set(z.files) - allowed)
     if stray:
         raise ValueError(
@@ -535,13 +576,24 @@ def _check_layer_count(meta: Mapping[str, Any], s_layers: List[int]) -> None:
 
 def _read_unit(z: np.lib.npyio.NpzFile, prefix: str) -> TQCodes:
     """Rebuild one TQCodes unit from its prefixed members, with structural
-    validation BEFORE from_arrays (which would silently cast)."""
+    validation BEFORE from_arrays (which would silently cast).
+
+    W9.2: the qjl pair (qjl_signs + gamma) is optional — absent on pre-W9.2
+    files (fields load as None), refused loudly when PARTIAL (exactly one
+    of the two present is a corrupted sketch)."""
     label = prefix[:-1]  # e.g. "s_3", "conv_12", "m1"
     missing = [f for f in _CODE_FIELDS if f"{prefix}{f}" not in z.files]
     if missing:
         raise ValueError(
             f"load_chunk: unit '{label}' is incomplete — missing members "
             f"{missing} (corrupt npz?)")
+    ql_key, gm_key = f"{prefix}qjl_signs", f"{prefix}gamma"
+    has_q, has_g = ql_key in z.files, gm_key in z.files
+    if has_q != has_g:
+        raise ValueError(
+            f"load_chunk: unit '{label}' carries a PARTIAL QJL sketch — "
+            f"{ql_key if has_q else gm_key} is present but "
+            f"{gm_key if has_q else ql_key} is missing (corrupt npz?)")
     raw = {f: z[f"{prefix}{f}"] for f in _CODE_FIELDS}
     for f in ("idx_lo", "idx_hi"):
         a = np.asarray(raw[f])
@@ -558,6 +610,20 @@ def _read_unit(z: np.lib.npyio.NpzFile, prefix: str) -> TQCodes:
             raise ValueError(
                 f"load_chunk: unit '{label}' {f} holds {got} bytes, expected "
                 f"ceil({n}*{b}/8) = {want} (corrupt npz?)")
+    if has_q:
+        s = np.asarray(z[ql_key])
+        if s.dtype != np.int8 or s.ndim != 1 or s.shape[0] != int(raw["d"]):
+            raise ValueError(
+                f"load_chunk: unit '{label}' qjl_signs must be a "
+                f"({int(raw['d'])},) int8 ±1 sketch, got dtype={s.dtype}, "
+                f"shape={s.shape}")
+        g = np.asarray(z[gm_key])
+        if g.dtype != np.float32 or g.size != 1:
+            raise ValueError(
+                f"load_chunk: unit '{label}' gamma must be a single fp32 "
+                f"scalar, got dtype={g.dtype}, size={g.size}")
+        raw["qjl_signs"] = s
+        raw["gamma"] = g
     try:
         return TQCodes.from_arrays(raw)
     except Exception as e:
@@ -566,23 +632,176 @@ def _read_unit(z: np.lib.npyio.NpzFile, prefix: str) -> TQCodes:
             from e
 
 
-def load_chunk(path: PathLike) -> ChunkSnapshot:
+# ------------------------------------------------------- W9.2 mmap ---
+class _MmapNpz:
+    """An np.load-style reader whose members are READ-ONLY np.memmap views
+    into the snapshot FILE (the `use_mmap=True` side of the W9.2 flag).
+
+    WHAT THE FLAG ACTUALLY DOES — the flag never lies:
+
+    * np.load(npz, mmap_mode=...) itself silently IGNORES mmap_mode on
+      npz archives in numpy 2.x (members come back as eager heap arrays;
+      verified on 2.1.3) — which is exactly why this dedicated reader
+      exists instead of a one-word np.load change.
+    * EAGER (cheap): the zip central directory (member names/order) and
+      each requested member's .npy header (a 128-byte padded record).
+    * LAZY: every ARRAY member (idx_lo/idx_hi bit-streams, qjl_signs,
+      the debug vector) is returned as an np.memmap — pages fault in on
+      FIRST TOUCH. Through TQCodes.from_arrays the fields come back as
+      plain ndarrays that are ZERO-COPY VIEWS onto those memmaps (numpy's
+      asarray strips the subclass; the bytes still live in the mapped
+      region — inspect .base for the np.memmap root). Either way the
+      loaded codes hold NO private heap copies of the streams (eager
+      np.load reads each member into a fresh heap array that then stays
+      alive inside the codes; here the bytes live once, in the OS page
+      cache, shared by every reader of the file).
+    * 0-d scalar members (norm/d/bits/n_lo/n_hi/seed — a few bytes each)
+      and the 0-d unicode `meta` string are read EAGERLY (nothing to
+      page-fault at 0-d; they are parsed immediately for validation
+      anyway) — the mmap win is about the big streams only.
+    * The sha256 integrity digest is STILL recomputed (it touches every
+      code byte once, transiently) — use_mmap changes WHERE the bytes
+      live, never WHETHER they are verified.
+    * REQUIRES ZIP_STORED members (np.savez's uncompressed format —
+      always ours, see the module docstring). A compressed member cannot
+      be mmapped at all: it falls back to an eager read WITH a warning
+      (never silent). np.memmap holds its own file descriptor, so closing
+      this reader does NOT invalidate the views; the FILE must simply not
+      be rewritten/truncated while the loaded codes are alive.
+    * VALUES are bit-identical to the eager reader (the W9.2 parity gate).
+
+    Mirrors the NpzFile surface this module uses: .files (stripped names,
+    zip order), __getitem__, __contains__, close() + context manager.
+    """
+
+    def __init__(self, path: str):
+        self._path = os.fspath(path)
+        try:
+            self._fh = open(self._path, "rb")
+            self._zf = zipfile.ZipFile(self._fh)
+        except (OSError, zipfile.BadZipFile) as e:
+            raise ValueError(
+                f"_MmapNpz: {self._path!r} is not a readable npz archive: "
+                f"{e}") from e
+        self._entries: Dict[str, zipfile.ZipInfo] = {}
+        for zi in self._zf.infolist():
+            name = zi.filename
+            if name.endswith(".npy"):
+                name = name[:-4]
+            self._entries[name] = zi
+        self.files = list(self._entries)  # NpzFile semantics: zip order
+
+    # ------------------------------------------------------------ reader --
+    def _member(self, name: str):
+        zi = self._entries[name]
+        if zi.compress_type != zipfile.ZIP_STORED:
+            warnings.warn(
+                f"use_mmap: npz member {name!r} is compressed "
+                f"(compress_type={zi.compress_type}) — cannot be mmapped; "
+                f"falling back to an eager in-memory read (this module's "
+                f"writer never compresses)", RuntimeWarning, stacklevel=3)
+            with self._zf.open(zi) as fp:
+                return _npformat.read_array(fp, allow_pickle=False)
+        # local file header: 30 fixed bytes + name + extra (the extra-field
+        # length in the LOCAL header can differ from the central one —
+        # parse it from the file, never trust the ZipInfo copy)
+        self._fh.seek(zi.header_offset)
+        fixed = self._fh.read(30)
+        if len(fixed) != 30 or fixed[:4] != b"PK\x03\x04":
+            raise ValueError(
+                f"use_mmap: bad local zip header for member {name!r} "
+                f"at offset {zi.header_offset} (corrupt npz?)")
+        name_len, extra_len = struct.unpack("<HH", fixed[26:30])
+        data_start = zi.header_offset + 30 + name_len + extra_len
+        with self._zf.open(zi) as fp:
+            version = _npformat.read_magic(fp)
+            shape, fortran, dtype = self._read_npy_header(fp, version, name)
+            consumed = fp.tell()  # bytes of the .npy header record
+        if len(shape) == 0 or dtype.kind in ("U", "S", "O"):
+            # 0-d scalars + string dtypes: eager (nothing to lazily page;
+            # the meta JSON must be parsed immediately anyway)
+            with self._zf.open(zi) as fp:
+                return _npformat.read_array(fp, allow_pickle=False)
+        return np.memmap(self._path, mode="r", dtype=dtype, shape=shape,
+                         order="F" if fortran else "C",
+                         offset=data_start + consumed)
+
+    @staticmethod
+    def _read_npy_header(fp, version, name: str):
+        major, minor = version
+        try:
+            if (major, minor) == (1, 0):
+                return _npformat.read_array_header_1_0(fp)
+            if (major, minor) in ((2, 0), (3, 0)):
+                # 3.0 is 2.0's record with an explicit utf-8 header
+                # encoding — same 4-byte length, same reader.
+                return _npformat.read_array_header_2_0(fp)
+            return _npformat._read_array_header(fp, version)
+        except Exception as e:
+            raise ValueError(
+                f"use_mmap: cannot parse the .npy header of member {name!r} "
+                f"(version {version}): {e}") from e
+
+    # ------------------------------------------------------ dict surface --
+    def __getitem__(self, name: str):
+        if name not in self._entries:
+            raise KeyError(
+                f"{name!r} is not a member of the archive "
+                f"({os.path.basename(self._path)})")
+        return self._member(name)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._entries
+
+    def __enter__(self) -> "_MmapNpz":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        try:
+            self._zf.close()
+        finally:
+            self._fh.close()
+
+
+def _open_npz(path: str, use_mmap: bool, ctx: str):
+    """The chunk-npz reader behind load_chunk/verify_chunk (W9.2 flag).
+
+    use_mmap=False (DEFAULT — the parity path): exactly the pre-W9.2
+    reader, np.load(path, allow_pickle=False) — eager, byte-identical.
+    use_mmap=True: the _MmapNpz reader (read-only per-member memmaps;
+    see its docstring for the honest behavior contract)."""
+    if not use_mmap:
+        z = np.load(path, allow_pickle=False)
+        if not hasattr(z, "files"):
+            raise ValueError(
+                f"{ctx}: {path!r} is not an npz archive (got "
+                f"{type(z).__name__}) — chunk snapshots are "
+                f"snapshots/chunk_XXXXX.npz (spec §11)")
+        return z
+    return _MmapNpz(path)
+
+
+def load_chunk(path: PathLike, use_mmap: bool = False) -> ChunkSnapshot:
     """Full reconstruction of a chunk snapshot (spec §5): meta validation
     (version, protocol, keys, file-name consistency), per-unit TQCodes
     rebuild, and the sha256 integrity comparison — raises LOUDLY on any
     mismatch/corruption.
+
+    use_mmap : bool, default False — the W9.2 P7 flag. False: the eager
+    pre-W9.2 reader (bit-identical loads — the parity gate). True: array
+    members come back as read-only np.memmap views into the snapshot file
+    (values identical; see _MmapNpz for exactly what that does and does
+    not mean — the flag never lies).
 
     The debug `vector` member (if one was saved) is intentionally NOT
     reconstructed: the production retrieval vector is recomputed from the
     codes (D5) — access it directly via np.load(path)["vector"] if needed.
     """
     p = os.fspath(path)
-    z = np.load(p, allow_pickle=False)
-    if not hasattr(z, "files"):
-        raise ValueError(
-            f"load_chunk: {p!r} is not an npz archive (got "
-            f"{type(z).__name__}) — chunk snapshots are "
-            f"snapshots/chunk_XXXXX.npz (spec §11)")
+    z = _open_npz(p, use_mmap, "load_chunk")
     with z:
         meta = _read_meta_json(z)
         _check_meta(meta, p)
@@ -618,7 +837,7 @@ def load_chunk(path: PathLike) -> ChunkSnapshot:
 
 
 # ---------------------------------------------------------------- verify ---
-def verify_chunk(path: PathLike) -> Dict[str, Any]:
+def verify_chunk(path: PathLike, use_mmap: bool = False) -> Dict[str, Any]:
     """Non-raising health check of a chunk snapshot file.
 
     Returns {"ok": bool, "chunk_id": ..., "protocol": ..., "n_s": int,
@@ -626,6 +845,9 @@ def verify_chunk(path: PathLike) -> Dict[str, Any]:
     "sha256_ok": bool} — on any format/corruption problem it REPORTS
     instead of raising: ok=False plus an "error" message (fields that
     could be salvaged before the failure are still filled in).
+
+    use_mmap : bool, default False — the W9.2 flag (same reader choice as
+    load_chunk; the verification result is identical either way).
     """
     out: Dict[str, Any] = {
         "ok": False, "chunk_id": None, "protocol": None,
@@ -635,10 +857,7 @@ def verify_chunk(path: PathLike) -> Dict[str, Any]:
     try:
         p = os.fspath(path)
         out["nbytes"] = os.path.getsize(p)
-        z = np.load(p, allow_pickle=False)
-        if not hasattr(z, "files"):
-            raise ValueError(
-                f"{p!r} is not an npz archive (got {type(z).__name__})")
+        z = _open_npz(p, use_mmap, "verify_chunk")
         with z:
             meta = _read_meta_json(z)
             out["chunk_id"] = meta.get("chunk_id")

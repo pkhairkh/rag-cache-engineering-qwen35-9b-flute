@@ -34,12 +34,59 @@ Codes are b-bit indices + one fp norm. Lloyd-Max is not additive:
 Q(a+b) ≠ Q(a)+Q(b) — install math (SPECIFICATION §6) therefore requantizes
 SUMS of dequantized vectors (see rag/install.py); this module intentionally
 offers no code-plus-code operation.
+
+THE W9.2 `qjl` FLAG (P7 / D1's flagged prod-variant A/B — DEFAULT OFF):
+`TurboQuant(..., qjl=True)` additionally computes the structured QJL
+residual sketch (PROPOSAL §1.2, the paper's Alg. 2 "TurboQuant_prod"):
+
+  r   = x − dequant_mse(codes)          (ORIGINAL-frame residual; the
+                                         rotated-frame form fht(x/‖x‖) − y
+                                         is identical by linearity — sign()
+                                         is scale-invariant either way)
+  γ   = ‖r‖₂                            (one fp32 scalar, never quantized)
+  qjl = sign(FHT(r/γ, seed+7777))       (d int8 ±1 — the SECOND
+                                         deterministic sign draw, own seed
+                                         = the kind's seed + QJL_SEED_OFFSET,
+                                         same d as the rotation)
+  dequant: x̃ = x̃_mse + (√(π/2)/√d)·γ·FHT_adjoint(qjl)
+
+EXACT FORMULATION (documented per the A/B contract): PROPOSAL §1.2 writes
+the paper's estimator as x̃ = x̃_mse + (√(π/2)/d)·γ·Sᵀ·qjl with S iid
+N(0,1) d×d — unit-variance entries, rows of norm ~√d. Our substitution
+(PROPOSAL §1.5 item 4: "the QJL projection is likewise substituted with a
+structured sketch") is S := √d·FHT(d, seed+7777): the sign-flipped
+Hadamard scaled to the SAME per-entry variance, whose second moments
+match the dense Gaussian exactly (E[S_ik·S_jl] = δ_ij·δ_kl over the ±1
+draw). Since sign() is scale-invariant the SKETCH is computed on the
+unscaled orthogonal FHT, and the adjoint carries the √d:
+
+  (√(π/2)/d)·γ·Sᵀ·qjl  ==  (√(π/2)/√d)·γ·FHT_adjoint(qjl)
+
+Unbiasedness of ⟨y, x̃⟩ (E = ⟨y, x⟩) survives any JL-valid projection with
+the right moments to CLT accuracy — the FHT's projection coordinates are
+equal-weight ±1 sums, Gaussian-marginal for generic x — and the VARIANCE
+CONSTANT of the structured substitute is exactly what the GPU Phase-5 gate
+re-measures (PROPOSAL §1.5(4), D1's A/B decision rule). Two deliberate A/B
+simplifications vs. the paper's Alg. 2, both pinned by PROPOSAL D1: (i)
+the MSE base layer keeps the SAME bit budget (the paper drops it to b-1;
+here the A/B isolates the residual bit at the production budget — "one
+extra bit per coordinate", so the effective rate is b+1); (ii) the
+retrieval-plane consumer (IVFADC-side IP estimation) is the GPU box's
+Phase-5 decision — index.py is deliberately untouched.
+
+Round-trip note: with qjl=True the MSE typically IMPROVES (the residual
+is compensated in expectation: E‖r−c‖² ≈ (π/2−1)·γ² vs. γ², with
+‖c‖ = √(π/2)·γ exactly); the parity gate covers qjl=False only.
+Serialization is BACKWARD-COMPATIBLE: codes quantized without the flag
+carry qjl_signs/gamma == None and write NONE of the new keys; from_arrays
+loads old npz/snapshots (no qjl keys) with the fields None.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple
+import math
 
 import numpy as np
 import torch
@@ -64,6 +111,13 @@ KINDS: Dict[str, Tuple[int, int]] = {
     "M2":  (524_288, 404),   # global value-memory (spec §2.2)
 }
 SEEDS: Dict[str, int] = {k: v[1] for k, v in KINDS.items()}
+
+# W9.2 qjl flag: the QJL sketch's own sign-draw seed offset, added to the
+# kind's D3 rotation seed (a SECOND deterministic draw — same d).
+QJL_SEED_OFFSET = 7777
+# The paper's Alg.-2 IP-estimator constant (PROPOSAL §1.2: (√(π/2)/d)·γ·Sᵀ·qjl
+# with S unit-variance; folded with S = √d·FHT -> (√(π/2)/√d)·γ·FHT_adjoint).
+QJL_C = math.sqrt(math.pi / 2.0)
 
 
 # ------------------------------------------------------------- bit packs ---
@@ -132,11 +186,21 @@ class TQCodes:
     idx_hi: np.ndarray                     # packed uint8 bit-stream
     seed: int                              # the D3 rotation seed (persisted)
     partition: str = "half"                # "half" (default) | "outlier" (W9 A/B)
+    # W9.2 qjl A/B (DEFAULT None = flag OFF / legacy codes): the structured
+    # QJL residual sketch — (d,) int8 ±1 = sign(FHT(r/γ, seed+7777)) — and
+    # the fp32 residual norm γ. Present IFF quantized with qjl=True;
+    # serialization writes them ONLY when present (backward compatible).
+    qjl_signs: Optional[np.ndarray] = None
+    gamma: Optional[np.float32] = None
 
     # ---- serialization ---------------------------------------------------
     def to_arrays(self) -> Dict[str, np.ndarray]:
-        """Flat array dict for embedding into a larger npz (snapshot.py)."""
-        return {
+        """Flat array dict for embedding into a larger npz (snapshot.py).
+
+        The qjl fields are written ONLY when present, so codes quantized
+        without the flag produce the EXACT pre-W9.2 key set (old readers
+        and old digests are unaffected)."""
+        out = {
             "kind": np.array(self.kind),
             "d": np.array(self.d, dtype=np.int64),
             "norm": np.array(self.norm, dtype=np.float32),
@@ -149,9 +213,20 @@ class TQCodes:
             "idx_lo": self.idx_lo,
             "idx_hi": self.idx_hi,
         }
+        if self.qjl_signs is not None:
+            out["qjl_signs"] = np.ascontiguousarray(self.qjl_signs,
+                                                   dtype=np.int8)
+        if self.gamma is not None:
+            out["gamma"] = np.array(self.gamma, dtype=np.float32)
+        return out
 
     @classmethod
     def from_arrays(cls, a: Dict[str, np.ndarray]) -> "TQCodes":
+        """Inverse of to_arrays. BACKWARD COMPATIBLE: an array dict
+        written WITHOUT the qjl keys (pre-W9.2 npz/snapshots) loads with
+        qjl_signs/gamma == None — the flag-off dequant path."""
+        qjl = a.get("qjl_signs") if hasattr(a, "get") else None
+        gam = a.get("gamma") if hasattr(a, "get") else None
         return cls(
             kind=str(a["kind"]),
             d=int(a["d"]),
@@ -164,10 +239,18 @@ class TQCodes:
             idx_hi=np.asarray(a["idx_hi"], dtype=np.uint8),
             seed=int(a["seed"]),
             partition=str(a["partition"]),
+            qjl_signs=(None if qjl is None
+                       else np.asarray(qjl, dtype=np.int8)),
+            gamma=(None if gam is None else np.float32(gam)),
         )
 
     def nbytes(self) -> int:
-        return self.idx_lo.nbytes + self.idx_hi.nbytes + 4  # + fp32 norm
+        n = self.idx_lo.nbytes + self.idx_hi.nbytes + 4  # + fp32 norm
+        if self.qjl_signs is not None:      # W9.2 A/B: +1 bit/coordinate
+            n += int(self.qjl_signs.nbytes)  # (d,) int8 sketch
+        if self.gamma is not None:
+            n += 4                           # fp32 gamma
+        return n
 
 
 # ------------------------------------------------------------ quantizer ----
@@ -182,10 +265,19 @@ class TurboQuant:
         realized as (floor(x), ceil(x)) with the fractional part choosing
         the lo/hi coordinate ratio (0.5 → half/half).
     seed : overrides the kind's D3 seed (tests only — never in production).
+    qjl : bool, default False — the W9.2 P7/D1 prod-variant A/B flag. When
+        True, quant() additionally computes the structured QJL residual
+        sketch (see the module docstring for the exact formulation) and
+        the returned TQCodes carry qjl_signs/gamma; dequant() then adds the
+        compensation term (√(π/2)/√d)·γ·FHT_adjoint(qjl) whenever the CODES
+        carry the fields (a qjl=False instance dequantizes qjl codes
+        correctly — the codes are self-describing). Flag OFF is
+        bit-identical to the pre-W9.2 behavior (parity gate).
     """
 
     def __init__(self, kind: str = "S", bits: float = 3.5,
-                 d: Optional[int] = None, seed: Optional[int] = None):
+                 d: Optional[int] = None, seed: Optional[int] = None,
+                 qjl: bool = False):
         if kind not in KINDS:
             if d is None or seed is None:
                 raise ValueError(
@@ -225,10 +317,24 @@ class TurboQuant:
                        else codebooks.get_codebook(self.bits_hi, self.d))
         # the D3 rotation: one sign vector per kind, generated once
         self._signs = fht.rotation_signs(self.d, self.seed)
+        # W9.2 qjl flag (DEFAULT OFF — the fields below are computed
+        # unconditionally but USED only on qjl paths, so flag-off output
+        # is bit-identical to the pre-W9.2 behavior):
+        self.qjl = bool(qjl)
+        # the SECOND deterministic sign draw (kind seed + 7777, same d) —
+        # the structured QJL projection S = √d·FHT(d, seed+7777)
+        self._qjl_signs_vec = fht.rotation_signs(self.d,
+                                                 self.seed + QJL_SEED_OFFSET)
 
     # ---------------------------------------------------------------- API --
     def quant(self, x: torch.Tensor) -> TQCodes:
-        """Quantize ONE unit: x is a (d,) tensor (any float dtype)."""
+        """Quantize ONE unit: x is a (d,) tensor (any float dtype).
+
+        qjl=True (the W9.2 flag) additionally attaches the residual sketch:
+        the ORIGINAL-frame residual r = x − dequant_mse(codes), its fp32
+        norm γ, and qjl = sign(FHT(r/γ, seed+7777)) (module docstring has
+        the exact formulation). The MSE layer (idx/norm) is computed
+        IDENTICALLY with and without the flag — the A/B is purely additive."""
         x = torch.as_tensor(x)
         if x.dim() != 1 or x.shape[0] != self.d:
             raise ValueError(
@@ -239,29 +345,97 @@ class TurboQuant:
         x32 = x.detach().to(torch.float32)
         norm = float(x32.norm().item())
         if norm == 0.0:  # degenerate: all-zero unit (codes of zero)
-            return TQCodes(self.kind, self.d, np.float32(0.0),
-                           self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
-                           np.zeros(_packed_len(self.n_lo, self.bits_lo), np.uint8),
-                           np.zeros(_packed_len(self.n_hi, self.bits_hi), np.uint8),
-                           self.seed)
-        r = (x32 / norm).reshape(1, self.d)
-        y = fht.fht_apply(r, self._signs).reshape(self.d)      # y = r @ T
-        y_np = y.numpy()
-        lo, hi = y_np[: self.n_lo], y_np[self.n_lo:]
-        idx_lo = np.searchsorted(self._cb_lo.boundaries, lo).astype(np.uint8)
-        idx_hi = np.searchsorted(self._cb_hi.boundaries, hi).astype(np.uint8)
-        return TQCodes(self.kind, self.d, np.float32(norm),
-                       self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
-                       pack_bits(idx_lo, self.bits_lo),
-                       pack_bits(idx_hi, self.bits_hi),
-                       self.seed)
+            codes = TQCodes(self.kind, self.d, np.float32(0.0),
+                            self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
+                            np.zeros(_packed_len(self.n_lo, self.bits_lo), np.uint8),
+                            np.zeros(_packed_len(self.n_hi, self.bits_hi), np.uint8),
+                            self.seed)
+        else:
+            r = (x32 / norm).reshape(1, self.d)
+            y = fht.fht_apply(r, self._signs).reshape(self.d)      # y = r @ T
+            y_np = y.numpy()
+            lo, hi = y_np[: self.n_lo], y_np[self.n_lo:]
+            idx_lo = np.searchsorted(self._cb_lo.boundaries, lo).astype(np.uint8)
+            idx_hi = np.searchsorted(self._cb_hi.boundaries, hi).astype(np.uint8)
+            codes = TQCodes(self.kind, self.d, np.float32(norm),
+                            self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
+                            pack_bits(idx_lo, self.bits_lo),
+                            pack_bits(idx_hi, self.bits_hi),
+                            self.seed)
+        if self.qjl:
+            self._attach_qjl(codes, x32)
+        return codes
+
+    def _attach_qjl(self, codes: TQCodes, x32: torch.Tensor) -> None:
+        """Compute + attach the structured QJL residual sketch (W9.2 flag).
+
+        r = x32 − dequant_mse(codes) in the ORIGINAL frame (the rotated
+        form is identical by linearity); γ = ‖r‖; qjl =
+        sign(FHT(r/γ, seed+7777)) — a (d,) int8 ±1 vector. A zero residual
+        (γ == 0: the degenerate zero-norm unit, or an exact reconstruction)
+        stores zeros and γ = 0 — the compensation term is then exactly 0."""
+        x_mse = self._dequant_mse(codes, dtype=torch.float32)
+        resid = x32 - x_mse
+        gamma = float(resid.norm().item())
+        if gamma > 0.0:
+            rn = (resid / gamma).reshape(1, self.d)
+            proj = fht.fht_apply(rn, self._qjl_signs_vec).reshape(self.d)
+            # ±1 exactly (np.sign; 0 only on an exact-zero projection —
+            # measure-zero for generic residuals, degrades that coordinate
+            # by 1/√d of its weight)
+            signs = np.sign(proj.numpy()).astype(np.int8)
+        else:
+            signs = np.zeros(self.d, dtype=np.int8)
+        codes.qjl_signs = signs
+        codes.gamma = np.float32(gamma)
 
     def dequant(self, codes: TQCodes,
                 dtype: torch.dtype = torch.float32) -> torch.Tensor:
-        """Dequantize ONE unit back to a (d,) tensor of `dtype`."""
+        """Dequantize ONE unit back to a (d,) tensor of `dtype`.
+
+        When the codes carry the QJL sketch (qjl_signs + gamma, the W9.2
+        flag — present IFF quantized with qjl=True), the reconstruction is
+        the paper's Alg.-2 estimator: x̃ = x̃_mse + (√(π/2)/√d)·γ·
+        FHT_adjoint(qjl)  ==  x̃_mse + (√(π/2)/d)·γ·Sᵀ·qjl with the
+        structured projection S = √d·FHT(d, codes.seed+7777) (module
+        docstring). Codes WITHOUT the fields: exactly the pre-W9.2 path."""
         self._check_codes(codes)
         if float(codes.norm) == 0.0:
+            # zero-norm unit ⇒ the quant-side residual was exactly zero ⇒
+            # γ == 0 ⇒ the compensation term is exactly 0 — plain zeros.
             return torch.zeros(self.d, dtype=dtype)
+        out = self._dequant_mse(codes, dtype=torch.float32)
+        if codes.qjl_signs is not None or codes.gamma is not None:
+            if codes.qjl_signs is None or codes.gamma is None:
+                raise ValueError(
+                    f"TurboQuant({self.kind}, bits={self.bits_spec}, "
+                    f"d={self.d}, seed={self.seed}): codes carry a PARTIAL "
+                    f"QJL sketch (qjl_signs={'set' if codes.qjl_signs is not None else 'None'}, "
+                    f"gamma={'set' if codes.gamma is not None else 'None'}) — "
+                    f"corrupted serialization?")
+            s = np.asarray(codes.qjl_signs)
+            if s.dtype != np.int8 or s.ndim != 1 or s.shape[0] != codes.d:
+                raise ValueError(
+                    f"TurboQuant({self.kind}): qjl_signs must be a "
+                    f"({codes.d},) int8 ±1 sketch, got shape={s.shape}, "
+                    f"dtype={s.dtype}")
+            gamma = float(codes.gamma)
+            if gamma != 0.0:
+                # _check_codes pins codes.seed == self.seed, so the cached
+                # second draw is the codes' own QJL sign vector.
+                # np.array(...) = a WRITABLE fp32 copy: torch.from_numpy on
+                # a read-only view (e.g. the zero-copy views onto mmap'd
+                # snapshot members) would warn + be UB on write.
+                s_t = torch.from_numpy(
+                    np.array(s, dtype=np.float32)).reshape(1, self.d)
+                z = fht.fht_adjoint(s_t, self._qjl_signs_vec).reshape(self.d)
+                out = out + (QJL_C * gamma / math.sqrt(self.d)) * z
+        return out.to(dtype)
+
+    def _dequant_mse(self, codes: TQCodes,
+                     dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        """The MSE-layer reconstruction (the pre-W9.2 dequant body, verbatim
+        — shared by dequant() and the qjl residual computation)."""
         idx_lo = unpack_bits(codes.idx_lo, codes.bits_lo, codes.n_lo)
         idx_hi = unpack_bits(codes.idx_hi, codes.bits_hi, codes.n_hi)
         y = np.empty(self.d, dtype=np.float32)

@@ -39,6 +39,19 @@ Quantizer resolution: the production shapes hit the canonical kinds
 (S: 1×32×128×128 = 524,288; conv: 1×8192×4 = 32,768). Smaller
 power-of-two shapes (tests) resolve to a custom-size quantizer that keeps
 the KIND's seed, so the D3 frame contract holds at every scale.
+
+THE W9.2 `graph_safe` FLAG (P7 CUDA-graph capture hooks — DEFAULT OFF):
+TQCache(..., graph_safe=True) / TQLinearAttentionLayer(..., graph_safe=True)
+is a passthrough contract marker for the GPU box's P7 hardening (the
+cuda-graph capture of the decode step — the quantize-on-write IS in the
+hot loop, PROPOSAL P7). On CPU it is PROVABLY a no-op: the flag gates
+nothing in the update/read paths (the W9.2 parity gate: flag-on ==
+flag-off outputs, bit-identical), and the two hook methods it exposes,
+before_graph_capture()/after_graph_capture(), are empty (see their
+docstrings). torch._dynamo.mark_static_address is NEVER called by this
+module (zero dynamo references — the only call sites in the process are
+the PARENT class's offline lazy_initialization, which the online path
+replaces entirely; see TQLinearAttentionLayer.lazy_initialization).
 """
 from __future__ import annotations
 
@@ -141,10 +154,13 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
     """
 
     def __init__(self, number_of_states: int = 1, bits: float = 3.5,
-                 online: bool = True):
+                 online: bool = True, graph_safe: bool = False):
         super().__init__(number_of_states=number_of_states)
         self.bits = float(bits)
         self.online = bool(online)
+        # W9.2 P7 flag (DEFAULT OFF — pure contract marker on CPU; see the
+        # module docstring): carried on the layer, passed through by TQCache.
+        self.graph_safe = bool(graph_safe)
         self._tq_s: Optional[TurboQuant] = None
         self._tq_conv: Optional[TurboQuant] = None
         self._s_codes: Optional[TQCodes] = None
@@ -197,7 +213,20 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
                             state_idx: int = 0,
                             conv_kernel_size: Optional[int] = None) -> None:
         """Online: capture shapes only — NEVER allocate fp16 state tensors.
-        Offline: parent behavior (raw tensors, snapshot fallback)."""
+        Offline: parent behavior (raw tensors, snapshot fallback).
+
+        W9.2 `graph_safe` VERIFICATION (the no-marking guarantee): the only
+        torch._dynamo.mark_static_address call sites reachable from this
+        class are inside the PARENT's lazy_initialization (transformers'
+        cache_utils — it marks the RAW conv/recurrent tensors "to be able
+        to use cudagraphs"). The ONLINE branch below never calls the
+        parent and this module has ZERO torch._dynamo references, so the
+        online path provably makes no mark_static_address calls — there is
+        nothing for graph_safe to skip. The offline (D4) branch keeps the
+        parent's marks VERBATIM (they are transformers' own cudagraph
+        enabler on raw tensors, and the offline regime is not the P7
+        capture target), so graph_safe=True changes nothing there either.
+        """
         if not self.online:
             return super().lazy_initialization(
                 conv_states=conv_states, recurrent_states=recurrent_states,
@@ -253,6 +282,36 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         self._s_codes = self._tq_s.quant(recurrent_states.reshape(-1))
         out = self._tq_s.dequant(self._s_codes, dtype=self._s_dtype)
         return out.reshape(self._s_shape)
+
+    # ------------------------------------------------- P7 graph hooks ---
+    # W9.2 `graph_safe` (P7): the CUDA-graph capture hook points. They are
+    # exposed on every TQLinearAttentionLayer (callable no-ops), but they
+    # are only part of the contract when the layer was built with
+    # graph_safe=True — the GPU box overrides or wraps them when it
+    # CUDA-graph-captures the decode step (the quantize-on-write —
+    # update_recurrent_state/update_conv_state — is in the captured hot
+    # loop, PROPOSAL P7).
+    def before_graph_capture(self) -> None:
+        """Called by the GPU box immediately BEFORE cuda-graph capture of
+        the decode step. NO-OP ON CPU — provable: this method returns None
+        and reads/writes no state (the codes, shapes, counters are
+        untouched; assert away in the W9.2 parity gate). Intended GPU-side
+        use: warm up / pin the static buffers the captured region will
+        read (e.g. materialize the dequantized read shapes once) so the
+        capture sees stable addresses.
+        """
+        return None
+
+    def after_graph_capture(self) -> None:
+        """Called by the GPU box immediately AFTER cuda-graph capture (and
+        typically once per replay batch). NO-OP ON CPU (same proof as
+        before_graph_capture). Intended GPU-side use: re-arm anything the
+        capture froze — e.g. the LAZY CONV RE-CAPTURE (_sync_conv: the
+        in-place causal_conv1d_update mutation must be requantized into
+        codes between replays) and any side-channel bookkeeping that must
+        stay OUTSIDE the captured region.
+        """
+        return None
 
     # --------------------------------------------------------- code access -
     @property
@@ -345,12 +404,20 @@ class TQCache(DynamicCache):
     M1/M2 (spec §2.2): global cache STATE on this object —
     update_m1/read_m1/m1_codes (+M2 twins), quantized with their own
     D3-seeded kinds.
+
+    graph_safe (W9.2, DEFAULT False): the P7 flag — passed through to
+    every TQLinearAttentionLayer (see that class + the module docstring;
+    provably a no-op on CPU).
     """
 
     def __init__(self, config=None, layer_types: Optional[Iterable[str]] = None,
-                 bits: float = 3.5, online: bool = True):
+                 bits: float = 3.5, online: bool = True,
+                 graph_safe: bool = False):
         self._tq_bits = float(bits)
         self._online = bool(online)
+        # W9.2 P7 flag (DEFAULT OFF) — passed through to every wrapped /
+        # built TQLinearAttentionLayer; a no-op on CPU (module docstring).
+        self._graph_safe = bool(graph_safe)
         self._m1_codes: Optional[TQCodes] = None
         self._m2_codes: Optional[TQCodes] = None
         self._tq_m1: Optional[TurboQuant] = None
@@ -366,7 +433,8 @@ class TQCache(DynamicCache):
             for lt in types:
                 if lt == "linear_attention":
                     layers.append(TQLinearAttentionLayer(
-                        bits=self._tq_bits, online=self._online))
+                        bits=self._tq_bits, online=self._online,
+                        graph_safe=self._graph_safe))
                 else:
                     cls = DYNAMIC_LAYER_TYPE_MAPPING.get(lt)
                     if cls is None:
@@ -385,7 +453,8 @@ class TQCache(DynamicCache):
                     and not isinstance(layer, TQLinearAttentionLayer)):
                 self.layers[i] = TQLinearAttentionLayer(
                     number_of_states=layer.number_of_states,
-                    bits=self._tq_bits, online=self._online)
+                    bits=self._tq_bits, online=self._online,
+                    graph_safe=self._graph_safe)
 
     def linear_layer_indices(self) -> List[int]:
         return [i for i, l in enumerate(self.layers)
