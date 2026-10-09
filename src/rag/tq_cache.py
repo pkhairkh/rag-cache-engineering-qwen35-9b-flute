@@ -458,14 +458,16 @@ class TQCache(DynamicCache):
     # ------------------------------------------------------------ snapshot --
     def snapshot_codes(self) -> Dict[str, object]:
         """All codes of this cache (the §5 snapshot: 24 S + 24 conv + M1/M2
-        at production shapes)."""
-        self._sync_all()
-        return {
-            "s": self.s_codes,
-            "conv": self.conv_codes,
-            "m1": self._m1_codes,
-            "m2": self._m2_codes,
-        }
+        at production shapes). Online: the standing codes. Offline (D4
+        fallback): quantizes the held raw tensors per layer."""
+        out: Dict[str, object] = {
+            "s": {}, "conv": {}, "m1": self._m1_codes, "m2": self._m2_codes}
+        for i, l in enumerate(self.layers):
+            if isinstance(l, TQLinearAttentionLayer):
+                layer_codes = l.snapshot_codes()  # syncs + (offline) quantizes
+                out["s"][i] = layer_codes["s"]
+                out["conv"][i] = layer_codes["conv"]
+        return out
 
     def _sync_all(self) -> None:
         for l in self.layers:

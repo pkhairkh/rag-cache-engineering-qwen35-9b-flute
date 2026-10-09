@@ -532,36 +532,30 @@ def test_offline_snapshot_codes_quantizes_held_tensors():
     assert _rel_mse(deq_c, x[..., -CONV_KERNEL:]) < REL_MSE_GATE  # 0.020
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="W2.2 reported bug (source untouched): TQCache.snapshot_codes() "
-           "reads the ONLINE code store, so in offline (D4) mode it returns "
-           "all-None views instead of quantizing the held raw tensors — the "
-           "layer-level snapshot_codes() works. See the repro in this test.",
-)
 def test_cache_level_snapshot_codes_offline_returns_codes():
-    """REPORTED BUG — exact repro (transformers 5.19.0, commit a27f6fc):
+    """Regression (W2.2 reported, ORCH fixed): TQCache.snapshot_codes()
+    now DELEGATES per layer, so the offline (D4 snapshot-fallback) regime
+    snapshots correctly. Was: it returned the online code views
+    ({"s": {0: None}, ...}) whenever D4 was selected — W5's §5 chunk
+    snapshot through the cache object would have been silently empty.
+
+    Exact repro of the old bug (transformers 5.19.0, commit a27f6fc):
 
         cache = TQCache(layer_types=["linear_attention"], online=False)
         cache.update_conv_state(x, 0, conv_kernel_size=4)   # raw tensor stored
         cache.update_recurrent_state(s, 0)
         cache.snapshot_codes()   # -> {"s": {0: None}, "conv": {0: None}, ...}
-
-    The layer-level path is correct:
-        cache.layers[0].snapshot_codes()  # -> {"s": TQCodes, "conv": TQCodes}
-
-    Root cause: TQCache.snapshot_codes() returns `self.s_codes` (the ONLINE
-    `_s_codes` property views, never set in offline mode) instead of
-    delegating to each TQLinearAttentionLayer.snapshot_codes(). Impact: W5's
-    §5 chunk snapshot taken through the CACHE object would silently emit an
-    empty snapshot whenever the D4 offline regime is selected. Strict xfail:
-    when fixed, this test must be updated (XPASS fails the suite).
     """
     cache, x, s, _, _ = _offline_cache()
     snap = cache.snapshot_codes()
     assert snap["s"][0] is not None, "offline cache snapshot lost the S codes"
     assert snap["conv"][0] is not None, "offline cache snapshot lost the conv codes"
-    assert snap["s"][0] == cache.layers[0].snapshot_codes()["s"]
+    # byte-identical to the (correct) layer-level snapshot — both quantize
+    # the same held raw tensors deterministically
+    layer_snap = cache.layers[0].snapshot_codes()
+    assert (snap["s"][0].idx_lo == layer_snap["s"].idx_lo).all()
+    assert (snap["conv"][0].idx_lo == layer_snap["conv"].idx_lo).all()
+    assert float(snap["s"][0].norm) == float(layer_snap["s"].norm)
 
 
 # --- contract 10: resolve_quantizer -------------------------------------------- #
