@@ -10,7 +10,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -28,8 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from transformers import (
-    initialization as init,
+from transformers import (initialization as init,
 )
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -59,8 +58,7 @@ from transformers.utils import (
     torch_compilable_check,
 )
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import (
-    accepts_precomputed_kwargs,
+from transformers.utils.generic import (accepts_precomputed_kwargs,
     get_max_seqlen,
     is_flash_attention_requested,
     maybe_autocast,
@@ -98,8 +96,7 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
 
     @staticmethod
     @deprecate_kwarg("device", version="5.18")
-    def compute_default_rope_parameters(
-        config: Qwen3_5TextConfig, device=None, **kwargs
+    def compute_default_rope_parameters(config: Qwen3_5TextConfig, device=None, **kwargs
     ) -> tuple[torch.Tensor, float]:
         """
         Computes the inverse frequencies according to the original RoPE implementation
@@ -188,9 +185,9 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
 
 
 # ---------------------------------------------------------------------------
-# W29: the fla linear-attention wiring (the decode path only).
+# the fla linear-attention wiring (the decode path only).
 #
-# The W29 box audit (docs/A10G_DECODE_INVESTIGATION.md section 6) found
+# The box audit (docs/A10G_DECODE_INVESTIGATION.md section 6) found
 # the GDN decode running pure-torch fallbacks: the per-token recurrent
 # update (~8-10 small kernels on the [1, 32, 128, 128] state) and the
 # causal-conv update (cat + copy_ + F.conv1d with groups=8192) — ~35-45
@@ -205,33 +202,33 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
 # bodies (so the hub decorators stay in charge: an active hub dispatches
 # before the body runs; an inactive hub falls to the body, which now
 # tries the kernel itself before the torch loop):
-#   * fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule — the
-#     [B, T, H, K] layout, the pre-sigmoided beta (use_beta_sigmoid_
-#     in_kernel=False), the in-kernel l2norm, the 1/sqrt(K) scale: the
-#     EXACT contract the torch loop below implements (fp32 state and
-#     q/k/v reads in fp32 inside the Triton kernel). Called ONLY at the
-#     decode shape (seq_len == 1 under the GDN dispatch) — prefill/PPL
-#     route through torch_chunk_gated_delta_rule / causal_conv1d_fn and
-#     stay byte-identical to the pre-W29 numerics (PPL delta +3.52%
-#     untouched).
-#   * causal_conv1d.causal_conv1d_update — the [B, D, T] decode update
-#     with the in-place state shift; the same window and the same state
-#     update as the cat + F.conv1d chain it replaces (both compute
-#     conv([s1..s_{W-1}, x]) and leave the state = [s1..s_{W-1}, x] for
-#     the transformers cache's state_len == W).
+# * fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule — the
+# [B, T, H, K] layout, the pre-sigmoided beta (use_beta_sigmoid_
+# in_kernel=False), the in-kernel l2norm, the 1/sqrt(K) scale: the
+# EXACT contract the torch loop below implements (fp32 state and
+# q/k/v reads in fp32 inside the Triton kernel). Called ONLY at the
+# decode shape (seq_len == 1 under the GDN dispatch) — prefill/PPL
+# route through torch_chunk_gated_delta_rule / causal_conv1d_fn and
+# stay byte-identical to the older numerics (PPL delta +3.52%
+# untouched).
+# * causal_conv1d.causal_conv1d_update — the [B, D, T] decode update
+# with the in-place state shift; the same window and the same state
+# update as the cat + F.conv1d chain it replaces (both compute
+# conv([s1..s_{W-1}, x]) and leave the state = [s1..s_{W-1}, x] for
+# the transformers cache's state_len == W).
 #
 # Failure discipline: import failures and FIRST-CALL failures both latch
 # the wiring off for the rest of the process (the torch fallbacks serve
 # everything after). The latch settles during the pre-capture warmup
 # (eager), so the eager ground truth and the captured replay always take
-# the SAME route — the W24 capture-verify gate stays exact either way.
+# the SAME route — the capture-verify gate stays exact either way.
 #
 # Decode numerics: the fla kernels compute the same math with a
 # different FMA association — decode greedy tokens may flip on
 # near-ties (the documented near-tie contract every decode kernel in
 # this repo carries; first-divergence is the aggregate to read).
 # FLUTE_NO_FLA=1 (or FLUTE_FLA=0) is the A/B switch: it restores the
-# pure-torch fallbacks of W28 bit-identically.
+# pure-torch fallbacks of bit-identically.
 # ---------------------------------------------------------------------------
 _FLUTE_FLA_STATE = {"tried": False, "recurrent": None, "conv_update": None}
 
@@ -240,12 +237,12 @@ def _fla_wiring_enabled() -> bool:
     v = os.environ.get("FLUTE_NO_FLA", "").strip()
     if v in ("1", "true", "True"):
         return False
-    v2 = os.environ.get("FLUTE_FLA", "1").strip()
-    return v2 not in ("0", "false", "False")
+    fla_on = os.environ.get("FLUTE_FLA", "1").strip()
+    return fla_on not in ("0", "false", "False")
 
 
 def _fla_resolve() -> dict:
-    """Resolve the fused decode kernels ONCE (W29; see the block comment
+    """Resolve the fused decode kernels ONCE (; see the block comment
     above). Import failures latch as None — the torch fallbacks stay (a
     performance fallback, never a correctness one)."""
     if _FLUTE_FLA_STATE["tried"]:
@@ -254,16 +251,14 @@ def _fla_resolve() -> dict:
     if not _fla_wiring_enabled():
         return _FLUTE_FLA_STATE
     try:
-        from fla.ops.gated_delta_rule import (
-            fused_recurrent_gated_delta_rule as _fla_recurrent,
+        from fla.ops.gated_delta_rule import (fused_recurrent_gated_delta_rule as _fla_recurrent,
         )
 
         _FLUTE_FLA_STATE["recurrent"] = _fla_recurrent
     except Exception:                                 # noqa: BLE001
         _FLUTE_FLA_STATE["recurrent"] = None
     try:
-        from causal_conv1d import (
-            causal_conv1d_update as _cc1d_update,
+        from causal_conv1d import (causal_conv1d_update as _cc1d_update,
         )
 
         _FLUTE_FLA_STATE["conv_update"] = _cc1d_update
@@ -273,14 +268,13 @@ def _fla_resolve() -> dict:
 
 
 @use_kernel_func_from_hub_with_fallback("causal_conv1d_update", "causal_conv1d")
-def causal_conv1d_update(
-    hidden_states: torch.Tensor,
+def causal_conv1d_update(hidden_states: torch.Tensor,
     conv_state: torch.Tensor,
     weight: nn.Parameter,
     bias: nn.Parameter | None = None,
     activation: str | None = None,
 ):
-    # W29: the causal-conv1d package's fused update FIRST — ONE Triton
+    # the causal-conv1d package's fused update FIRST — ONE Triton
     # kernel + the in-place state shift replaces the cat + copy_ +
     # F.conv1d chain (same window, same state update; see the block
     # comment above). A first-call failure latches the wiring off (the
@@ -299,8 +293,7 @@ def causal_conv1d_update(
         and (bias is None or bias.is_contiguous())
     ):
         try:
-            out = _fla["conv_update"](
-                hidden_states, conv_state, weight, bias, activation
+            out = _fla["conv_update"](hidden_states, conv_state, weight, bias, activation
             )
             return out.to(hidden_states.dtype)
         except Exception:                             # noqa: BLE001
@@ -318,8 +311,7 @@ def causal_conv1d_update(
 
 
 @use_kernel_func_from_hub_with_fallback("causal_conv1d_fn", "causal_conv1d")
-def causal_conv1d_fn(
-    hidden_states: torch.Tensor,
+def causal_conv1d_fn(hidden_states: torch.Tensor,
     weight: nn.Parameter,
     bias: nn.Parameter | None = None,
     activation: str | None = None,
@@ -328,8 +320,7 @@ def causal_conv1d_fn(
     _, hidden_size, seq_len = hidden_states.shape
     padding = weight.shape[-1] - 1
 
-    out = F.conv1d(
-        hidden_states.to(weight.dtype),
+    out = F.conv1d(hidden_states.to(weight.dtype),
         weight=weight.unsqueeze(1),
         bias=bias,
         padding=padding,
@@ -349,8 +340,7 @@ def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
 
 
 @use_kernel_func_from_hub_with_fallback("chunk_gated_delta_rule", "fla")
-def torch_chunk_gated_delta_rule(
-    query: torch.Tensor,
+def torch_chunk_gated_delta_rule(query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     g: torch.Tensor,
@@ -486,8 +476,7 @@ def torch_chunk_gated_delta_rule(
 
 
 @use_kernel_func_from_hub_with_fallback("fused_recurrent_gated_delta_rule", "fla")
-def torch_recurrent_gated_delta_rule(
-    query: torch.Tensor,
+def torch_recurrent_gated_delta_rule(query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     g: torch.Tensor,
@@ -500,7 +489,7 @@ def torch_recurrent_gated_delta_rule(
     """Computes linear attention using the gated delta rule, by iterating over each token in the sequence dimension.
     Same args and return value as torch_chunk_gated_delta_rule, except for `chunk_size` because the sequence dim is not
     chunked."""
-    # W29: the fla fused-recurrent kernel FIRST at the decode shape
+    # the fla fused-recurrent kernel FIRST at the decode shape
     # (seq_len == 1 under the GDN dispatch — ONE Triton launch replaces
     # the ~8-10-kernel torch loop on the [B, H, K, V] state; see the
     # block comment above). The kernel takes the [B, T, H, K] layout
@@ -509,8 +498,7 @@ def torch_recurrent_gated_delta_rule(
     # A first-call failure latches the wiring off; the loop serves the
     # rest of the run (and the loop stays the general-seqlen fallback).
     if key.dim() != 4:
-        raise ValueError(
-            f"torch_recurrent_gated_delta_rule: key must be [B, T, H, D] "
+        raise ValueError(f"torch_recurrent_gated_delta_rule: key must be [B, T, H, D] "
             f"(got {tuple(key.shape)})")
     _fla = _fla_resolve()
     if (
@@ -520,8 +508,7 @@ def torch_recurrent_gated_delta_rule(
         and not is_torchdynamo_exporting()
     ):
         try:
-            o, final_state = _fla["recurrent"](
-                query,
+            o, final_state = _fla["recurrent"](query,
                 key,
                 value,
                 g,
@@ -605,8 +592,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         # QKV
         self.conv_dim = self.key_dim * 2 + self.value_dim
-        self.conv1d = nn.Conv1d(
-            in_channels=self.conv_dim,
+        self.conv1d = nn.Conv1d(in_channels=self.conv_dim,
             out_channels=self.conv_dim,
             bias=False,
             kernel_size=self.conv_kernel_size,
@@ -633,8 +619,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
     @force_accelerate_hooks("conv1d")
-    def forward(
-        self,
+    def forward(self,
         hidden_states: torch.Tensor,
         cache_params: Cache | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -644,8 +629,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         # Set up dimensions for reshapes later
         batch_size, seq_len, _ = hidden_states.shape
-        use_precomputed_states = cache_params is not None and cache_params.has_previous_state(
-            self.layer_idx, state_idx=0
+        use_precomputed_states = cache_params is not None and cache_params.has_previous_state(self.layer_idx, state_idx=0
         )
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
@@ -660,8 +644,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if use_precomputed_states and seq_len == 1 and not cache_params.layers[self.layer_idx].record_past:
             conv_state = cache_params.layers[self.layer_idx].conv_states[0]
             # Single-token cached decode: the fused per-step kernel updates the conv state in-place.
-            mixed_qkv = causal_conv1d_update(
-                mixed_qkv,
+            mixed_qkv = causal_conv1d_update(mixed_qkv,
                 conv_state,
                 self.conv1d.weight.squeeze(1),
                 self.conv1d.bias,
@@ -669,12 +652,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         else:
             if cache_params is not None:
-                mixed_qkv = cache_params.update_conv_state(
-                    mixed_qkv, self.layer_idx, conv_kernel_size=self.conv_kernel_size
+                mixed_qkv = cache_params.update_conv_state(mixed_qkv, self.layer_idx, conv_kernel_size=self.conv_kernel_size
                 )
 
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
+            mixed_qkv = causal_conv1d_fn(mixed_qkv,
                 self.conv1d.weight.squeeze(1),
                 self.conv1d.bias,
                 activation=self.activation,
@@ -686,8 +667,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 mixed_qkv = mixed_qkv[:, :, -seq_len:]
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
-        query, key, value = torch.split(
-            mixed_qkv,
+        query, key, value = torch.split(mixed_qkv,
             [
                 self.key_dim,
                 self.key_dim,
@@ -701,7 +681,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
         beta = b.sigmoid()
-        # If the model is loaded in fp16, without the .float() here, A might be -inf
+        # If the model is loaded in fp16, without the .float here, A might be -inf
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -709,8 +689,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         recurrent_state = cache_params.layers[self.layer_idx].recurrent_states[0] if use_precomputed_states else None
         if use_precomputed_states and seq_len == 1:
-            core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
-                query,
+            core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(query,
                 key,
                 value,
                 g=g,
@@ -722,8 +701,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 **kwargs,
             )
         else:
-            core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
-                query,
+            core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(query,
                 key,
                 value,
                 g=g,
@@ -741,10 +719,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # M1/M2 read/write (SPECIFICATION §2.2): the two global memories,
         # attached by Qwen3_5TextModel when config.use_m1m2 is set (default
         # off — this block is skipped entirely, zero code-path change).
-        # The state lives in the TQ cache (dequantize-on-read /
-        # quantize-on-write, §3.2); with zero-init write gates the whole
-        # block is a bit-identical no-op (read of zero memories = exact
-        # zeros; writes return the state unchanged — PROPOSAL P3).
+        # State lives in the TQ cache (dequantize-on-read /
+        # quantize-on-write, §3.2); zero-init write gates = bit-identical
+        # no-op (PROPOSAL P3). Write positions run on a per-cache token
+        # counter (decode steps stop overwriting slot 0).
         _m1m2 = getattr(self, "m1m2", None)
         if _m1m2 is not None and cache_params is not None and hasattr(cache_params, "read_m1"):
             _m1 = cache_params.read_m1(dtype=value.dtype)
@@ -758,10 +736,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             if _k.shape[1] != _q.shape[1]:
                 _k = _k.repeat_interleave(_q.shape[1] // _k.shape[1], dim=1)
             _v = value.transpose(1, 2)
-            # write positions: RUNNING token counter on the TQ cache layer —
-            # per-forward arange(T) would make every decode step write slot 0
-            # (wasting 127/128 of memory capacity); the counter resets with a
-            # fresh cache, so per-chunk ingestion deltas stay consistent
             _tl = cache_params.layers[self.layer_idx] if hasattr(
                 cache_params, "layers") else None
             _pos0 = getattr(_tl, "_m1m2_tokens", 0) if _tl is not None else 0
@@ -845,8 +819,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def eager_attention_forward(
-    module: nn.Module,
+def eager_attention_forward(module: nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -873,8 +846,7 @@ def eager_attention_forward(
 _FLUTE_SM86_WARNED = False
 
 
-def flute_sm86_attention_forward(
-    module,
+def flute_sm86_attention_forward(module,
     query_states,
     key_states,
     value_states,
@@ -915,8 +887,7 @@ def flute_sm86_attention_forward(
     import attn_sm86 as _attn
     ok, _reason = _attn.kernel_available()
     if ok or os.environ.get("TRITON_INTERPRET") == "1":
-        out = _attn.flute_sm86_attention(
-            query_states, key_states, value_states, scaling)
+        out = _attn.flute_sm86_attention(query_states, key_states, value_states, scaling)
         # (B, H, S, D) -> (B, S, H, D): eager's interface return
         # contract. The module tail that result flows through
         # (reshape(*input_shape, -1) -> * sigmoid(gate) -> o_proj) is
@@ -932,8 +903,7 @@ def flute_sm86_attention_forward(
     module.config._attn_implementation = "sdpa"
     fallback: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
         "sdpa", eager_attention_forward)
-    return fallback(
-        module, query_states, key_states, value_states, attention_mask,
+    return fallback(module, query_states, key_states, value_states, attention_mask,
         dropout=dropout, scaling=scaling, **kwargs)
 
 
@@ -953,23 +923,18 @@ class Qwen3_5Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=config.attention_bias
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=config.attention_bias
         )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
         self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
 
-    def forward(
-        self,
+    def forward(self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
@@ -979,8 +944,7 @@ class Qwen3_5Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states, gate = torch.chunk(
-            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
+        query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
         )
         gate = gate.reshape(*input_shape, -1)
 
@@ -994,12 +958,10 @@ class Qwen3_5Attention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(self.config._attn_implementation, eager_attention_forward
         )
 
-        attn_output, attn_weights = attention_interface(
-            self,
+        attn_output, attn_weights = attention_interface(self,
             query_states,
             key_states,
             value_states,
@@ -1068,8 +1030,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
+    def forward(self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
@@ -1083,16 +1044,14 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
 
         # Token Mixer
         if self.block_type == "linear_attention":
-            hidden_states = self.linear_attn(
-                hidden_states=hidden_states,
+            hidden_states = self.linear_attn(hidden_states=hidden_states,
                 cache_params=past_key_values,
                 attention_mask=attention_mask,
                 **kwargs,
             )
         elif self.block_type == "full_attention":
             # Self Attention
-            hidden_states, _ = self.self_attn(
-                hidden_states=hidden_states,
+            hidden_states, _ = self.self_attn(hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -1133,8 +1092,7 @@ class Qwen3_5PreTrainedModel(PreTrainedModel):
         if isinstance(module, Qwen3_5GatedDeltaNet):
             init.ones_(module.dt_bias)
             # Lower bound kept away from 0 so log(A) never becomes -inf
-            init.copy_(
-                module.A_log,
+            init.copy_(module.A_log,
                 torch.empty(module.num_v_heads, device=module.A_log.device).uniform_(0.01, 16).log_(),
             )
         # We initialize with 0s to be 1 centered as the RMSNorm here does (1 + weight)
@@ -1168,13 +1126,11 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         # M1/M2: the two global memories (SPECIFICATION §2.2), shared
-        # across ALL linear layers — added behind the config flag
-        # `use_m1m2` (default OFF: zero code-path change for parity; the
-        # RAG build turns it on). The M1/M2 STATE lives in the TQ cache
-        # (rag/tq_cache.py); this module holds only the read/write gates
+        # across ALL linear layers — behind config flag `use_m1m2` (default
+        # OFF: zero code-path change for parity). State lives in the TQ
+        # cache (rag/tq_cache.py); this module holds only the gates
         # (zero-init writes — bit-identical no-op until the §7 fine-tune
-        # opens them). Lazy path-anchored import: the model code must not
-        # hard-depend on the RAG package at module import.
+        # opens them). Lazy path-anchored import (no RAG dep at import).
         if getattr(config, "use_m1m2", False):
             import os as _os
             import sys as _sys
@@ -1205,8 +1161,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
-    def forward(
-        self,
+    def forward(self,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
@@ -1257,8 +1212,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-            hidden_states = decoder_layer(
-                hidden_states,
+            hidden_states = decoder_layer(hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=causal_mask_mapping[self.config.layer_types[i]],
                 position_ids=text_position_ids,
@@ -1269,8 +1223,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
 
         hidden_states = self.norm(hidden_states)
 
-        return Qwen3_5ModelOutputWithPast(
-            last_hidden_state=hidden_states,
+        return Qwen3_5ModelOutputWithPast(last_hidden_state=hidden_states,
             past_key_values=past_key_values,
         )
 
@@ -1296,8 +1249,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
 
     @can_return_tuple
     @auto_docstring
-    def forward(
-        self,
+    def forward(self,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
@@ -1325,8 +1277,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
+        outputs: BaseModelOutputWithPast = self.model(input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -1344,8 +1295,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        return CausalLMOutputWithPast(
-            loss=loss,
+        return CausalLMOutputWithPast(loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,

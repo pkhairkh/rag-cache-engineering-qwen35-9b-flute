@@ -6,7 +6,7 @@ materializes (B, H, S, S) fp32 scores. The teacher stays on torch SDPA.
 Design of record: reports/design_attn_sm86.md.
 
 Public surface:
-  - kernel_available() -> (bool, reason): the guard callers must check
+  - kernel_available -> (bool, reason): the guard callers must check
     before the kernel path. triton is imported lazily, never at module
     top level, so this module imports on any box.
   - sm86_attention_forward(q, k, v, sm_scale, ...) -> (out, lse): the
@@ -50,7 +50,7 @@ import torch
 _INTERPRET_MODE = os.environ.get("TRITON_INTERPRET") == "1"
 
 # Lazily decorated @triton.jit kernels (triton must never load at module
-# import — see kernel_available()).
+# import — see kernel_available).
 _FWD_KERNEL = None
 _DQ_KERNEL = None
 _DKV_KERNEL = None
@@ -83,30 +83,23 @@ def _check_qkv(ctx, q, k, v, out=None, grad_out=None, lse=None):
     the calling function (`ctx`) and the offending shapes. out and
     grad_out are validated together (both or neither).
     """
-    assert q.dim() == 4, (
-        f"{ctx}: q must be 4-D (B, H, S, D), got "
+    assert q.dim() == 4, (f"{ctx}: q must be 4-D (B, H, S, D), got "
         f"{q.dim()} dims, shape {tuple(q.shape)}")
-    assert k.dim() == 4, (
-        f"{ctx}: k must be 4-D (B, H_kv, S, D), got "
+    assert k.dim() == 4, (f"{ctx}: k must be 4-D (B, H_kv, S, D), got "
         f"{k.dim()} dims, shape {tuple(k.shape)}")
-    assert v.dim() == 4, (
-        f"{ctx}: v must be 4-D (B, H_kv, S, D), got "
+    assert v.dim() == 4, (f"{ctx}: v must be 4-D (B, H_kv, S, D), got "
         f"{v.dim()} dims, shape {tuple(v.shape)}")
     if out is not None:
-        assert out.dim() == 4, (
-            f"{ctx}: out must be 4-D (B, H, S, D), "
+        assert out.dim() == 4, (f"{ctx}: out must be 4-D (B, H, S, D), "
             f"got {out.dim()} dims, shape {tuple(out.shape)}")
     if grad_out is not None:
-        assert grad_out.dim() == 4, (
-            f"{ctx}: grad_out must be 4-D (B, H, S, D), "
+        assert grad_out.dim() == 4, (f"{ctx}: grad_out must be 4-D (B, H, S, D), "
             f"got {grad_out.dim()} dims, shape {tuple(grad_out.shape)}")
     if lse is not None:
-        assert torch.is_tensor(lse), (
-            f"{ctx}: lse must be a (B, H, S) fp32 tensor "
+        assert torch.is_tensor(lse), (f"{ctx}: lse must be a (B, H, S) fp32 tensor "
             f"(the forward's recompute key; the need_lse=False shortcut "
             f"output cannot backpropagate), got {type(lse).__name__}")
-        assert lse.dim() == 3, (
-            f"{ctx}: lse must be 3-D (B, H, S), got "
+        assert lse.dim() == 3, (f"{ctx}: lse must be 3-D (B, H, S), got "
             f"{lse.dim()} dims, shape {tuple(lse.shape)}")
 
     B, H, S, D = q.shape
@@ -114,25 +107,21 @@ def _check_qkv(ctx, q, k, v, out=None, grad_out=None, lse=None):
     B_v, H_kv_v, S_v, D_v = v.shape
 
     assert (B_k == B and B_v == B and S_k == S and S_v == S
-            and D_k == D and D_v == D), (
-        f"{ctx}: q/k/v must share B, S, D; got "
+            and D_k == D and D_v == D), (f"{ctx}: q/k/v must share B, S, D; got "
         f"q {tuple(q.shape)}, k {tuple(k.shape)}, v {tuple(v.shape)}")
     D_o = D_g = None
     if out is not None:
         B_o, H_o, S_o, D_o = out.shape
-        assert (B_o == B and H_o == H and S_o == S and D_o == D), (
-            f"{ctx}: out must match q's (B, H, S, D); "
+        assert (B_o == B and H_o == H and S_o == S and D_o == D), (f"{ctx}: out must match q's (B, H, S, D); "
             f"got out {tuple(out.shape)} vs q {tuple(q.shape)}")
     if grad_out is not None:
         B_g, H_g, S_g, D_g = grad_out.shape
-        assert (B_g == B and H_g == H and S_g == S and D_g == D), (
-            f"{ctx}: grad_out must match q's "
+        assert (B_g == B and H_g == H and S_g == S and D_g == D), (f"{ctx}: grad_out must match q's "
             f"(B, H, S, D); got grad_out {tuple(grad_out.shape)} vs "
             f"q {tuple(q.shape)}")
     if lse is not None:
         B_l, H_l, S_l = lse.shape
-        assert (B_l == B and H_l == H and S_l == S), (
-            f"{ctx}: lse must be (B, H, S) matching q; "
+        assert (B_l == B and H_l == H and S_l == S), (f"{ctx}: lse must be (B, H, S) matching q; "
             f"got lse {tuple(lse.shape)} vs q {tuple(q.shape)}")
 
     d_parts = [f"q D={D}", f"k D={D_k}", f"v D={D_v}"]
@@ -140,34 +129,27 @@ def _check_qkv(ctx, q, k, v, out=None, grad_out=None, lse=None):
         d_parts.append(f"out D={D_o}")
     if grad_out is not None:
         d_parts.append(f"grad_out D={D_g}")
-    assert D == 256, (
-        f"{ctx}: design geometry is D=256 "
+    assert D == 256, (f"{ctx}: design geometry is D=256 "
         f"(reports/design_attn_sm86.md); got " + ", ".join(d_parts))
-    assert H % H_kv == 0 and H_kv_v == H_kv, (
-        f"{ctx}: GQA requires H % H_kv == 0 and k/v "
+    assert H % H_kv == 0 and H_kv_v == H_kv, (f"{ctx}: GQA requires H % H_kv == 0 and k/v "
         f"to share H_kv; got H={H}, H_kv={H_kv} (k), H_kv={H_kv_v} (v); "
         f"shapes q {tuple(q.shape)}, k {tuple(k.shape)}, "
         f"v {tuple(v.shape)}")
-    assert S >= 1, (
-        f"{ctx}: S must be >= 1, got S={S} "
+    assert S >= 1, (f"{ctx}: S must be >= 1, got S={S} "
         f"(q {tuple(q.shape)}, k {tuple(k.shape)}, v {tuple(v.shape)})")
-    assert q.dtype in (torch.float16, torch.bfloat16), (
-        f"{ctx}: q must be fp16 or bf16, got "
+    assert q.dtype in (torch.float16, torch.bfloat16), (f"{ctx}: q must be fp16 or bf16, got "
         f"{q.dtype} (q {tuple(q.shape)}, k {tuple(k.shape)}, "
         f"v {tuple(v.shape)})")
-    assert k.dtype == q.dtype and v.dtype == q.dtype, (
-        f"{ctx}: q/k/v must share dtype, got "
+    assert k.dtype == q.dtype and v.dtype == q.dtype, (f"{ctx}: q/k/v must share dtype, got "
         f"q={q.dtype}, k={k.dtype}, v={v.dtype} "
         f"(q {tuple(q.shape)}, k {tuple(k.shape)}, v {tuple(v.shape)})")
     if out is not None and grad_out is not None:
-        assert out.dtype == q.dtype and grad_out.dtype == q.dtype, (
-            f"{ctx}: out/grad_out must share q's dtype, "
+        assert out.dtype == q.dtype and grad_out.dtype == q.dtype, (f"{ctx}: out/grad_out must share q's dtype, "
             f"got q={q.dtype}, out={out.dtype}, grad_out={grad_out.dtype} "
             f"(q {tuple(q.shape)}, out {tuple(out.shape)}, "
             f"grad_out {tuple(grad_out.shape)})")
     if lse is not None:
-        assert lse.dtype == torch.float32, (
-            f"{ctx}: lse must be fp32 (the forward "
+        assert lse.dtype == torch.float32, (f"{ctx}: lse must be fp32 (the forward "
             f"produces (B, H, S) fp32 natural log), got {lse.dtype} "
             f"(lse {tuple(lse.shape)}, q {tuple(q.shape)})")
     return B, H, S, D, H_kv
@@ -176,14 +158,12 @@ def _check_qkv(ctx, q, k, v, out=None, grad_out=None, lse=None):
 def _check_tiling(ctx, D, block_m, block_n, d_chunk):
     """Kernel tiling contract: exactly two D-chunks; power-of-two
     block sizes (tl.arange constraint)."""
-    assert 2 * d_chunk == D, (
-        f"{ctx}: the kernel processes D in exactly "
+    assert 2 * d_chunk == D, (f"{ctx}: the kernel processes D in exactly "
         f"two D-chunks, so 2*d_chunk must equal D={D}; got "
         f"d_chunk={d_chunk}")
     for name, val in (("block_m", block_m), ("block_n", block_n),
                       ("d_chunk", d_chunk)):
-        assert val > 0 and (val & (val - 1)) == 0, (
-            f"{ctx}: {name} must be a power of two "
+        assert val > 0 and (val & (val - 1)) == 0, (f"{ctx}: {name} must be a power of two "
             f"(tl.arange constraint), got {name}={val}")
 
 
@@ -201,15 +181,13 @@ def _get_fwd_kernel():
         import triton
         import triton.language as tl
     except ImportError as e:
-        raise ImportError(
-            f"attn_sm86: _attn_fwd_kernel needs triton but the import "
+        raise ImportError(f"attn_sm86: _attn_fwd_kernel needs triton but the import "
             f"failed ({e}); kernel_available() would have returned False — "
             f"guard the kernel path with it and fall back to "
             f"reference_attention_forward") from e
 
     @triton.jit
-    def _attn_fwd_kernel(
-        q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr, sm_scale,
+    def _attn_fwd_kernel(q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr, sm_scale,
         stride_qb, stride_qh, stride_qm,
         stride_kh, stride_kn,
         stride_vh, stride_vn,
@@ -324,22 +302,19 @@ def sm86_attention_forward(q, k, v, sm_scale, need_lse=True,
     if _INTERPRET_MODE:
         # Test-only seam (see module docstring): interpreter mode runs the
         # kernel on CPU — relax the CUDA assert to CPU tensors.
-        assert not q.is_cuda and not k.is_cuda and not v.is_cuda, (
-            f"sm86_attention_forward: TRITON_INTERPRET=1 test seam expects "
+        assert not q.is_cuda and not k.is_cuda and not v.is_cuda, (f"sm86_attention_forward: TRITON_INTERPRET=1 test seam expects "
             f"CPU tensors, got devices q={q.device}, k={k.device}, "
             f"v={v.device} (shapes q {tuple(q.shape)}, "
             f"k {tuple(k.shape)}, v {tuple(v.shape)})")
     else:
-        assert q.is_cuda and k.is_cuda and v.is_cuda, (
-            f"sm86_attention_forward: the Triton kernel is the CUDA path; "
+        assert q.is_cuda and k.is_cuda and v.is_cuda, (f"sm86_attention_forward: the Triton kernel is the CUDA path; "
             f"got devices q={q.device}, k={k.device}, v={v.device} "
             f"(shapes q {tuple(q.shape)}, k {tuple(k.shape)}, "
             f"v {tuple(v.shape)}). CPU callers must guard with "
             f"kernel_available() and use reference_attention_forward.")
         ok, reason = kernel_available()
         if not ok:
-            raise RuntimeError(
-                f"sm86_attention_forward: SM86 Triton kernel unavailable "
+            raise RuntimeError(f"sm86_attention_forward: SM86 Triton kernel unavailable "
                 f"({reason}); shapes q {tuple(q.shape)}, "
                 f"k {tuple(k.shape)}, v {tuple(v.shape)}. Guard the kernel "
                 f"path with kernel_available() and fall back to "
@@ -364,8 +339,7 @@ def sm86_attention_forward(q, k, v, sm_scale, need_lse=True,
     kernel = _get_fwd_kernel()
     grid = ((S + block_m - 1) // block_m, H, B)  # (ceil(S/BLOCK_M), H, B)
     # Strides in ELEMENTS (torch strides are element strides already).
-    kernel[grid](
-        q, k_flat, v_flat, out, lse,
+    kernel[grid](q, k_flat, v_flat, out, lse,
         sm_scale,
         q.stride(0), q.stride(1), q.stride(2),
         k_flat.stride(0), k_flat.stride(1),
@@ -382,7 +356,7 @@ def sm86_attention_forward(q, k, v, sm_scale, need_lse=True,
 def _get_dq_kernel():
     """Lazily import triton and define/decorate _attn_dq_kernel.
 
-    Mirrors _get_fwd_kernel(): the module must import without triton, so
+    Mirrors _get_fwd_kernel: the module must import without triton, so
     the kernel is defined here (first use) and cached. TRITON_INTERPRET
     must be set before the first call so @triton.jit picks interpreter
     mode on CPU test boxes.
@@ -394,15 +368,13 @@ def _get_dq_kernel():
         import triton
         import triton.language as tl
     except ImportError as e:
-        raise ImportError(
-            f"attn_sm86: _attn_dq_kernel needs triton but the import "
+        raise ImportError(f"attn_sm86: _attn_dq_kernel needs triton but the import "
             f"failed ({e}); kernel_available() would have returned False — "
             f"guard the kernel path with it and differentiate "
             f"reference_attention_forward instead") from e
 
     @triton.jit
-    def _attn_dq_kernel(
-        q_ptr, k_ptr, v_ptr, do_ptr, dq_ptr, lse_ptr, delta_ptr, sm_scale,
+    def _attn_dq_kernel(q_ptr, k_ptr, v_ptr, do_ptr, dq_ptr, lse_ptr, delta_ptr, sm_scale,
         stride_qb, stride_qh, stride_qm,
         stride_kh, stride_kn,
         stride_vh, stride_vn,
@@ -547,15 +519,13 @@ def sm86_attention_backward_dq(q, k, v, out, lse, grad_out, sm_scale,
         # kernel on CPU — relax the CUDA assert to CPU tensors.
         assert (not q.is_cuda and not k.is_cuda and not v.is_cuda
                 and not out.is_cuda and not lse.is_cuda
-                and not grad_out.is_cuda), (
-            f"sm86_attention_backward_dq: TRITON_INTERPRET=1 test seam "
+                and not grad_out.is_cuda), (f"sm86_attention_backward_dq: TRITON_INTERPRET=1 test seam "
             f"expects CPU tensors, got devices q={q.device}, "
             f"k={k.device}, v={v.device}, out={out.device}, "
             f"lse={lse.device}, grad_out={grad_out.device}")
     else:
         assert (q.is_cuda and k.is_cuda and v.is_cuda and out.is_cuda
-                and lse.is_cuda and grad_out.is_cuda), (
-            f"sm86_attention_backward_dq: the Triton kernel is the CUDA "
+                and lse.is_cuda and grad_out.is_cuda), (f"sm86_attention_backward_dq: the Triton kernel is the CUDA "
             f"path; got devices q={q.device}, k={k.device}, "
             f"v={v.device}, out={out.device}, lse={lse.device}, "
             f"grad_out={grad_out.device}. CPU callers must guard with "
@@ -563,8 +533,7 @@ def sm86_attention_backward_dq(q, k, v, out, lse, grad_out, sm_scale,
             f"reference_attention_forward instead.")
         ok, reason = kernel_available()
         if not ok:
-            raise RuntimeError(
-                f"sm86_attention_backward_dq: SM86 Triton kernel "
+            raise RuntimeError(f"sm86_attention_backward_dq: SM86 Triton kernel "
                 f"unavailable ({reason}); shapes q {tuple(q.shape)}, "
                 f"k {tuple(k.shape)}, v {tuple(v.shape)}. Guard the "
                 f"kernel path with kernel_available() — never a silent "
@@ -594,8 +563,7 @@ def sm86_attention_backward_dq(q, k, v, out, lse, grad_out, sm_scale,
     kernel = _get_dq_kernel()
     grid = ((S + block_m - 1) // block_m, H, B)  # (ceil(S/BLOCK_M), H, B)
     # Strides in ELEMENTS (torch strides are element strides already).
-    kernel[grid](
-        q, k_flat, v_flat, grad_out, dq, lse, delta,
+    kernel[grid](q, k_flat, v_flat, grad_out, dq, lse, delta,
         sm_scale,
         q.stride(0), q.stride(1), q.stride(2),
         k_flat.stride(0), k_flat.stride(1),
@@ -614,7 +582,7 @@ def sm86_attention_backward_dq(q, k, v, out, lse, grad_out, sm_scale,
 def _get_dkv_kernel():
     """Lazily import triton and define/decorate _attn_dkv_kernel.
 
-    Mirrors _get_fwd_kernel()/_get_dq_kernel(): the module must import
+    Mirrors _get_fwd_kernel/_get_dq_kernel: the module must import
     without triton, so the kernel is defined here (first use) and cached.
     TRITON_INTERPRET must be set before the first call so @triton.jit
     picks interpreter mode on CPU test boxes.
@@ -626,15 +594,13 @@ def _get_dkv_kernel():
         import triton
         import triton.language as tl
     except ImportError as e:
-        raise ImportError(
-            f"attn_sm86: _attn_dkv_kernel needs triton but the import "
+        raise ImportError(f"attn_sm86: _attn_dkv_kernel needs triton but the import "
             f"failed ({e}); kernel_available() would have returned False — "
             f"guard the kernel path with it and differentiate "
             f"reference_attention_forward instead") from e
 
     @triton.jit
-    def _attn_dkv_kernel(
-        q_ptr, k_ptr, v_ptr, do_ptr, dk_ptr, dv_ptr, lse_ptr, delta_ptr,
+    def _attn_dkv_kernel(q_ptr, k_ptr, v_ptr, do_ptr, dk_ptr, dv_ptr, lse_ptr, delta_ptr,
         sm_scale,
         stride_qb, stride_qh, stride_qm,
         stride_kh, stride_kn,
@@ -816,15 +782,13 @@ def sm86_attention_backward_dkv(q, k, v, out, lse, grad_out, sm_scale,
         # kernel on CPU — relax the CUDA assert to CPU tensors.
         assert (not q.is_cuda and not k.is_cuda and not v.is_cuda
                 and not out.is_cuda and not lse.is_cuda
-                and not grad_out.is_cuda), (
-            f"sm86_attention_backward_dkv: TRITON_INTERPRET=1 test seam "
+                and not grad_out.is_cuda), (f"sm86_attention_backward_dkv: TRITON_INTERPRET=1 test seam "
             f"expects CPU tensors, got devices q={q.device}, "
             f"k={k.device}, v={v.device}, out={out.device}, "
             f"lse={lse.device}, grad_out={grad_out.device}")
     else:
         assert (q.is_cuda and k.is_cuda and v.is_cuda and out.is_cuda
-                and lse.is_cuda and grad_out.is_cuda), (
-            f"sm86_attention_backward_dkv: the Triton kernel is the CUDA "
+                and lse.is_cuda and grad_out.is_cuda), (f"sm86_attention_backward_dkv: the Triton kernel is the CUDA "
             f"path; got devices q={q.device}, k={k.device}, "
             f"v={v.device}, out={out.device}, lse={lse.device}, "
             f"grad_out={grad_out.device}. CPU callers must guard with "
@@ -832,8 +796,7 @@ def sm86_attention_backward_dkv(q, k, v, out, lse, grad_out, sm_scale,
             f"reference_attention_forward instead.")
         ok, reason = kernel_available()
         if not ok:
-            raise RuntimeError(
-                f"sm86_attention_backward_dkv: SM86 Triton kernel "
+            raise RuntimeError(f"sm86_attention_backward_dkv: SM86 Triton kernel "
                 f"unavailable ({reason}); shapes q {tuple(q.shape)}, "
                 f"k {tuple(k.shape)}, v {tuple(v.shape)}. Guard the "
                 f"kernel path with kernel_available() — never a silent "
@@ -866,8 +829,7 @@ def sm86_attention_backward_dkv(q, k, v, out, lse, grad_out, sm_scale,
     kernel = _get_dkv_kernel()
     grid = ((S + block_n - 1) // block_n, H_kv, B)  # (ceil(S/BLOCK_N), H_KV, B)
     # Strides in ELEMENTS (torch strides are element strides already).
-    kernel[grid](
-        q, k_flat, v_flat, grad_out, dk_flat, dv_flat, lse, delta,
+    kernel[grid](q, k_flat, v_flat, grad_out, dk_flat, dv_flat, lse, delta,
         sm_scale,
         q.stride(0), q.stride(1), q.stride(2),
         k_flat.stride(0), k_flat.stride(1),
@@ -895,14 +857,11 @@ def reference_attention_forward(q, k, v, sm_scale):
     h -> kv head h // n_rep), matching the kernel's GQA mapping —
     repeat_interleave would be WRONG here.
     """
-    assert q.dim() == 4, (
-        f"reference_attention_forward: q must be 4-D (B, H, S, D), got "
+    assert q.dim() == 4, (f"reference_attention_forward: q must be 4-D (B, H, S, D), got "
         f"{q.dim()} dims, shape {tuple(q.shape)}")
-    assert k.dim() == 4, (
-        f"reference_attention_forward: k must be 4-D (B, H_kv, S, D), got "
+    assert k.dim() == 4, (f"reference_attention_forward: k must be 4-D (B, H_kv, S, D), got "
         f"{k.dim()} dims, shape {tuple(k.shape)}")
-    assert v.dim() == 4, (
-        f"reference_attention_forward: v must be 4-D (B, H_kv, S, D), got "
+    assert v.dim() == 4, (f"reference_attention_forward: v must be 4-D (B, H_kv, S, D), got "
         f"{v.dim()} dims, shape {tuple(v.shape)}")
 
     B, H, S, D = q.shape
@@ -910,12 +869,10 @@ def reference_attention_forward(q, k, v, sm_scale):
     B_v, H_kv_v, S_v, D_v = v.shape
 
     assert (B_k == B and B_v == B and S_k == S and S_v == S
-            and D_k == D and D_v == D and H_kv_v == H_kv), (
-        f"reference_attention_forward: q/k/v must share B, S, D and k/v "
+            and D_k == D and D_v == D and H_kv_v == H_kv), (f"reference_attention_forward: q/k/v must share B, S, D and k/v "
         f"must share H_kv; got q {tuple(q.shape)}, k {tuple(k.shape)}, "
         f"v {tuple(v.shape)}")
-    assert H % H_kv == 0, (
-        f"reference_attention_forward: GQA requires H % H_kv == 0; got "
+    assert H % H_kv == 0, (f"reference_attention_forward: GQA requires H % H_kv == 0; got "
         f"H={H}, H_kv={H_kv} (q {tuple(q.shape)}, k {tuple(k.shape)}, "
         f"v {tuple(v.shape)})")
 
@@ -941,14 +898,15 @@ def reference_attention_forward(q, k, v, sm_scale):
 
 
 # ---------------------------------------------------------------------------
-# The autograd Function gluing the kernels (repo autograd-Function
-# convention): frozen tensors as plain ctx attributes (NOT
-# save_for_backward), an escape-hatch env flag, and a NaN debug env flag.
+# The autograd Function gluing the kernels. Mirrors the repo's
+# the repo autograd-Function style: frozen tensors as plain
+# ctx attributes (NOT save_for_backward), an escape-hatch env flag, and a
+# NaN debug env flag.
 # ---------------------------------------------------------------------------
 
 
 def _debug_nan_enabled() -> bool:
-    """FLUTE_ATTN_DEBUG_NAN=1 → backward grad NaNs raise (the
+    """FLUTE_ATTN_DEBUG_NAN=1 → backward grad NaNs raise (the repo
     FLUTE_DEBUG_NAN pattern: off by default, zero overhead when off)."""
     return os.environ.get("FLUTE_ATTN_DEBUG_NAN", "") == "1"
 
@@ -979,11 +937,11 @@ class Sm86AttentionFn(torch.autograd.Function):
     Forward: (out, lse) = sm86_attention_forward(q, k, v, sm_scale,
     need_lse=True); returns out ONLY — lse is internal (the backward's
     recompute key, never part of the public output). q/k/v/out/lse/
-    sm_scale are saved as PLAIN ctx attributes (the frozen-tensor
+    sm_scale are saved as PLAIN ctx attributes (the repo autograd-Function
     style: they survive checkpoint recompute and skip save_for_backward's
     version bookkeeping; the tradeoff — an in-place mutation of q/k/v
     between forward and backward is not detected — is the documented
-    contract). Operand dtype is kept AS-IS: fp16 and bf16 are
+    repo autograd-Function contract). Operand dtype is kept AS-IS: fp16 and bf16 are
     both first-class kernel operand dtypes (bf16 is NOT cast to fp16).
 
     Backward: dq from sm86_attention_backward_dq, (dk, dv) from
@@ -995,15 +953,14 @@ class Sm86AttentionFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, sm_scale):
         assert (q.dtype in (torch.float16, torch.bfloat16)
-                and k.dtype == q.dtype and v.dtype == q.dtype), (
-            f"Sm86AttentionFn.forward: q/k/v must be fp16 or bf16 and "
+                and k.dtype == q.dtype and v.dtype == q.dtype), (f"Sm86AttentionFn.forward: q/k/v must be fp16 or bf16 and "
             f"share dtype, kept AS-IS (the kernels take both operand "
             f"dtypes; bf16 is NOT cast to fp16); got q={q.dtype}, "
             f"k={k.dtype}, v={v.dtype} (shapes q {tuple(q.shape)}, "
             f"k {tuple(k.shape)}, v {tuple(v.shape)})")
         out, lse = sm86_attention_forward(q, k, v, sm_scale,
                                           need_lse=True)
-        # Frozen tensors as plain ctx attributes (see
+        # Frozen tensors as plain ctx attributes (the repo style — see
         # the class docstring); lse detached (it is fp32, graph-free
         # anyway — detach is the belt-and-braces contract).
         ctx.q = q
@@ -1019,12 +976,10 @@ class Sm86AttentionFn(torch.autograd.Function):
         q, k, v = ctx.q, ctx.k, ctx.v
         out, lse, sm_scale = ctx.out, ctx.lse, ctx.sm_scale
 
-        assert torch.is_tensor(grad_out), (
-            f"Sm86AttentionFn.backward: grad_out must be a tensor "
+        assert torch.is_tensor(grad_out), (f"Sm86AttentionFn.backward: grad_out must be a tensor "
             f"matching out's (B, H, S, D)={tuple(out.shape)}, got "
             f"{type(grad_out).__name__}")
-        assert tuple(grad_out.shape) == tuple(out.shape), (
-            f"Sm86AttentionFn.backward: grad_out must match out's shape "
+        assert tuple(grad_out.shape) == tuple(out.shape), (f"Sm86AttentionFn.backward: grad_out must match out's shape "
             f"{tuple(out.shape)}, got {tuple(grad_out.shape)}")
         # autograd hands us whatever layout the downstream op produced
         # (possibly non-contiguous / a view); the kernels' stride
@@ -1039,8 +994,7 @@ class Sm86AttentionFn(torch.autograd.Function):
         if _debug_nan_enabled():
             for name, grad in (("dq", dq), ("dk", dk), ("dv", dv)):
                 if torch.isnan(grad).any():
-                    raise RuntimeError(
-                        f"Sm86AttentionFn.backward produced NaN in {name} "
+                    raise RuntimeError(f"Sm86AttentionFn.backward produced NaN in {name} "
                         f"(shape {tuple(grad.shape)}; q {tuple(q.shape)}, "
                         f"k {tuple(k.shape)}, v {tuple(v.shape)}, dtype "
                         f"{q.dtype}, sm_scale={sm_scale}); see "
@@ -1072,14 +1026,11 @@ def flute_sm86_attention(q, k, v, sm_scale):
     Returns out (B, H, S, D) in q.dtype. Loud asserts, shapes in every
     message.
     """
-    assert q.dim() == 4, (
-        f"flute_sm86_attention: q must be 4-D (B, H, S, D), got "
+    assert q.dim() == 4, (f"flute_sm86_attention: q must be 4-D (B, H, S, D), got "
         f"{q.dim()} dims, shape {tuple(q.shape)}")
-    assert k.dim() == 4, (
-        f"flute_sm86_attention: k must be 4-D (B, H_kv, S, D), got "
+    assert k.dim() == 4, (f"flute_sm86_attention: k must be 4-D (B, H_kv, S, D), got "
         f"{k.dim()} dims, shape {tuple(k.shape)}")
-    assert v.dim() == 4, (
-        f"flute_sm86_attention: v must be 4-D (B, H_kv, S, D), got "
+    assert v.dim() == 4, (f"flute_sm86_attention: v must be 4-D (B, H_kv, S, D), got "
         f"{v.dim()} dims, shape {tuple(v.shape)}")
 
     B, H, S, D = q.shape
@@ -1087,27 +1038,21 @@ def flute_sm86_attention(q, k, v, sm_scale):
     B_v, H_kv_v, S_v, D_v = v.shape
 
     assert (B_k == B and B_v == B and S_k == S and S_v == S
-            and D_k == D and D_v == D and H_kv_v == H_kv), (
-        f"flute_sm86_attention: q/k/v must share B, S, D and k/v must "
+            and D_k == D and D_v == D and H_kv_v == H_kv), (f"flute_sm86_attention: q/k/v must share B, S, D and k/v must "
         f"share H_kv; got q {tuple(q.shape)}, k {tuple(k.shape)}, "
         f"v {tuple(v.shape)}")
-    assert D == 256, (
-        f"flute_sm86_attention: design geometry is D=256 "
+    assert D == 256, (f"flute_sm86_attention: design geometry is D=256 "
         f"(reports/design_attn_sm86.md); got q D={D}, k D={D_k}, "
         f"v D={D_v}")
-    assert H % H_kv == 0, (
-        f"flute_sm86_attention: GQA requires H % H_kv == 0; got H={H}, "
+    assert H % H_kv == 0, (f"flute_sm86_attention: GQA requires H % H_kv == 0; got H={H}, "
         f"H_kv={H_kv} (q {tuple(q.shape)}, k {tuple(k.shape)}, "
         f"v {tuple(v.shape)})")
-    assert S >= 1, (
-        f"flute_sm86_attention: S must be >= 1, got S={S} "
+    assert S >= 1, (f"flute_sm86_attention: S must be >= 1, got S={S} "
         f"(q {tuple(q.shape)}, k {tuple(k.shape)}, v {tuple(v.shape)})")
-    assert q.dtype == k.dtype and k.dtype == v.dtype, (
-        f"flute_sm86_attention: q/k/v must share dtype, got q={q.dtype}, "
+    assert q.dtype == k.dtype and k.dtype == v.dtype, (f"flute_sm86_attention: q/k/v must share dtype, got q={q.dtype}, "
         f"k={k.dtype}, v={v.dtype} (q {tuple(q.shape)}, "
         f"k {tuple(k.shape)}, v {tuple(v.shape)})")
-    assert q.device == k.device and k.device == v.device, (
-        f"flute_sm86_attention: q/k/v must share device, got "
+    assert q.device == k.device and k.device == v.device, (f"flute_sm86_attention: q/k/v must share device, got "
         f"q={q.device}, k={k.device}, v={v.device} (shapes q "
         f"{tuple(q.shape)}, k {tuple(k.shape)}, v {tuple(v.shape)})")
 
@@ -1125,6 +1070,6 @@ def flute_sm86_attention(q, k, v, sm_scale):
         return Sm86AttentionFn.apply(q, k, v, sm_scale)
 
     # CPU box without the interpreter: the documented CPU behavior —
-    # reference numerics with native autograd (kernel_available() is
+    # reference numerics with native autograd (kernel_available is
     # (False, ...) here; the kernels cannot run).
     return reference_attention_forward(q, k, v, sm_scale)[0]
