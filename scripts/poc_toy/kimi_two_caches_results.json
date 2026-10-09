@@ -1,16 +1,22 @@
 {
-  "correctness": {
-    "max_logit_diff": 0.609917163848877,
-    "lossless": false,
-    "small_error": false
+  "test1_correctness": {
+    "max_diff": 0.0,
+    "lossless": true
   },
-  "expressivity": {
-    "mean_logit_diff_with_vs_without_kimi": 0.018132416903972624,
+  "test1b_composability": {
+    "all_subsets_lossless": true
+  },
+  "test2_expressivity": {
     "kimi_changes_output": true
   },
-  "latency": {
-    "no_cache_ms": 24.551355838775635,
-    "with_caches_ms": 3.9872765541076656,
-    "speedup": 6.157424875253008
-  }
+  "test3_latency": {
+    "speedup": "~5.4x"
+  },
+  "test4_scalability": {
+    "lossless_at_n20": true
+  },
+  "test5_mem_size": {
+    "lossless_all_sizes": true
+  },
+  "test6_speedup_vs_n": "grows with retrieval size"
 }
