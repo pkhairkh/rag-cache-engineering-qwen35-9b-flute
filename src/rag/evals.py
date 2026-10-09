@@ -568,6 +568,19 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     out = args.out_dir or _OUT_DIR
     st = getattr(args, "self_test", False)
+    # GPU-real-mode commands WITHOUT --self-test refuse LOUDLY (W9.1's
+    # documented contract — "Real-data mode requires the GPU-box inputs
+    # ... and refuses loudly when absent"): this CLI has no arguments for
+    # the real inputs (model artifacts / corpus / index are GPU-box-only),
+    # so falling through to the synthetic self-test would silently LIE
+    # about what was measured. (W9.3 hardening; roundtrip/ledger stay
+    # CPU-legal — their synthetic core IS the real core on CPU.)
+    if args.cmd in ("streaming", "margin", "recall", "e2e") and not st:
+        raise SystemExit(
+            f"{args.cmd}: real-data mode requires the GPU box (model "
+            f"artifacts / corpus / index — the Phase-0/Phase-5 inputs); "
+            f"none are available on this CPU box — rerun with "
+            f"--self-test for the synthetic machinery check")
     if args.cmd == "roundtrip":
         r = measure_roundtrip(n_vectors=args.n_vectors, d=args.d,
                               out_dir=out)
