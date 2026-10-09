@@ -48,10 +48,12 @@ from tq_cache import TQCache, TQLinearAttentionLayer, resolve_quantizer
 
 __all__ = [
     "SystemState", "ChunkRecord", "prefill_system", "reseed_cache",
-    "ingest_chunk", "IngestDriver", "MANIFEST_NAME",
+    "ingest_chunk", "IngestDriver", "MANIFEST_NAME", "SYSTEM_FILE",
+    "load_system_state",
 ]
 
 MANIFEST_NAME = "ingest_manifest.json"
+SYSTEM_FILE = "system_state.npz"  # the persisted reset point (absolute protocol)
 
 
 # ------------------------------------------------------------- system ------
@@ -118,6 +120,50 @@ class SystemState:
             if c is not None:
                 h = (h * 1000003 + int(float(c.norm) * 1e6)) & 0xFFFFFFFF
         return f"sysstate-{h:08x}"
+
+
+def _save_system_state(out_dir: str, system: SystemState) -> str:
+    """Persist the reset point as an ABSOLUTE-protocol chunk snapshot (the
+    index builder and the install path both need S_sys codes + geometry from
+    disk alone). Shapes/dtypes ride in `extra` (JSON-safe)."""
+    path = os.path.join(out_dir, SYSTEM_FILE)
+    snap = ChunkSnapshot(
+        chunk_id=0, protocol="absolute",
+        s_codes=system.s_codes, conv_codes=system.conv_codes,
+        m1_codes=system.m1_codes, m2_codes=system.m2_codes,
+        system_ref=system.reference(),
+        extra={"s_shapes": {str(k): list(v) for k, v in system.s_shapes.items()},
+               "conv_shapes": {str(k): list(v) for k, v in system.conv_shapes.items()},
+               "s_dtype": system.s_dtype, "conv_dtype": system.conv_dtype,
+               "m1_shape": list(system.m1_shape) if system.m1_shape else None,
+               "m2_shape": list(system.m2_shape) if system.m2_shape else None,
+               "bits": system.bits})
+    return snap_mod.save_chunk(path, snap)
+
+
+def load_system_state(disk_dir: str) -> SystemState:
+    """Reconstruct the SystemState from disk (manifest's reset point)."""
+    path = os.path.join(disk_dir, SYSTEM_FILE)
+    if not os.path.exists(path):
+        raise ValueError(
+            f"load_system_state: {path} not found — run the IngestDriver "
+            f"(the reset point is persisted on first run)")
+    snap = snap_mod.load_chunk(path)
+    if snap.protocol != "absolute":
+        raise ValueError(
+            f"load_system_state: protocol {snap.protocol!r} != 'absolute'")
+    extra = snap.extra or {}
+    return SystemState(
+        s_codes=dict(snap.s_codes),
+        conv_codes=dict(snap.conv_codes),
+        m1_codes=snap.m1_codes, m2_codes=snap.m2_codes,
+        system_ref=snap.system_ref or "",
+        bits=float(extra.get("bits", 3.5)),
+        s_shapes={int(k): tuple(v) for k, v in (extra.get("s_shapes") or {}).items()},
+        conv_shapes={int(k): tuple(v) for k, v in (extra.get("conv_shapes") or {}).items()},
+        s_dtype=extra.get("s_dtype"), conv_dtype=extra.get("conv_dtype"),
+        m1_shape=tuple(extra["m1_shape"]) if extra.get("m1_shape") else None,
+        m2_shape=tuple(extra["m2_shape"]) if extra.get("m2_shape") else None)
 
 
 def reseed_cache(cache: TQCache, system: SystemState) -> None:
@@ -328,6 +374,8 @@ class IngestDriver:
                                     sys_cache, system_ref=self.system_ref,
                                     bits=self.bits)
             man["system_ref"] = system.reference()
+            man["system_file"] = os.path.relpath(
+                _save_system_state(self.out_dir, system), self.out_dir)
         else:
             # resume: rebuild the reset point from a fresh prefill and
             # CHECK it matches the manifest reference (deterministic
