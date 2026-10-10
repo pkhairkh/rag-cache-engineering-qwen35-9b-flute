@@ -48,6 +48,12 @@ class QueryResult:
     cos_scores: List[float] = field(default_factory=list)
     timings: Dict[str, float] = field(default_factory=dict)
     new_token_ids: List[int] = field(default_factory=list)
+    # W12: per-step greedy confidences (max softmax prob of each decoded
+    # token, same definition as scripts/gpu's gen gates) — the G6 gate
+    # judged answer_query e2e on repetition only and FALSE-PASSED low-
+    # confidence garbage; the callers that need the gate now have the
+    # numbers. Empty when max_new_tokens == 0 or decode_fn is used.
+    token_confs: List[float] = field(default_factory=list)
     oracle: bool = False
     install_report: Optional[dict] = None
 
@@ -161,6 +167,7 @@ def answer_query(
             res.new_token_ids = _greedy_decode(
                 model, cache, logits, max_new_tokens,
                 eos_token_id=_eos_token_id(model))
+            res.token_confs = list(_LAST_TOKEN_CONFS)
         t["decode"] = time.perf_counter() - t0
 
     res.timings = t
@@ -196,12 +203,22 @@ def _greedy_decode(model, cache, logits, max_new_tokens: int,
                    eos_token_id: Optional[int] = None) -> List[int]:
     """Plain greedy loop (step 8). `logits` is the answer-prefill output of
     the stub/model; the loop feeds each argmax back as the next input.
-    Stops early when eos_token_id is generated."""
+    Stops early when eos_token_id is generated.
+
+    The loop also records each step's max-softmax confidence into the
+    module-level _LAST_TOKEN_CONFS list (W12: the e2e gate's conf metric —
+    answer_query copies it into QueryResult.token_confs after the loop;
+    a return-type change would break the decode_fn contract)."""
+    _LAST_TOKEN_CONFS.clear()
     out_ids: List[int] = []
     cur_logits = _unwrap_logits(logits)
     if cur_logits is None:
         return out_ids
-    next_id = torch.tensor([[int(cur_logits[:, -1, :].argmax(dim=-1))]])
+    last = cur_logits[:, -1, :].float()
+    probs = torch.softmax(last, dim=-1)
+    conf, next_id = probs.max(dim=-1)
+    next_id = torch.tensor([[int(next_id)]])
+    _LAST_TOKEN_CONFS.append(float(conf))
     out_ids.append(int(next_id))
     if eos_token_id is not None and int(next_id) == eos_token_id:
         return out_ids
@@ -212,9 +229,17 @@ def _greedy_decode(model, cache, logits, max_new_tokens: int,
         cur_logits = _unwrap_logits(r)
         if cur_logits is None:
             break
-        next_id = torch.tensor(
-            [[int(cur_logits[:, -1, :].argmax(dim=-1))]])
+        last = cur_logits[:, -1, :].float()
+        probs = torch.softmax(last, dim=-1)
+        conf, next_id = probs.max(dim=-1)
+        next_id = torch.tensor([[int(next_id)]])
+        _LAST_TOKEN_CONFS.append(float(conf))
         out_ids.append(int(next_id))
         if eos_token_id is not None and int(next_id) == eos_token_id:
             break
     return out_ids
+
+
+# W12: the greedy loop's per-step confidences (see _greedy_decode's
+# docstring — kept module-level to preserve the decode_fn return contract).
+_LAST_TOKEN_CONFS: List[float] = []

@@ -15,7 +15,7 @@ Status: written Wv2-8 for THIS repo (the one page with no main-project counterpa
 | `hooks.py` | the 9-hook capture harness (hook 0 after layer 0, 1–8 after layers 3,7,…,31) | `test_hooks.py` |
 | `ingest.py` | the delta-protocol ingestion + the restartable `IngestDriver` | `test_ingest.py` |
 | `snapshot.py` | the codes-only per-chunk npz codec + sha256 integrity | `test_ingest.py` |
-| `install.py` | the §6 install math: `sum_turboquant_codes`, `install_from_disk` | `test_query.py`, `test_install_real_math.py` (W11: install-vs-ground-truth at real GDN fidelity) |
+| `install.py` | the §6 install math: `sum_turboquant_codes`, `install_from_disk` | `test_query.py`, `test_install_real_math.py` (W11: install-vs-ground-truth at real GDN fidelity, S-path isolation), `test_install_conv_math.py` (W13: the S+conv COMBINATION through the real GDN forward — install-vs-truth, no-variant-asymmetry, decode stability) |
 | `query.py` | the §6 eight-step query flow: `answer_query` | `test_query.py` |
 | `finetune.py` | the §7 lean fine-tune loop (straight-through LUTs, ~500 steps A10G) | `test_finetune.py` |
 | `lut_export.py` | the fine-tuned LUT artifact codec (`pretrained_luts/`) | `test_finetune.py` |
@@ -25,21 +25,26 @@ Status: written Wv2-8 for THIS repo (the one page with no main-project counterpa
 Housekeeping, not in the 13: `__init__.py`, `_paths.py` (the sys.path
 anchor — no dedicated test file).
 
-Suite: `python3 -m pytest src/rag/tests -q` → 175 tests (12 files), CPU-only.
+Suite: `python3 -m pytest src/rag/tests -q` → 179 tests (13 files), CPU-only.
 
-GPU-box operational tools live under `scripts/gpu/` (W11): `run_ingestion.py`,
-`run_index.py`, `run_query.py` (the pipeline stages, argparse over the box
-defaults), `verify_pipeline.py` (the G1–G6 generation ladder with
-confidence/repetition metrics) and `bisect_install.py` (install-content ×
-kernel-route bisection: S-read drift check, conv-tail energy check, FLA
-on/off A/B) — see HANDOVER.md for the post-W11 procedure (re-ingest
-required: pre-W11 snapshots carry 16,384-truncated conv codes).
+GPU-box operational tools live under `scripts/gpu/` (W11, revised W13):
+`run_ingestion.py`, `run_index.py`, `run_query.py` (the pipeline stages,
+argparse over the box defaults), `verify_pipeline.py` (the G1–G6
+generation ladder with confidence/repetition metrics — G6 judges conf
+too since W13) and `bisect_install.py` (install-content × kernel-route
+bisection: the per-variant S-read check against the CORRECT reference
+—the W12 "DRIFT" rows were this script's own reference bug, retracted—,
+the CUDA-kernel-vs-reference FRAME check at the live conv geometry, conv
+read fidelity + tail energy, gen conf numbers in the matrix, and the
+TRUE-DOC raw control that separates semantic document-continuation from
+corruption; FLA on/off A/B) — see HANDOVER.md for the post-W13
+procedure.
 
 ## 2. Run matrix
 
 | box | runs |
 |---|---|
-| CPU | `python3 -m pytest src/rag/tests -q` (175 tests; `-m "not slow"` skips full-scale) |
+| CPU | `python3 -m pytest src/rag/tests -q` (179 tests; `-m "not slow"` skips full-scale) |
 | CPU | `python3 src/rag/evals.py <roundtrip\|streaming\|margin\|recall\|e2e\|ledger> --self-test` (artifacts under `evals_out/`) |
 | GPU | kernel build + the ladder gates: `src/docs/BUILD.md` §2/§5 (`test_flute.py`, `test_qwen_weights.py`) |
 | GPU | model load: `load_quant_model(artifacts_dir, model_name, device, forward="kernel")` (`forward="reference"` = the CPU-legal route) |

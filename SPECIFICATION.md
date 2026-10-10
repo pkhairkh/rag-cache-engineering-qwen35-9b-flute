@@ -2,7 +2,7 @@
 
 Purpose: cache-engineered RAG on Qwen3.5-9B — the LUT model's cache IS the retrieval vector; NO separate embedder, NO chunk text on disk, NO re-prefill; TurboQuant online at 3.5 bits (quality-neutral).
 Authority: top of the doc chain SPECIFICATION.md > PROPOSAL.md > TASKS.md; design decisions D1–D5 live in PROPOSAL.md, execution waves in TASKS.md.
-Status: v1 semantics preserved (format rewritten Wv2-6.1); implemented under `src/rag/` — 175 tests green; §9–§10 are A10G targets to measure on the GPU box.
+Status: v1 semantics preserved (format rewritten Wv2-6.1); implemented under `src/rag/` — 179 tests green; §9–§10 are A10G targets to measure on the GPU box.
 
 ## 1. The model
 - **N1.** Load Qwen3.5-9B (FLUTE idxN hybrid palettization) via `src/scripts/loader.py::load_quant_model`.
@@ -171,5 +171,5 @@ disk/
 | `src/scripts/palettized_modules.py` | `PalettizedLinear.forward(x)` | the idxN LUT forward |
 | `src/flute_extended/src/kernel_fht.cu` | `fht_forward_kernel` | the FHT (TurboQuant's rotation) |
 | `transformers` | `DynamicCache(config=model.config)` | the cache object (TQ-intercepted) |
-| `src/rag/` | `turboquant`, `codebooks`, `tq_cache`, `m1m2`, `hooks`, `ingest`, `snapshot`, `install`, `query`, `finetune`, `lut_export`, `index`, `evals` (+ `codebooks/`, `tests/`) | the §1–§8 implementation; per-section clauses above name each entry point; 175 tests under `src/rag/tests/` |
+| `src/rag/` | `turboquant`, `codebooks`, `tq_cache`, `m1m2`, `hooks`, `ingest`, `snapshot`, `install`, `query`, `finetune`, `lut_export`, `index`, `evals` (+ `codebooks/`, `tests/`) | the §1–§8 implementation; per-section clauses above name each entry point; 179 tests under `src/rag/tests/` |
 | `src/flute_extended/src/` | `kernel_gemv*.cu`, `kernel_streaming.cu`, `kernel_fht.cu`, `kernel_debug_simple.cu`, `kernel_cutlass_dense.cu` + `include/flute/` headers | the idxN inference CUDA kernels |

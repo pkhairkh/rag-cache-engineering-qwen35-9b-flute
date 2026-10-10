@@ -179,13 +179,18 @@ def main() -> int:
             cache_factory=fresh_cache, retrieved_ids=[args.chunk],
             max_new_tokens=args.max_new_tokens)
     toks = result.new_token_ids
-    # confidences not tracked by answer_query; judge on text/repetition only
+    # W12: the conf gate now applies to G6 too (answer_query tracks the
+    # per-step confidences in QueryResult.token_confs). The old criteria
+    # (repetition only) FALSE-PASSED low-confidence garbage — the W12
+    # matrix's "G6 PASS vs G5 FAIL" contradiction was partly this.
+    conf = (sum(result.token_confs) / len(result.token_confs)
+            if result.token_confs else 0.0)
     rep = (sum(1 for a, b in zip(toks, toks[1:]) if a == b)
            / max(1, len(toks) - 1))
     text = tokenizer.decode(toks, skip_special_tokens=True)
-    ok = len(toks) >= 1 and rep <= 0.6
-    print(f"  [{'PASS' if ok else 'FAIL'}] G6 e2e: rep {rep:.2f}\n"
-          f"         text: {text!r}")
+    ok = len(toks) >= 1 and conf >= 0.20 and rep <= 0.6
+    print(f"  [{'PASS' if ok else 'FAIL'}] G6 e2e: conf {conf:.3f} "
+          f"rep {rep:.2f}\n         text: {text!r}")
     failures += 0 if ok else 1
 
     print("\n" + "=" * 60)
