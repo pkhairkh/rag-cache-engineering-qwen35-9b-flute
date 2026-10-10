@@ -67,6 +67,7 @@ from index import (
     preselect,
     rerank,
 )
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 from ingest import MANIFEST_NAME, IngestDriver
 from tq_cache import TQCache
 from turboquant import SEEDS
@@ -102,7 +103,7 @@ def _rel_mse(a, b) -> float:
 
 def _tokens(seed: int, n: int) -> torch.Tensor:
     return torch.randint(0, 100_000, (1, n),
-                         generator=torch.Generator().manual_seed(seed))
+                         generator=torch.Generator().manual_seed(seed)).to(DEVICE)
 
 
 def _key_hash(ids: torch.Tensor) -> int:
@@ -134,26 +135,26 @@ class StubModel:
         n_tok = int(input_ids.shape[-1])
         for L in self.linears:
             cur = past_key_values.layers[L].recurrent_states[0]
-            cur = torch.zeros(S_D, device='cuda') if cur is None else cur.reshape(-1).float().cuda()
+            cur = torch.zeros(S_D, device=DEVICE) if cur is None else cur.reshape(-1).float().to(DEVICE)
             g = torch.Generator().manual_seed(1_000_003 * L + kh)
-            new = cur + self.s_noise * torch.randn(S_D, generator=g).cuda()
+            new = cur + self.s_noise * torch.randn(S_D, generator=g).to(DEVICE)
             past_key_values.update_recurrent_state(
-                new.reshape(S_SHAPE).half().cuda(), L)
+                new.reshape(S_SHAPE).half().to(DEVICE), L)
             g = torch.Generator().manual_seed(1_000_003 * L + 17 * kh)
-            conv_in = torch.randn(1, CONV_D, n_tok, generator=g).cuda()
+            conv_in = torch.randn(1, CONV_D, n_tok, generator=g).to(DEVICE)
             past_key_values.update_conv_state(
-                conv_in.half().cuda(), L, conv_kernel_size=KERNEL)
+                conv_in.half().to(DEVICE), L, conv_kernel_size=KERNEL)
         for which, noise, m_shape in (("m1", self.m1_noise, M_SHAPE),
                                       ("m2", self.m2_noise, M_SHAPE)):
             cur = getattr(past_key_values, f"read_{which}")()
             if cur is None:
-                cur = torch.zeros(*m_shape, dtype=torch.float16, device='cuda')
+                cur = torch.zeros(*m_shape, dtype=torch.float16, device=DEVICE)
             else:
-                cur = cur.cuda() if not cur.is_cuda else cur
+                cur = cur.to(DEVICE)
             g = torch.Generator().manual_seed(9001 + kh if which == "m1"
                                               else 9002 + kh)
-            new = cur + noise * torch.randn(*m_shape, generator=g).cuda()
-            getattr(past_key_values, f"update_{which}")(new.half().cuda())
+            new = cur + noise * torch.randn(*m_shape, generator=g).to(DEVICE)
+            getattr(past_key_values, f"update_{which}")(new.half().to(DEVICE))
         return None
 
 

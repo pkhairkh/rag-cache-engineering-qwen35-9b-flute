@@ -19,6 +19,21 @@ from typing import Optional
 import numpy as np
 import torch
 
+# W18: this is the GPU-box Triton/CUTLASS kernel harness — CUDA-only by
+# design. A skip guard keeps accidental collection (e.g. pytest from the
+# repo root on a CPU box) loud-and-clean instead of crashing on device
+# creation; run it directly ON the GPU box as documented above.
+if not torch.cuda.is_available():
+    if "pytest" in sys.modules:  # collected by pytest -> a clean skip
+        import pytest
+        pytest.skip("flute_extended kernel harness: CUDA required (the "
+                    "GPU-box-only Triton/CUTLASS tests)",
+                    allow_module_level=True)
+    else:  # run as a script on a CPU box -> a clean, loud exit
+        raise SystemExit(
+            "flute_extended kernel harness: CUDA required — run this on "
+            "the GPU box (Triton/CUTLASS kernels)")
+
 # Make the local package importable regardless of checkout location.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import flute_extended

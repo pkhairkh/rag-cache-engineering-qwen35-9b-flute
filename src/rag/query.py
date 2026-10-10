@@ -260,7 +260,9 @@ def _greedy_decode(model, cache, logits, max_new_tokens: int,
     last = cur_logits[:, -1, :].float()
     probs = torch.softmax(last, dim=-1)
     conf, next_id = probs.max(dim=-1)
-    next_id = torch.tensor([[int(next_id)]])
+    # W18: the fed-back token follows the logits' device — a CPU-born
+    # tensor crashes a CUDA model at the next decode step.
+    next_id = torch.tensor([[int(next_id)]], device=cur_logits.device)
     _LAST_TOKEN_CONFS.append(float(conf))
     out_ids.append(int(next_id))
     if eos_token_id is not None and int(next_id) == eos_token_id:
@@ -275,7 +277,7 @@ def _greedy_decode(model, cache, logits, max_new_tokens: int,
         last = cur_logits[:, -1, :].float()
         probs = torch.softmax(last, dim=-1)
         conf, next_id = probs.max(dim=-1)
-        next_id = torch.tensor([[int(next_id)]])
+        next_id = torch.tensor([[int(next_id)]], device=cur_logits.device)
         _LAST_TOKEN_CONFS.append(float(conf))
         out_ids.append(int(next_id))
         if eos_token_id is not None and int(next_id) == eos_token_id:

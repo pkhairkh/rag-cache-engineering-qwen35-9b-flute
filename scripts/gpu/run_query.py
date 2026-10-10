@@ -89,6 +89,7 @@ def main() -> int:
                           m1m2_mem_size=mem_size or 128,
                           m1m2_gates_path=args.m1m2_gates)
     check_m1m2_geometry(model, system, mem_size)
+    dev = next(model.parameters()).device  # W18: ids follow the model
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
@@ -132,7 +133,7 @@ def main() -> int:
         # add_special_tokens=False: matches the ingestion's chunk and
         # system encoding (the query must live in the same token regime)
         query_ids = torch.tensor(
-            tokenizer.encode(question, add_special_tokens=False)).cuda()
+            tokenizer.encode(question, add_special_tokens=False)).to(dev)
 
         cache = cache_factory()
         reseed_cache(cache, system)

@@ -91,6 +91,7 @@ from ingest import (
     prefill_system,
     reseed_cache,
 )
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 from snapshot import (
     ChunkSnapshot,
     chunk_nbytes,
@@ -154,7 +155,7 @@ def _rel_mse(a, b) -> float:
 
 def _tokens(seed: int, n: int) -> torch.Tensor:
     return torch.randint(0, 100_000, (1, n),
-                         generator=torch.Generator().manual_seed(seed)).cuda()
+                         generator=torch.Generator().manual_seed(seed)).to(DEVICE)
 
 
 def _key_of(ids: torch.Tensor) -> tuple:
@@ -200,12 +201,12 @@ class StubModel:
         self.true_m1, self.true_m2 = {}, {}
         # the exact variant's fixed increments (per layer / per memory)
         self.fixed = {L: torch.randn(S_D, generator=torch.Generator()
-                                     .manual_seed(7000 + L)).cuda()
+                                     .manual_seed(7000 + L)).to(DEVICE)
                       for L in self.linears}
         self.fixed_m1 = torch.randn(*M_SHAPE, generator=torch.Generator()
-                                    .manual_seed(8001)).cuda()
+                                    .manual_seed(8001)).to(DEVICE)
         self.fixed_m2 = torch.randn(*M_SHAPE, generator=torch.Generator()
-                                    .manual_seed(8002)).cuda()
+                                    .manual_seed(8002)).to(DEVICE)
 
     def __call__(self, input_ids, past_key_values, use_cache=True):
         key = _key_of(input_ids)
@@ -214,48 +215,48 @@ class StubModel:
         for L in self.linears:
             cur = past_key_values.layers[L].recurrent_states[0]
             if cur is None:
-                cur = torch.zeros(S_D, dtype=torch.float16, device='cuda')
+                cur = torch.zeros(S_D, dtype=torch.float16, device=DEVICE)
             else:
-                cur = cur.cuda() if not cur.is_cuda else cur
+                cur = cur.to(DEVICE)
             cur = cur.reshape(-1).float()
             if self.exact:
                 new = cur + n_tok * self.fixed[L]
             else:
                 g = torch.Generator().manual_seed(1_000_003 * L + kh)
-                new = cur + self.s_noise * torch.randn(S_D, generator=g).cuda()
+                new = cur + self.s_noise * torch.randn(S_D, generator=g).to(DEVICE)
             past_key_values.update_recurrent_state(
-                new.reshape(S_SHAPE).half().cuda(), L)
-            self.true_states[(key, L)] = new.reshape(S_SHAPE).half().cuda().clone()
+                new.reshape(S_SHAPE).half().to(DEVICE), L)
+            self.true_states[(key, L)] = new.reshape(S_SHAPE).half().to(DEVICE).clone()
             g = torch.Generator().manual_seed(1_000_003 * L + 17 * kh)
-            conv_in = torch.randn(1, CONV_D, n_tok, generator=g).cuda()
+            conv_in = torch.randn(1, CONV_D, n_tok, generator=g).to(DEVICE)
             past_key_values.update_conv_state(
-                conv_in.half().cuda(), L, conv_kernel_size=KERNEL)
+                conv_in.half().to(DEVICE), L, conv_kernel_size=KERNEL)
         m1 = past_key_values.read_m1()
         if m1 is None:
-            m1 = torch.zeros(*M_SHAPE, dtype=torch.float16, device='cuda')
+            m1 = torch.zeros(*M_SHAPE, dtype=torch.float16, device=DEVICE)
         else:
-            m1 = m1.cuda() if not m1.is_cuda else m1
+            m1 = m1.to(DEVICE)
         if self.exact:
             new_m1 = m1 + n_tok * self.fixed_m1
         elif self.m1_noise:
             g = torch.Generator().manual_seed(9001 + kh)
-            new_m1 = m1 + self.m1_noise * torch.randn(*M_SHAPE, generator=g).cuda()
+            new_m1 = m1 + self.m1_noise * torch.randn(*M_SHAPE, generator=g).to(DEVICE)
         else:  # the zero-gate no-op: the memory stays at its current value
             new_m1 = m1
-        past_key_values.update_m1(new_m1.half().cuda())
-        self.true_m1[key] = new_m1.half().cuda().clone()
+        past_key_values.update_m1(new_m1.half().to(DEVICE))
+        self.true_m1[key] = new_m1.half().to(DEVICE).clone()
         m2 = past_key_values.read_m2()
         if m2 is None:
-            m2 = torch.zeros(*M_SHAPE, dtype=torch.float16, device='cuda')
+            m2 = torch.zeros(*M_SHAPE, dtype=torch.float16, device=DEVICE)
         else:
-            m2 = m2.cuda() if not m2.is_cuda else m2
+            m2 = m2.to(DEVICE)
         if self.exact:
             new_m2 = m2 + n_tok * self.fixed_m2
         else:
             g = torch.Generator().manual_seed(9002 + kh)
-            new_m2 = m2 + self.m2_noise * torch.randn(*M_SHAPE, generator=g).cuda()
-        past_key_values.update_m2(new_m2.half().cuda())
-        self.true_m2[key] = new_m2.half().cuda().clone()
+            new_m2 = m2 + self.m2_noise * torch.randn(*M_SHAPE, generator=g).to(DEVICE)
+        past_key_values.update_m2(new_m2.half().to(DEVICE))
+        self.true_m2[key] = new_m2.half().to(DEVICE).clone()
         return None
 
 
@@ -277,7 +278,7 @@ def test_full_scale_size_gate(tmp_path):
     g = torch.Generator().manual_seed(20260503)
 
     def unit(d: int):
-        x = torch.randn(d, generator=g, dtype=torch.float32).cuda()
+        x = torch.randn(d, generator=g, dtype=torch.float32).to(DEVICE)
         return x / x.norm()
 
     s_codes = {L: q["S"].quant(unit(D_S)) for L in LIN24}

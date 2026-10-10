@@ -96,6 +96,7 @@ from snapshot import ChunkSnapshot, load_chunk
 from install import install_from_disk, install_snapshot, sum_turboquant_codes
 from query import answer_query, query_cache_vector
 from index import ChunkVectorLoader, IndexConfig, build_index, load_index
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ------------------------------------------------------------- geometry ---
 LIN, FULL = "linear_attention", "full_attention"
@@ -119,8 +120,8 @@ SNAP_IDS = (10, 15, 20)
 CORRECT_CHUNK, CORRECT_TOPIC = 7, 2           # 7 % 5 == 2
 WRONG_CHUNK, WRONG_TOPIC = 9, 4               # 9 % 5 == 4
 
-QUERY_IDS = torch.tensor([[200, 201]]).cuda()        # distinct from every corpus key
-SYSTEM_IDS = torch.tensor([[5, 6, 7, 8]]).cuda()
+QUERY_IDS = torch.tensor([[200, 201]], device=DEVICE)        # distinct from every corpus key
+SYSTEM_IDS = torch.tensor([[5, 6, 7, 8]], device=DEVICE)
 
 
 def _rel_mse(a, b) -> float:
@@ -155,7 +156,7 @@ class TopicStubModel:
 
     def __init__(self, n_topics: int = N_TOPICS):
         g = torch.Generator().manual_seed(99)
-        self.topic_dirs = [torch.randn(S_SHAPE, generator=g).cuda()
+        self.topic_dirs = [torch.randn(S_SHAPE, generator=g).to(DEVICE)
                            for _ in range(n_topics)]
         # matched-filter head: logits[i] = S0 . dir_i
         self.head = torch.stack(
@@ -172,39 +173,39 @@ class TopicStubModel:
         # the S state this forward READS (the installed codes at answer
         # time; the system codes at query-prefill time)
         cur0 = past_key_values.layers[0].recurrent_states[0]
-        read_s0 = torch.zeros(S_D, device='cuda') if cur0 is None else cur0.reshape(-1).float().cuda()
+        read_s0 = torch.zeros(S_D, device=DEVICE) if cur0 is None else cur0.reshape(-1).float().to(DEVICE)
         topic = self._topic(ids)
         for L in LINEARS:
             cur = past_key_values.layers[L].recurrent_states[0]
             if cur is None:
-                cur = torch.zeros(S_SHAPE, dtype=torch.float16, device='cuda')
+                cur = torch.zeros(S_SHAPE, dtype=torch.float16, device=DEVICE)
             else:
-                cur = cur.cuda() if not cur.is_cuda else cur
+                cur = cur.to(DEVICE)
             g = torch.Generator().manual_seed(31 * (L + 1) + kh)
-            add = NOISE * torch.randn(S_SHAPE, generator=g).cuda()
+            add = NOISE * torch.randn(S_SHAPE, generator=g).to(DEVICE)
             if L == 0 and topic is not None:
                 add = add + MARKER * self.topic_dirs[topic]
-            new = (cur.float() + add.float()).half().cuda()
+            new = (cur.float() + add.float()).half().to(DEVICE)
             past_key_values.update_recurrent_state(new, L)
             conv_in = torch.randn(1, CONV_D, max(1, len(ids)), generator=g)
             past_key_values.update_conv_state(
-                conv_in.half().cuda(), L, conv_kernel_size=KERNEL)
+                conv_in.half().to(DEVICE), L, conv_kernel_size=KERNEL)
         m1 = past_key_values.read_m1()
         if m1 is None:
-            m1 = torch.zeros(*M_SHAPE, dtype=torch.float16, device='cuda')
+            m1 = torch.zeros(*M_SHAPE, dtype=torch.float16, device=DEVICE)
         else:
-            m1 = m1.cuda() if not m1.is_cuda else m1
+            m1 = m1.to(DEVICE)
         g = torch.Generator().manual_seed(7001 + kh)
         past_key_values.update_m1(
-            (m1.float() + M_NOISE * torch.randn(*M_SHAPE, generator=g).cuda()).half().cuda())
+            (m1.float() + M_NOISE * torch.randn(*M_SHAPE, generator=g).to(DEVICE)).half().to(DEVICE))
         m2 = past_key_values.read_m2()
         if m2 is None:
-            m2 = torch.zeros(*M_SHAPE, dtype=torch.float16, device='cuda')
+            m2 = torch.zeros(*M_SHAPE, dtype=torch.float16, device=DEVICE)
         else:
-            m2 = m2.cuda() if not m2.is_cuda else m2
+            m2 = m2.to(DEVICE)
         g = torch.Generator().manual_seed(7002 + kh)
         past_key_values.update_m2(
-            (m2.float() + M_NOISE * torch.randn(*M_SHAPE, generator=g).cuda()).half().cuda())
+            (m2.float() + M_NOISE * torch.randn(*M_SHAPE, generator=g).to(DEVICE)).half().to(DEVICE))
         logits = (read_s0 @ self.head).reshape(1, 1, -1)
         return logits
 
@@ -222,7 +223,7 @@ def corpus(tmp_path_factory):
     for i in range(N_CHUNKS):
         tok = (100 + 7 * i, 101 + 7 * i, 102 + 7 * i)
         model.chunk_topics[tok] = i % N_TOPICS   # bake the topic in
-        chunks.append(torch.tensor([list(tok)]).cuda())
+        chunks.append(torch.tensor([list(tok)], device=DEVICE))
     assert model.active_topic is None            # clean state for ingest
     drv = IngestDriver(model, SYSTEM_IDS, chunks, disk,
                        cache_factory=_make_cache)
@@ -254,8 +255,8 @@ def test_install_one_requant_bit_exact():
     (two rounds) provably differs; empty deltas = one requant of sys."""
     q = resolve_quantizer("S", S_D, BITS)
     g = torch.Generator().manual_seed(11)
-    sys_codes = q.quant(3.0 * torch.randn(S_D, generator=g).cuda())
-    d_codes = [q.quant(0.5 * torch.randn(S_D, generator=g).cuda())
+    sys_codes = q.quant(3.0 * torch.randn(S_D, generator=g).to(DEVICE))
+    d_codes = [q.quant(0.5 * torch.randn(S_D, generator=g).to(DEVICE))
                for _ in range(3)]
 
     summed = sum_turboquant_codes(sys_codes, d_codes, kind="S", bits=BITS)
@@ -350,10 +351,10 @@ def test_install_frame_guards(corpus):
     the wrong bits — all loudly (ValueError, culprit named)."""
     q = resolve_quantizer("S", S_D, BITS)
     g = torch.Generator().manual_seed(5)
-    sys_codes = q.quant(torch.randn(S_D, generator=g).cuda())
+    sys_codes = q.quant(torch.randn(S_D, generator=g).to(DEVICE))
     rogue = TurboQuant(kind="custom", bits=BITS, d=S_D, seed=999)
-    rogue_delta = rogue.quant(torch.randn(S_D, generator=g).cuda())
-    ok_delta = q.quant(torch.randn(S_D, generator=g).cuda())
+    rogue_delta = rogue.quant(torch.randn(S_D, generator=g).to(DEVICE))
+    ok_delta = q.quant(torch.randn(S_D, generator=g).to(DEVICE))
 
     # (a) delta frame drift — the mission's gate
     with pytest.raises(ValueError, match="frame drift"):
@@ -362,7 +363,7 @@ def test_install_frame_guards(corpus):
     big = resolve_quantizer("S", 256, BITS)
     with pytest.raises(ValueError, match="unit mismatch"):
         sum_turboquant_codes(
-            sys_codes, [big.quant(torch.randn(256, generator=g).cuda())], kind="S")
+            sys_codes, [big.quant(torch.randn(256, generator=g).to(DEVICE))], kind="S")
     # (c) the SYSTEM codes themselves in a foreign frame
     with pytest.raises(ValueError, match="frame drift"):
         sum_turboquant_codes(rogue_delta, [ok_delta], kind="S")

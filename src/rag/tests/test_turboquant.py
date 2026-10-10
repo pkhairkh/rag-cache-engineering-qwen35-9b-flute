@@ -63,6 +63,7 @@ from turboquant import (
     pack_bits,
     unpack_bits,
 )
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 D = 1024                          # small-dim workhorse (committed cb_b*_d1024)
 N_VECS = 30                       # unit vectors per MSE measurement
@@ -74,7 +75,7 @@ FHT_SEEDS = (7, 42)               # the brief's rotation-binding seeds
 def _unit_vectors(d: int, n: int, seed: int) -> torch.Tensor:
     """n deterministic random unit vectors, shape (n, d), fp32."""
     g = torch.Generator().manual_seed(seed)
-    x = torch.randn(n, d, generator=g, dtype=torch.float32).cuda()
+    x = torch.randn(n, d, generator=g, dtype=torch.float32).to(DEVICE)
     return x / x.norm(dim=-1, keepdim=True)
 
 
@@ -91,7 +92,7 @@ def test_fht_binding_matches_rotation_matrix(seed):
     assert torch.equal(q._signs, fht.rotation_signs(D, seed))
 
     g = torch.Generator().manual_seed(seed)
-    x = torch.randn(8, D, generator=g, dtype=torch.float32).cuda()
+    x = torch.randn(8, D, generator=g, dtype=torch.float32).to(DEVICE)
     T = fht.build_rotation_matrix(D, seed, device=x.device)  # explicit (D, D) truth on same device
 
     y = fht.fht_apply(x, q._signs)                  # y = x @ T
@@ -242,7 +243,7 @@ def test_full_chunk_size_gate():
         q = quants[kind]
         kind_total = 0
         for _ in range(count):
-            v = torch.randn(q.d, generator=g, dtype=torch.float32).cuda()
+            v = torch.randn(q.d, generator=g, dtype=torch.float32).to(DEVICE)
             v = v / v.norm()
             kind_total += q.quant(v).nbytes()       # quantize each unit once
         per_unit[kind] = kind_total // count

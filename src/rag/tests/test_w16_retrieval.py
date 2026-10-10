@@ -68,6 +68,7 @@ from index import (ChunkVectorLoader, IndexConfig, RetrievalFrame,
                    build_index, build_retrieval_frame, iter_centered_vectors,
                    load_index, load_retrieval_frame, rerank,
                    save_retrieval_frame)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 from query import answer_query, query_cache_vector
 from tq_cache import TQCache
 
@@ -87,8 +88,8 @@ COMMON = 40.0                     # the generic-text response (the floor)
 QMARKER = 2.0                     # the query's WEAK topic signal
 JITTER = 0.25                     # per-chunk norm modulation (length)
 
-QUERY_IDS = torch.tensor([[200, 201]]).cuda()
-SYSTEM_IDS = torch.tensor([[5, 6, 7, 8]]).cuda()
+QUERY_IDS = torch.tensor([[200, 201]], device=DEVICE)
+SYSTEM_IDS = torch.tensor([[5, 6, 7, 8]], device=DEVICE)
 QUERY_TOPIC = 2
 
 
@@ -110,9 +111,9 @@ class CommonComponentStub:
 
     def __init__(self, n_topics: int = N_TOPICS):
         g = torch.Generator().manual_seed(99)
-        self.topic_dirs = [torch.randn(S_SHAPE, generator=g).cuda()
+        self.topic_dirs = [torch.randn(S_SHAPE, generator=g).to(DEVICE)
                            for _ in range(n_topics)]
-        self.common_dir = torch.randn(S_SHAPE, generator=g).cuda()
+        self.common_dir = torch.randn(S_SHAPE, generator=g).to(DEVICE)
         self.chunk_topics: dict = {}   # tuple(tokens) -> topic
         self.chunk_jitter: dict = {}   # tuple(tokens) -> the norm scale
         self.active_topic = None       # the QUERY's topic
@@ -125,32 +126,32 @@ class CommonComponentStub:
         for L in LINEARS:
             cur = past_key_values.layers[L].recurrent_states[0]
             if cur is None:
-                cur = torch.zeros(S_SHAPE, dtype=torch.float16, device='cuda')
+                cur = torch.zeros(S_SHAPE, dtype=torch.float16, device=DEVICE)
             else:
-                cur = cur.cuda() if not cur.is_cuda else cur
+                cur = cur.to(DEVICE)
             g = torch.Generator().manual_seed(31 * (L + 1) + kh)
-            add = NOISE * torch.randn(S_SHAPE, generator=g).cuda() \
+            add = NOISE * torch.randn(S_SHAPE, generator=g).to(DEVICE) \
                 + scale * COMMON * self.common_dir
             if topic is not None:
                 marker = scale * MARKER if ids in self.chunk_topics \
                     else QMARKER
                 add = add + marker * self.topic_dirs[topic]
-            new = (cur.float() + add.float()).half().cuda()
+            new = (cur.float() + add.float()).half().to(DEVICE)
             past_key_values.update_recurrent_state(new, L)
             conv_in = torch.randn(1, CONV_D, max(1, len(ids)), generator=g)
             past_key_values.update_conv_state(
-                conv_in.half().cuda(), L, conv_kernel_size=KERNEL)
+                conv_in.half().to(DEVICE), L, conv_kernel_size=KERNEL)
         for which, seed in (("m1", 7001), ("m2", 7002)):
             m = getattr(past_key_values, f"read_{which}")()
             if m is None:
-                m = torch.zeros(*M_SHAPE, dtype=torch.float16, device='cuda')
+                m = torch.zeros(*M_SHAPE, dtype=torch.float16, device=DEVICE)
             else:
-                m = m.cuda() if not m.is_cuda else m
+                m = m.to(DEVICE)
             g = torch.Generator().manual_seed(seed + kh)
             getattr(past_key_values, f"update_{which}")(
                 (m.float() + M_NOISE * torch.randn(*M_SHAPE,
-                                                   generator=g).cuda()).half().cuda())
-        return torch.zeros(1, max(1, len(ids)), N_TOPICS)
+                                                   generator=g).to(DEVICE)).half().to(DEVICE))
+        return torch.zeros(1, max(1, len(ids)), N_TOPICS, device=DEVICE)
 
 
 # ------------------------------------------------------- module fixture ---
@@ -167,7 +168,7 @@ def corpus(tmp_path_factory):
         model.chunk_topics[tok] = i % N_TOPICS
         model.chunk_jitter[tok] = 1.0 + JITTER * (
             ((i * 2654435761) % 1000) / 1000.0 - 0.5)
-        chunks.append(torch.tensor([list(tok)]).cuda())
+        chunks.append(torch.tensor([list(tok)], device=DEVICE))
     assert model.active_topic is None
     IngestDriver(model, SYSTEM_IDS, chunks, disk,
                  cache_factory=_make_cache).run()
@@ -331,8 +332,8 @@ def test_answer_query_full_attention_fresh(tmp_path):
             # the full-attn layers: this call's tokens as KV (B, H, T, D)
             for i, layer in enumerate(past_key_values.layers):
                 if type(layer).__name__ == "DynamicLayer":
-                    k = F.relu(torch.randn(1, 2, len(ids), 4))
-                    v = F.relu(torch.randn(1, 2, len(ids), 4))
+                    k = F.relu(torch.randn(1, 2, len(ids), 4, device=DEVICE))
+                    v = F.relu(torch.randn(1, 2, len(ids), 4, device=DEVICE))
                     layer.update(k, v, layer_idx=i, cache_kwargs={})
             return super().__call__(input_ids, past_key_values, use_cache)
 
@@ -341,7 +342,7 @@ def test_answer_query_full_attention_fresh(tmp_path):
     for i in range(4):
         tok = (300 + 11 * i, 301 + 11 * i, 302 + 11 * i)
         model.chunk_jitter[tok] = 1.0
-        chunks.append(torch.tensor([list(tok)]).cuda())
+        chunks.append(torch.tensor([list(tok)], device=DEVICE))
     disk = str(tmp_path)
     IngestDriver(model, SYSTEM_IDS, chunks, disk,
                  cache_factory=_make_cache).run()

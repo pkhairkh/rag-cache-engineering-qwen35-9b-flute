@@ -665,7 +665,8 @@ class TurboQuant:
         return self
 
     def dequant(self, codes: TQCodes,
-                dtype: torch.dtype = torch.float32) -> torch.Tensor:
+                dtype: torch.dtype = torch.float32,
+                device: Optional[torch.device] = None) -> torch.Tensor:
         """Dequantize ONE unit back to a (d,) tensor of `dtype`.
 
         Routing (W15): the CODES are self-describing — partition="outlier"
@@ -679,7 +680,16 @@ class TurboQuant:
         the paper's Alg.-2 estimator: x̃ = x̃_mse + (√(π/2)/√d)·γ·
         FHT_adjoint(qjl)  ==  x̃_mse + (√(π/2)/d)·γ·Sᵀ·qjl with the
         structured projection S = √d·FHT(d, codes.seed+7777) (module
-        docstring). Codes WITHOUT the fields: exactly the pre-W9.2 path."""
+        docstring). Codes WITHOUT the fields: exactly the pre-W9.2 path.
+
+        W18 `device`: the reconstruction itself ALWAYS runs on the CPU
+        reference path (numpy codebooks -> from_numpy -> fht_adjoint on a
+        CPU tensor — numerics pinned bit-identical across platforms;
+        dequant is the reference, the CUDA FHT kernel is a QUANT-time
+        device). When `device` is given, the FINAL tensor is moved there
+        once — the caller's placement contract (None = CPU, the
+        pre-W18 behavior every CPU-side consumer relies on).
+        """
         if getattr(codes, "partition", "half") == "outlier":
             q = self._route_for(codes)
             q._check_codes(codes)
@@ -688,9 +698,13 @@ class TurboQuant:
             # the REGULAR sub-set's norm; a zero regular set with a live
             # outlier set (or vice versa) is handled per sub-set above.
             out = self._qjl_compensation_term(codes, out)
-            return out.to(dtype)
-        q = self._route_for(codes)
-        return q._dequant_flat(codes, dtype)
+            out = out.to(dtype)
+        else:
+            q = self._route_for(codes)
+            out = q._dequant_flat(codes, dtype)
+        if device is not None:
+            out = out.to(device)
+        return out
 
     def _qjl_compensation_term(self, codes: TQCodes,
                                out: torch.Tensor) -> torch.Tensor:
@@ -760,9 +774,9 @@ class TurboQuant:
 
     # round-trip helper (evals/Phase-1 measurement harness)
     def roundtrip(self, x: torch.Tensor) -> torch.Tensor:
-        # Preserve device: dequant returns CPU tensors (codebook path is numpy/CPU)
-        out = self.dequant(self.quant(x), dtype=x.dtype)
-        return out.to(x.device) if out.device != x.device else out
+        # W18: the dequant device parameter carries the placement — no
+        # post-hoc move needed.
+        return self.dequant(self.quant(x), dtype=x.dtype, device=x.device)
 
     # ------------------------------------------------------------ plumbing -
     def _check_codes(self, codes: TQCodes) -> None:

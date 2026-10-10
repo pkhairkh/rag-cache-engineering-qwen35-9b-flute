@@ -84,7 +84,7 @@ def _rel_mse(a, b) -> float:
 
 def _tokens(n: int, seed: int) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
-    return torch.randint(0, VOCAB, (B, n), generator=g).cuda()
+    return torch.randint(0, VOCAB, (B, n), generator=g).to(DEVICE)
 
 
 def _config() -> Qwen3_5Config:
@@ -111,7 +111,7 @@ class _ResidualGDNStack(torch.nn.Module):
         for m in self.modules():
             for p in m.parameters():
                 if p.dim() > 1:
-                    p.data = torch.randn(p.shape, generator=g).cuda() * 0.1
+                    p.data = torch.randn(p.shape, generator=g).to(DEVICE) * 0.1
                 else:
                     p.data.fill_(1.0)
         for lyr in self.gdn:
@@ -135,13 +135,13 @@ def _s_of(cache) -> dict:
     for i in range(N_LAYERS):
         t = cache.layers[i].recurrent_states[0]
         out[i] = (t.reshape(-1).float().clone() if t is not None
-                  else torch.zeros(1))
+                  else torch.zeros(1, device=DEVICE))
     return out
 
 
 # W17: device-adaptive (the c37f20e edit hard-coded 'cuda' for the GPU
 # box and broke the CPU suite — the house contract is both boxes green)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @pytest.fixture(scope="module")

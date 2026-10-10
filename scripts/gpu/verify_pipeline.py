@@ -119,6 +119,7 @@ def main() -> int:
                           args.model_name,
                           m1m2_mem_size=mem_size or 128)
     check_m1m2_geometry(model, system, mem_size)
+    dev = next(model.parameters()).device  # W18: ids follow the model
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     snap = load_chunk(os.path.join(args.disk_dir, "snapshots",
                                    f"chunk_{args.chunk:05d}.npz"))
@@ -130,7 +131,7 @@ def main() -> int:
     # G1 — pure generation (no cache)
     print(f"\nG1  pure generation: {args.prompt!r}")
     with torch.no_grad():
-        ids = tokenizer.encode(args.prompt, return_tensors="pt").cuda()
+        ids = tokenizer.encode(args.prompt, return_tensors="pt").to(dev)
         toks, confs = _greedy(model, None, ids, args.max_new_tokens, tokenizer)
     failures += 0 if _report("G1 pure model", toks, confs, tokenizer) else 1
 
@@ -138,7 +139,7 @@ def main() -> int:
     print(f"\nG2  fresh TQCache: {args.prompt!r}")
     with torch.no_grad():
         cache = fresh_cache()
-        ids = tokenizer.encode(args.prompt, return_tensors="pt").cuda()
+        ids = tokenizer.encode(args.prompt, return_tensors="pt").to(dev)
         toks, confs = _greedy(model, cache, ids, args.max_new_tokens, tokenizer)
     failures += 0 if _report("G2 TQCache", toks, confs, tokenizer) else 1
 
@@ -147,7 +148,7 @@ def main() -> int:
     with torch.no_grad():
         cache = fresh_cache()
         reseed_cache(cache, system)
-        ids = tokenizer.encode(args.question, return_tensors="pt").cuda()
+        ids = tokenizer.encode(args.question, return_tensors="pt").to(dev)
         toks, confs = _greedy(model, cache, ids, args.max_new_tokens, tokenizer)
     failures += 0 if _report("G3 reseed", toks, confs, tokenizer) else 1
 
@@ -161,7 +162,7 @@ def main() -> int:
             summed = sum_turboquant_codes(system.s_codes[0], [delta0],
                                           kind="S", bits=args.bits)
             cache.set_s_codes(0, summed)
-        ids = tokenizer.encode(args.question, return_tensors="pt").cuda()
+        ids = tokenizer.encode(args.question, return_tensors="pt").to(dev)
         toks, confs = _greedy(model, cache, ids, args.max_new_tokens, tokenizer)
     failures += 0 if _report("G4 S-only install", toks, confs, tokenizer) else 1
 
@@ -171,7 +172,7 @@ def main() -> int:
         cache = fresh_cache()
         reseed_cache(cache, system)
         report = install_snapshot(cache, system, [snap])
-        ids = tokenizer.encode(args.question, return_tensors="pt").cuda()
+        ids = tokenizer.encode(args.question, return_tensors="pt").to(dev)
         toks, confs = _greedy(model, cache, ids, args.max_new_tokens, tokenizer)
     print(f"         install report L0: {report.get(0)}")
     failures += 0 if _report("G5 full install", toks, confs, tokenizer) else 1
@@ -182,7 +183,7 @@ def main() -> int:
     from query import answer_query
     loader = ChunkVectorLoader(args.disk_dir, bits=args.bits)
     with torch.no_grad():
-        ids = tokenizer.encode(args.question, return_tensors="pt").cuda()
+        ids = tokenizer.encode(args.question, return_tensors="pt").to(dev)
         result = answer_query(
             model=model, query_token_ids=ids, system=system, loader=loader,
             cache_factory=fresh_cache, retrieved_ids=[args.chunk],

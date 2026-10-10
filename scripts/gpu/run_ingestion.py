@@ -41,12 +41,12 @@ def main() -> int:
     ap.add_argument("--system-prompt", default="You are a helpful AI assistant.")
     ap.add_argument("--bits", type=float, default=3.5)
     ap.add_argument("--m1m2-mem-size", type=int, default=1024,
-                    help="W17: the M1/M2 memories' slot count (spec §2.2 "
-                         "default 128; the handover's retrieval "
-                         "experiments: 1024/4096/8192). The snapshot "
-                         "gains 2 x (32*mem*128)-dim m1/m2 code units; "
-                         "query/index must use the SAME value (the "
-                         "loaders fail loudly on drift)")
+                    help="W17: the M1/M2 memories' slot count — the "
+                         "architecture's band is [1024, 4096] (two GLOBAL "
+                         "memories shared across the 24 linear layers). "
+                         "The snapshot gains 2 x (32*mem*128)-dim m1/m2 "
+                         "code units; query/index must use the SAME value "
+                         "(the loaders fail loudly on drift)")
     ap.add_argument("--m1m2-gates", default=None,
                     help="W17: trained-gates .npz (finetune_m1m2.py's "
                          "artifact) — without it the gates stay at the "
@@ -68,6 +68,12 @@ def main() -> int:
     print("=" * 60)
     print("RAGGA INGESTION (scripts/gpu/run_ingestion.py)")
     print("=" * 60)
+
+    # the architecture's band (the handover's contract) — loud refusal
+    if not 1024 <= args.m1m2_mem_size <= 4096:
+        raise SystemExit(
+            f"--m1m2-mem-size {args.m1m2_mem_size} is outside the "
+            f"architecture's band [1024, 4096] — refuse")
 
     print("\n[1] Loading model...")
     model, _ = load_model(args.artifacts_dir, args.heads_dir, args.model_name,

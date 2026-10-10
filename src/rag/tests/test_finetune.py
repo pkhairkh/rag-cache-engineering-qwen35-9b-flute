@@ -65,6 +65,7 @@ import lut_export  # noqa: E402
 import palettized_modules as pm  # noqa: E402
 from m1m2 import M1M2, m1m2_from_cache, push_to_cache  # noqa: E402
 from tq_cache import TQCache  # noqa: E402
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SRC_RAG = Path(__file__).resolve().parents[1]
 IDXN = pm._get_idxn()  # the standalone canonical idxN producer/verifier
@@ -106,19 +107,19 @@ def _make_palettized(N: int, K: int, group_size: int, bits: int,
 
     logical = rng.integers(0, 1 << bits, size=(N, K), dtype=np.uint8)
     blob = IDXN.pack_idxn(logical, bits)          # canonical idxN producer
-    lut = (0.1 * torch.randn(ng, 1 << bits, generator=gen).cuda()).half().cuda()
+    lut = (0.1 * torch.randn(ng, 1 << bits, generator=gen).to(DEVICE)).half()
 
     indices2 = lut2 = None
     if bits2 is not None:                          # the W4 Route A stream 2
         logical2 = rng.integers(0, 1 << bits2, size=(N, K), dtype=np.uint8)
         blob2 = IDXN.pack_idxn(logical2, bits2)
         indices2 = torch.from_numpy(np.ascontiguousarray(blob2))
-        lut2 = (0.1 * torch.randn(ng, 1 << bits2, generator=gen).cuda()).half().cuda()
+        lut2 = (0.1 * torch.randn(ng, 1 << bits2, generator=gen).to(DEVICE)).half()
 
     resA = resB = None
     if residual:                                   # LQER serving form
-        resA = (0.05 * torch.randn(N, RES_RANK, generator=gen).cuda()).half().cuda()
-        resB = (0.05 * torch.randn(RES_RANK, K, generator=gen).cuda()).half().cuda()
+        resA = (0.05 * torch.randn(N, RES_RANK, generator=gen).to(DEVICE)).half()
+        resB = (0.05 * torch.randn(RES_RANK, K, generator=gen).to(DEVICE)).half()
 
     mod = pm.PalettizedLinear(
         torch.from_numpy(np.ascontiguousarray(blob)), lut, bits, group_size,
@@ -141,7 +142,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         gen = torch.Generator().manual_seed(seed + 2)
         self.in_proj = nn.Linear(d_model, d_model, bias=False)
         self.in_proj.weight.data.copy_(
-            0.2 * torch.randn(d_model, d_model, generator=gen).cuda())
+            0.2 * torch.randn(d_model, d_model, generator=gen))
         self.A_log = nn.Parameter(torch.zeros(()))
         self.dt_bias = nn.Parameter(torch.full((d_model,), 0.1))
 
@@ -163,7 +164,7 @@ class FinetuneStubModel(nn.Module):
         gen = torch.Generator().manual_seed(seed + 100)
         self.embed = nn.Embedding(VOCAB, D_EMB)
         self.embed.weight.data.copy_(
-            torch.randn(VOCAB, D_EMB, generator=gen).cuda())
+            torch.randn(VOCAB, D_EMB, generator=gen))
         self.linear_attn = Qwen3_5GatedDeltaNet(D_EMB, seed=seed)
         # stream-1 module WITH the LQER residual; group-1 input path
         self.plin = _make_palettized(
@@ -173,7 +174,10 @@ class FinetuneStubModel(nn.Module):
         self.lm_head_plin = _make_palettized(
             VOCAB, N_OUT, GROUP_SIZE, 4, bits2=2, seed=seed + 50)
         self.m1m2 = M1M2(num_heads=M_H, head_dim=M_D, mem_size=M_MEM,
-                         num_linear_layers=1).cuda()
+                         num_linear_layers=1)
+        # the whole rig on DEVICE (one move — every param, incl. the
+        # CPU-born A_log/dt_bias/embed the earlier per-tensor copies missed)
+        self.to(DEVICE)
         # opened write gates (see the module docstring: the P3 zero-init
         # is a production property; the dry-run needs nonzero gate grads)
         with torch.no_grad():
@@ -188,18 +192,18 @@ class FinetuneStubModel(nn.Module):
         # (1) embed -> in_proj -> the palettized GEMM (reference path; the
         # fp16 input mirrors the kernel path's A-operand dtype contract)
         h = self.linear_attn(self.embed(input_ids))          # (B, T, 64)
-        y = self.plin(h.half().cuda()).float()                      # (B, T, 128)
+        y = self.plin(h.half().to(DEVICE)).float()                      # (B, T, 128)
 
         # (2) the GatedDeltaNet-like state write into the TQCache: S
         # quantize-on-write (path h -> y -> S: the state follows the
         # palettized output), the conv windowing write
         cur = cache.layers[0].recurrent_states[0]
-        cur = torch.zeros(S_D, dtype=torch.float16) if cur is None \
+        cur = torch.zeros(S_D, dtype=torch.float16, device=DEVICE) if cur is None \
             else cur.reshape(-1)
         new_s = cur.float() + y.float().sum(dim=(0, 1))
-        cache.update_recurrent_state(new_s.reshape(S_SHAPE).half().cuda(), 0)
+        cache.update_recurrent_state(new_s.reshape(S_SHAPE).half().to(DEVICE), 0)
         conv_in = h.detach()[..., :CONV_D].transpose(1, 2).contiguous()
-        cache.update_conv_state(conv_in.half().cuda(), 0,
+        cache.update_conv_state(conv_in.half().to(DEVICE), 0,
                                 conv_kernel_size=KERNEL)
 
         # (3) M1/M2: read the current state (zeros on a fresh cache) ->
@@ -216,7 +220,7 @@ class FinetuneStubModel(nn.Module):
             B, T, M_H * M_D)                                 # (B, T, 128)
         z = y + read_contrib
 
-        logits = self.lm_head_plin(z.half().cuda()).float()         # (B, T, VOCAB)
+        logits = self.lm_head_plin(z.half().to(DEVICE)).float()         # (B, T, VOCAB)
         self.last_cache = cache
         return logits
 
@@ -227,7 +231,7 @@ def _make_cache() -> TQCache:
 
 def _batches(n: int = 3, seed: int = 7):
     gen = torch.Generator().manual_seed(seed)
-    return [torch.randint(0, VOCAB, (1, 8), generator=gen).cuda()
+    return [torch.randint(0, VOCAB, (1, 8), generator=gen).to(DEVICE)
             for _ in range(n)]
 
 

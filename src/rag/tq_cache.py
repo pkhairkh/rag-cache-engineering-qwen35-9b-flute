@@ -190,21 +190,18 @@ class _StateView(dict):
                 codes = layer._conv_codes
                 if codes is None:
                     return None
+                # W18: dequant's device param carries the placement (the
+                # tracked device — the write-time tensor's device)
                 t = layer._dequant_conv(layer._conv_dtype)
-                # move to tracked device
-                if layer._device is not None and t.device != layer._device:
-                    t = t.to(layer._device)
                 layer._handed_conv = t
                 return t
             layer.reads["s"] += 1
             codes = layer._s_codes
             if codes is None:
                 return None
-            t = layer._tq_s.dequant(codes, dtype=layer._s_dtype)
+            t = layer._tq_s.dequant(codes, dtype=layer._s_dtype,
+                                     device=layer._device)
             t = t.reshape(layer._s_shape)
-            # move to tracked device
-            if layer._device is not None and t.device != layer._device:
-                t = t.to(layer._device)
             return t
         # offline mode: plain passthrough (None before the first write —
         # the mixin's dicts are lazily filled, read-before-write is legal)
@@ -278,11 +275,11 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
 
     def _dequant_conv(self, dtype: torch.dtype) -> torch.Tensor:
         """Codes -> the shaped window: dequant the (d,) unit, STRIP the <= 31
-        round-up pad, reshape to `_conv_shape`. Caller owns device placement;
-        the tracked device (when known) is applied for the read path."""
-        t = self._tq_conv.dequant(self._conv_codes, dtype=dtype)
-        if self._device is not None and t.device != self._device:
-            t = t.to(self._device)
+        round-up pad, reshape to `_conv_shape`. The tracked device (when
+        known — set at the first write) is the output's device (W18: the
+        dequant device parameter, one move at the source)."""
+        t = self._tq_conv.dequant(self._conv_codes, dtype=dtype,
+                                  device=self._device)
         n = self._conv_numel if self._conv_numel is not None else t.numel()
         if t.numel() > n:
             t = t[:n]
@@ -414,11 +411,11 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
             self._init_s(recurrent_states, state_idx)
         self.writes["s"] += 1
         self._s_codes = self._tq_s.quant(recurrent_states.reshape(-1))
-        out = self._tq_s.dequant(self._s_codes, dtype=self._s_dtype)
+        # W18: the dequant device parameter — the round-trip state lands
+        # on the writer's device directly.
+        out = self._tq_s.dequant(self._s_codes, dtype=self._s_dtype,
+                                 device=recurrent_states.device)
         out = out.reshape(self._s_shape)
-        # ensure device consistency with input
-        if out.device != recurrent_states.device:
-            out = out.to(recurrent_states.device)
         return out
 
     # ------------------------------------------------- P7 graph hooks ---
@@ -662,16 +659,31 @@ class TQCache(DynamicCache):
         if self._m_device is None:
             self._m_device = tensor.device
 
+    def _m_read_device(self) -> Optional[torch.device]:
+        """W18: where a codes-only read (no live write yet — e.g. right
+        after install_from_disk) should land. Resolution order: the
+        device seen at the last M write; else the first tracked layer
+        device; else None (CPU — a codes-only cache with no device
+        signal at all)."""
+        if self._m_device is None:
+            for layer in self.layers:
+                d = getattr(layer, "_device", None)
+                if d is not None:
+                    self._m_device = d
+                    break
+        return self._m_device
+
     def update_m1(self, tensor: torch.Tensor) -> torch.Tensor:
         """Quantize-on-write for the global key-memory (spec §2.2/§5)."""
         if (self._tq_m1 is None or self._m1_codes is None
                 or tensor.numel() != self._m1_codes.d):
             self._resolve_m("M1", tensor)
         self._m1_codes = self._tq_m1.quant(tensor.reshape(-1))
-        out = self._tq_m1.dequant(self._m1_codes, dtype=tensor.dtype)
+        # W18: the dequant device parameter — the round-trip state lands
+        # on the writer's device directly.
+        out = self._tq_m1.dequant(self._m1_codes, dtype=tensor.dtype,
+                                   device=tensor.device)
         out = out.reshape(tuple(tensor.shape))
-        if out.device != tensor.device:
-            out = out.to(tensor.device)
         return out
 
     def read_m1(self, dtype: torch.dtype = torch.float16) -> Optional[torch.Tensor]:
@@ -679,15 +691,8 @@ class TQCache(DynamicCache):
             return None
         self._check_m_geometry("read_m1", "M1", self._m1_codes.d,
                                self._m1_shape)
-        t = self._tq_m1.dequant(self._m1_codes, dtype=dtype).reshape(self._m1_shape)
-        # infer device from layers if not yet tracked
-        if self._m_device is None and self.layers:
-            for layer in self.layers:
-                if hasattr(layer, "_device") and layer._device is not None:
-                    self._m_device = layer._device
-                    break
-        if self._m_device is not None and t.device != self._m_device:
-            t = t.to(self._m_device)
+        t = self._tq_m1.dequant(self._m1_codes, dtype=dtype,
+                                 device=self._m_read_device()).reshape(self._m1_shape)
         return t
 
     @property
@@ -707,10 +712,9 @@ class TQCache(DynamicCache):
                 or tensor.numel() != self._m2_codes.d):
             self._resolve_m("M2", tensor)
         self._m2_codes = self._tq_m2.quant(tensor.reshape(-1))
-        out = self._tq_m2.dequant(self._m2_codes, dtype=tensor.dtype)
+        out = self._tq_m2.dequant(self._m2_codes, dtype=tensor.dtype,
+                                   device=tensor.device)
         out = out.reshape(tuple(tensor.shape))
-        if out.device != tensor.device:
-            out = out.to(tensor.device)
         return out
 
     def read_m2(self, dtype: torch.dtype = torch.float16) -> Optional[torch.Tensor]:
@@ -718,15 +722,8 @@ class TQCache(DynamicCache):
             return None
         self._check_m_geometry("read_m2", "M2", self._m2_codes.d,
                                self._m2_shape)
-        t = self._tq_m2.dequant(self._m2_codes, dtype=dtype).reshape(self._m2_shape)
-        # infer device from layers if not yet tracked
-        if self._m_device is None and self.layers:
-            for layer in self.layers:
-                if hasattr(layer, "_device") and layer._device is not None:
-                    self._m_device = layer._device
-                    break
-        if self._m_device is not None and t.device != self._m_device:
-            t = t.to(self._m_device)
+        t = self._tq_m2.dequant(self._m2_codes, dtype=dtype,
+                                 device=self._m_read_device()).reshape(self._m2_shape)
         return t
 
     @staticmethod

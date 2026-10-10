@@ -270,29 +270,7 @@ class M1M2(nn.Module):
                 f"M1M2.write: k/v/m1/m2 must live on one device, got "
                 f"{k.device} / {v.device} / {m1.device} / {m2.device}")
         B, H, T, D = tuple(k.shape)
-        if positions is None:
-            pos = torch.arange(T, device=k.device)
-        else:
-            if not isinstance(positions, torch.Tensor):
-                raise TypeError(
-                    f"M1M2.write: positions must be a torch.Tensor, got "
-                    f"{type(positions).__name__}")
-            if positions.dim() != 1 or positions.numel() != T:
-                raise ValueError(
-                    f"M1M2.write: positions must be a (T,) = ({T},) "
-                    f"tensor, got shape {tuple(positions.shape)}")
-            if (positions.dtype.is_floating_point
-                    or positions.dtype.is_complex
-                    or positions.dtype == torch.bool):
-                raise TypeError(
-                    f"M1M2.write: positions must be an integer tensor, "
-                    f"got dtype {positions.dtype}")
-            if positions.numel() > 0 and bool((positions < 0).any()):
-                raise ValueError(
-                    f"M1M2.write: positions must be non-negative (token "
-                    f"positions), got min "
-                    f"{int(positions.min().item())}")
-            pos = positions.to(device=k.device, dtype=torch.long)
+        pos = self._resolve_positions(positions, T, k.device)
         slots = torch.remainder(pos, self.mem_size)    # (T,) slot = p mod mem
         m1_new = self._gated_scatter(k, m1, self.write_gate_k[layer_idx],
                                      slots, B, "k")
@@ -300,28 +278,93 @@ class M1M2(nn.Module):
                                      slots, B, "v")
         return m1_new, m2_new
 
+    def write_deltas(self, k: torch.Tensor, v: torch.Tensor,
+                     layer_idx: int,
+                     positions: Optional[torch.Tensor] = None,
+                     state: Optional[torch.Tensor] = None
+                     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(Δ1, Δ2) — the RAW per-call deltas, state-independent (the §2.2
+        additive property: m_new = m + g·Δ with Δ the pure scatter of
+        k/v). W18: the memory-safe replay's backward recomputes these ONE
+        CALL AT A TIME instead of retaining the 24-boundary-state chain —
+        bit-identical to the deltas the write path itself adds (the same
+        _scatter_delta, shared code, no drift).
+
+        `state` (any state-shaped tensor, e.g. the m_init) fixes the
+        promotion dtype + device of the returned deltas; positions
+        resolve exactly as in write()."""
+        self._check_layer_idx("write_deltas", layer_idx)
+        self._check_qkv("write_deltas", "k", k)
+        self._check_qkv("write_deltas", "v", v)
+        if state is not None:
+            self._check_state("write_deltas", "state", state)
+        if k.shape != v.shape:
+            raise ValueError(
+                f"M1M2.write_deltas: k and v must share (B, H, T, D), got "
+                f"{tuple(k.shape)} vs {tuple(v.shape)}")
+        ref = state if state is not None else k
+        B, H, T, D = tuple(k.shape)
+        pos = self._resolve_positions(positions, T, k.device)
+        slots = torch.remainder(pos, self.mem_size)
+        d1 = self._scatter_delta(k, slots, B, ref)
+        d2 = self._scatter_delta(v, slots, B, ref)
+        return d1, d2
+
+    def _resolve_positions(self, positions, T: int,
+                           device: torch.device) -> torch.Tensor:
+        """The write-positions contract (shared by write/write_deltas):
+        default arange(T); loud validation otherwise."""
+        if positions is None:
+            return torch.arange(T, device=device)
+        if not isinstance(positions, torch.Tensor):
+            raise TypeError(
+                f"M1M2.write: positions must be a torch.Tensor, got "
+                f"{type(positions).__name__}")
+        if positions.dim() != 1 or positions.numel() != T:
+            raise ValueError(
+                f"M1M2.write: positions must be a (T,) = ({T},) "
+                f"tensor, got shape {tuple(positions.shape)}")
+        if (positions.dtype.is_floating_point
+                or positions.dtype.is_complex
+                or positions.dtype == torch.bool):
+            raise TypeError(
+                f"M1M2.write: positions must be an integer tensor, "
+                f"got dtype {positions.dtype}")
+        if positions.numel() > 0 and bool((positions < 0).any()):
+            raise ValueError(
+                f"M1M2.write: positions must be non-negative (token "
+                f"positions), got min "
+                f"{int(positions.min().item())}")
+        return positions.to(device=device, dtype=torch.long)
+
+    def _scatter_delta(self, x: torch.Tensor, slots: torch.Tensor, B: int,
+                       state: torch.Tensor) -> torch.Tensor:
+        """delta (H, mem, D) in promote(x, state) — the additive scatter
+        (token-major index_add, NO python loop). Shared by the gated
+        write and the W18 write_deltas (the replay backward's recompute
+        is the SAME code, hence bit-identical)."""
+        H, D = self.num_heads, self.head_dim
+        T = x.shape[2]
+        dtype = torch.promote_types(x.dtype, state.dtype)
+        src = x.permute(0, 2, 1, 3).reshape(B * T, H, D).to(dtype)
+        idx = slots.repeat(B)                             # (B·T,) slot/token
+        delta = torch.zeros(self.mem_size, H, D, dtype=dtype,
+                            device=x.device)
+        delta = torch.index_add(delta, 0, idx, src)       # (mem, H, D)
+        return delta.permute(1, 0, 2)                    # -> (H, mem, D)
+
     def _gated_scatter(self, x: torch.Tensor, state: torch.Tensor,
                        gate: torch.Tensor, slots: torch.Tensor, B: int,
                        name: str) -> torch.Tensor:
         """state + gate · scatter(x) — the additive write for one memory.
 
-        delta[s] = Σ_{tokens at slot s} x[b, :, t, :] (vectorized
-        torch.index_add — the additive scatter, a token-major src with a
-        (B·T,) index; NO python loop over tokens), then ONE gated add.
-        Collision order within a slot is the token order (deterministic
-        on CPU; ≤2-token collisions are bit-stable everywhere — fp add
-        commutativity).
+        delta[s] = Σ_{tokens at slot s} x[b, :, t, :] (the shared
+        _scatter_delta), then ONE gated add. Collision order within a
+        slot is the token order (deterministic on CPU; ≤2-token
+        collisions are bit-stable everywhere — fp add commutativity).
         """
-        H, D = self.num_heads, self.head_dim
-        T = x.shape[2]
         dtype = torch.promote_types(x.dtype, state.dtype)
-        # token-major (B·T, H, D): token i = b·T + t — matches the index
-        src = x.permute(0, 2, 1, 3).reshape(B * T, H, D).to(dtype)
-        idx = slots.repeat(B)                             # (B·T,) slot/token
-        delta = torch.zeros(self.mem_size, H, D, dtype=dtype,
-                            device=state.device)
-        delta = torch.index_add(delta, 0, idx, src)       # (mem, H, D)
-        delta = delta.permute(1, 0, 2)                    # -> (H, mem, D)
+        delta = self._scatter_delta(x, slots, B, state)
         # one branch-free gated add — gradients flow at gate == 0 (P3)
         return (state.to(dtype) + gate * delta).to(state.dtype)
 
@@ -370,16 +413,19 @@ def m1m2_from_cache(cache: "TQCache", module: "M1M2",
             f"{type(module).__name__}")
     m1 = cache.read_m1(dtype=dtype)
     m2 = cache.read_m2(dtype=dtype)
-    device = None
-    if m1 is not None:
-        device = m1.device
-    elif m2 is not None:
-        device = m2.device
+    # W18: the states follow the MODULE's device (the wiring's consumer) —
+    # a codes-only cache may dequant to CPU while the module lives on
+    # CUDA; init_state already defaults there, the read side moves now.
+    want_dev = module.write_gate_k.device
+    if m1 is not None and m1.device != want_dev:
+        m1 = m1.to(want_dev)
+    if m2 is not None and m2.device != want_dev:
+        m2 = m2.to(want_dev)
     want = tuple(module.state_shape())
     out = []
     for name, t in (("m1", m1), ("m2", m2)):
         if t is None:
-            t = module.init_state(dtype=dtype, device=device)
+            t = module.init_state(dtype=dtype, device=want_dev)
         elif tuple(t.shape) != want:
             raise ValueError(
                 f"m1m2_from_cache: cached {name} has shape "

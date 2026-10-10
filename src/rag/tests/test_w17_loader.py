@@ -32,6 +32,7 @@ from transformers import (
     Qwen3_5ForCausalLM as NativeCausalLM,
     Qwen3_5ForConditionalGeneration as NativeCG,
 )
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 from transformers.models.qwen3_5.configuration_qwen3_5 import \
     Qwen3_5VisionConfig
 from transformers import Qwen3_5TextConfig
@@ -90,7 +91,7 @@ def ckpt(tmp_path_factory):
 
 
 def _load(ckpt, **kw):
-    kw.setdefault("device", "cuda")
+    kw.setdefault("device", DEVICE)
     kw.setdefault("dtype", torch.float16)
     return pmod.load_palettized_model(
         ckpt["artifacts"], ckpt["hub"], **kw)
@@ -98,7 +99,7 @@ def _load(ckpt, **kw):
 
 def _ids(n, seed):
     g = torch.Generator().manual_seed(seed)
-    return torch.randint(0, 128, (1, n), generator=g).cuda()
+    return torch.randint(0, 128, (1, n), generator=g).to(DEVICE)
 
 
 # ================================================= 1. load parity ==========
@@ -127,7 +128,7 @@ def test_w17_2_forward_parity_zero_gate(ckpt):
     activation is a true no-op until the fine-tune opens the gates."""
     wired, _ = _load(ckpt, use_m1m2=True, m1m2_mem_size=MEM)
     native = NativeCausalLM.from_pretrained(ckpt["hub"],
-                                            dtype=torch.float16).eval().cuda()
+                                            dtype=torch.float16).eval().to(DEVICE)
     ids = _ids(12, 7)
     outs = {}
     for tag, mdl in (("native", native), ("wired", wired)):
@@ -182,14 +183,14 @@ def test_w17_4_flags_on_text_config_not_composite(ckpt):
     tcfg = getattr(comp, "text_config", None) or comp
     tcfg.use_m1m2 = True
     tcfg.m1m2_mem_size = MEM
-    m = modeling.Qwen3_5TextModel(comp).eval().cuda()
+    m = modeling.Qwen3_5TextModel(comp).eval().to(DEVICE)
     assert getattr(m, "m1m2", None) is not None, \
         "flags on the text config must wire the model"
     # the OLD (broken) placement: composite only -> NO wiring
     comp2 = Qwen3_5Config(text_config=_text_config())
     comp2.use_m1m2 = True
     comp2.m1m2_mem_size = MEM
-    m2 = modeling.Qwen3_5TextModel(comp2).eval().cuda()
+    m2 = modeling.Qwen3_5TextModel(comp2).eval().to(DEVICE)
     assert getattr(m2, "m1m2", None) is None, \
         "composite-only flags must NOT wire (the silent no-op)"
 

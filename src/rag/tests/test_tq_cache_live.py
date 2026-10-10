@@ -63,6 +63,7 @@ from transformers.cache_utils import (
     LinearAttentionLayer,
     get_layer_types_and_kwargs,
 )
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 from tq_cache import TQCache, TQLinearAttentionLayer
 
@@ -142,8 +143,8 @@ def test_config_route_full_cache_api_roundtrip():
     assert cache.has_previous_state(0) is False
 
     g = torch.Generator().manual_seed(123)
-    x = torch.randn(1, 32, 7, generator=g, dtype=torch.float16).cuda()   # prefill
-    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).cuda()
+    x = torch.randn(1, 32, 7, generator=g, dtype=torch.float16).to(DEVICE)   # prefill
+    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
 
     # cache-level dispatch (Cache.update_conv_state isinstance-checks the
     # layer, then delegates) — the exact calls modeling.py makes
@@ -173,13 +174,13 @@ def test_config_route_full_cache_api_roundtrip():
         cache.has_previous_state(1)                   # a full-attention layer
     with pytest.raises(ValueError):
         cache.update_conv_state(                       # a non-linear-attention layer
-            torch.zeros(1, 32, 1, dtype=torch.float16), 1)
+            torch.zeros(1, 32, 1, dtype=torch.float16, device=DEVICE), 1)
     with pytest.raises(ValueError):
-        cache.update_recurrent_state(torch.zeros(*S_UNIT), 1)
+        cache.update_recurrent_state(torch.zeros(*S_UNIT, device=DEVICE), 1)
 
     # M1/M2 are cache-level state on the config route as well
-    m1 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16).cuda()
-    m2 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16).cuda()
+    m1 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
+    m2 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
     assert _rel_mse(cache.update_m1(m1), m1) < REL_MSE_GATE     # 0.020
     assert _rel_mse(cache.update_m2(m2), m2) < REL_MSE_GATE     # 0.018
     assert cache.m1_codes.seed == 303 and cache.m2_codes.seed == 404
@@ -189,8 +190,8 @@ def test_second_linear_layer_is_isolated():
     cfg = _tiny_config()
     cache = TQCache(config=cfg)
     g = torch.Generator().manual_seed(126)
-    x = torch.randn(*CONV_UNIT, generator=g, dtype=torch.float16).cuda()
-    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).cuda()
+    x = torch.randn(*CONV_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
+    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
 
     # write through the cache-level API at the SECOND linear layer
     cache.update_conv_state(x, 2, conv_kernel_size=CONV_KERNEL)
@@ -217,9 +218,9 @@ def test_second_linear_layer_is_isolated():
 def test_live_differential_vs_real_dynamic_cache(seed):
     cfg = _tiny_config()
     g = torch.Generator().manual_seed(seed)
-    prefill = torch.randn(1, 32, 7, generator=g, dtype=torch.float16).cuda()
-    token = torch.randn(1, 32, 1, generator=g, dtype=torch.float16).cuda()
-    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).cuda()
+    prefill = torch.randn(1, 32, 7, generator=g, dtype=torch.float16).to(DEVICE)
+    token = torch.randn(1, 32, 1, generator=g, dtype=torch.float16).to(DEVICE)
+    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
 
     real = DynamicCache(config=cfg)    # the REAL machinery, unwrapped
     tqc = TQCache(config=cfg)          # the wrapped cache
@@ -258,15 +259,15 @@ def test_live_differential_vs_real_dynamic_cache(seed):
 def test_config_cache_decode_loop():
     cfg = _tiny_config()
     g = torch.Generator().manual_seed(321)
-    prefill = torch.randn(1, 32, 7, generator=g, dtype=torch.float16).cuda()
+    prefill = torch.randn(1, 32, 7, generator=g, dtype=torch.float16).to(DEVICE)
     real = DynamicCache(config=cfg)
     tqc = TQCache(config=cfg)
     real.update_conv_state(prefill, 0, conv_kernel_size=CONV_KERNEL)
     tqc.update_conv_state(prefill, 0, conv_kernel_size=CONV_KERNEL)
 
     for step in range(3):
-        token = torch.randn(1, 32, 1, generator=g, dtype=torch.float16).cuda()
-        s_new = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).cuda()
+        token = torch.randn(1, 32, 1, generator=g, dtype=torch.float16).to(DEVICE)
+        s_new = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
 
         # the single-token step of modeling.py::Qwen3_5GatedDeltaNet.forward:
         # read the conv state (handed to causal_conv1d_update), then the two

@@ -51,6 +51,7 @@ from hooks import (
     CapturePoint,
     hook_map,
 )
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 from tq_cache import TQCache, resolve_quantizer
 from turboquant import TQCodes
 
@@ -97,12 +98,12 @@ def _rel_mse(a: torch.Tensor, b: torch.Tensor) -> float:
 def _stub_s(layer_idx: int, pass_idx: int) -> torch.Tensor:
     """Deterministic per-(layer, pass) recurrent state."""
     g = torch.Generator().manual_seed(5000 + 101 * pass_idx + layer_idx)
-    return torch.randn(*S_UNIT, generator=g, dtype=torch.float32).cuda()
+    return torch.randn(*S_UNIT, generator=g, dtype=torch.float32).to(DEVICE)
 
 
 def _stub_conv_in(layer_idx: int, pass_idx: int) -> torch.Tensor:
     g = torch.Generator().manual_seed(9000 + 101 * pass_idx + layer_idx)
-    return torch.randn(*CONV_IN_UNIT, generator=g, dtype=torch.float32).cuda()
+    return torch.randn(*CONV_IN_UNIT, generator=g, dtype=torch.float32).to(DEVICE)
 
 
 class _StubLinear(nn.Module):
@@ -166,7 +167,7 @@ def _build_stub(layer_types=None, silent=()):
 def _run(layers, pass_idx: int = 0, upto: int | None = None) -> None:
     """Run the stack's layers in order (hooks fire per layer)."""
     n = len(layers) if upto is None else upto
-    x = torch.zeros(1)
+    x = torch.zeros(1, device=DEVICE)
     for layer in list(layers)[:n]:
         x = layer(x, pass_idx)
 
@@ -355,8 +356,8 @@ def test_capture_vector_layout():
     hooks.attach(layers)
     _run(layers)
     g = torch.Generator().manual_seed(777)
-    cache.update_m1(torch.randn(*M_UNIT, generator=g, dtype=torch.float32).cuda())
-    cache.update_m2(torch.randn(*M_UNIT, generator=g, dtype=torch.float32).cuda())
+    cache.update_m1(torch.randn(*M_UNIT, generator=g, dtype=torch.float32).to(DEVICE))
+    cache.update_m2(torch.randn(*M_UNIT, generator=g, dtype=torch.float32).to(DEVICE))
     snap = hooks.capture()
 
     v = snap.capture_vector()
@@ -402,8 +403,8 @@ def test_m1_m2_read_at_capture_time():
     assert snap0.capture_vector().numel() == 24 * S_D
 
     g = torch.Generator().manual_seed(778)
-    m1 = torch.randn(*M_UNIT, generator=g, dtype=torch.float32).cuda()
-    m2 = torch.randn(*M_UNIT, generator=g, dtype=torch.float32).cuda()
+    m1 = torch.randn(*M_UNIT, generator=g, dtype=torch.float32).to(DEVICE)
+    m2 = torch.randn(*M_UNIT, generator=g, dtype=torch.float32).to(DEVICE)
     cache.update_m1(m1)
     cache.update_m2(m2)
     snap = hooks.capture()
@@ -425,7 +426,7 @@ def test_m1_m2_read_at_capture_time():
     # read at CAPTURE time: an m1 rewrite between forwards is picked up
     # by the next capture without any hook re-firing
     g2 = torch.Generator().manual_seed(779)
-    cache.update_m1(torch.randn(*M_UNIT, generator=g2, dtype=torch.float32).cuda())
+    cache.update_m1(torch.randn(*M_UNIT, generator=g2, dtype=torch.float32).to(DEVICE))
     snap2 = hooks.capture()
     assert snap2.m1_codes is cache.m1_codes
     assert snap2.m1_codes is not snap.m1_codes
@@ -469,7 +470,7 @@ def test_bind_and_capture_loud_validation():
 
     # attach: not a stack at all
     with pytest.raises(TypeError):
-        hooks.attach(torch.zeros(3))
+        hooks.attach(torch.zeros(3, device=DEVICE))
 
     # bind: cache plan disagrees with the hook map
     cache4 = TQCache(layer_types=[LIN, FULL, LIN, FULL])
@@ -499,7 +500,7 @@ def test_attach_idempotent_no_duplicate_hooks():
     hooks.attach(model)
     hooks.attach(model)
     with torch.no_grad():
-        model(torch.zeros(1))
+        model(torch.zeros(1, device=DEVICE))
     assert hooks.fired_counts == {i: 1 for i in range(9)}
     snap = hooks.capture()
     assert sorted(snap.s_codes) == LINEAR_IDX
@@ -537,7 +538,6 @@ def test_refire_latest_wins():
 def test_real_model_integration():
     import modeling  # the vendored Qwen3.5 (src/scripts, conftest-anchored)
 
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     plan = [LIN, FULL, LIN, FULL]
     cfg = Qwen3_5TextConfig(
@@ -546,7 +546,7 @@ def test_real_model_integration():
         linear_key_head_dim=16, linear_value_head_dim=16,
         linear_conv_kernel_dim=4, use_m1m2=True, m1m2_mem_size=8)
     torch.manual_seed(21)
-    m = modeling.Qwen3_5TextModel(cfg).eval().cuda().to(DEVICE)
+    m = modeling.Qwen3_5TextModel(cfg).eval().to(DEVICE)
 
     cache = TQCache(config=cfg)
     hooks = CaptureHooks(plan)

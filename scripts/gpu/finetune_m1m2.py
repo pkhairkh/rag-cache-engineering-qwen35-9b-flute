@@ -105,9 +105,16 @@ def main() -> int:
     ap.add_argument("--gates-out", default="m1m2_gates.npz",
                     help="output .npz (save_gates artifact)")
     ap.add_argument("--m1m2-mem-size", type=int, default=1024,
-                    help="the memories' slot count (spec default 128; the "
-                         "handover's retrieval experiments: 1024/4096/8192; "
-                         "ingest+query must use the SAME value)")
+                    help="the memories' slot count — the architecture's "
+                         "band is [1024, 4096] (two GLOBAL states, "
+                         "shared across all 24 linear layers; the gates "
+                         "are per-layer); ingest+query must use the SAME "
+                         "value")
+    ap.add_argument("--no-memopt", action="store_true",
+                    help="A/B: the W17 plain autograd replay chain (retains "
+                         "the 24 boundary states per side — the A10G OOM "
+                         "path; the default is the W18 exact-gradient "
+                         "memory-safe replay)")
     ap.add_argument("--no-m1m2", action="store_true",
                     help="load without the wiring (the W16-exact A/B)")
     ap.add_argument("--bits", type=float, default=3.5)
@@ -131,6 +138,15 @@ def main() -> int:
     print("=" * 60)
     print("RAGGA M1/M2 GATE FINE-TUNE (scripts/gpu/finetune_m1m2.py)")
     print("=" * 60)
+
+    # the architecture's band: two GLOBAL memories shared across all 24
+    # linear layers (the handover's contract) — outside it is a loud
+    # refusal, never a silent geometry change
+    if not 1024 <= args.m1m2_mem_size <= 4096:
+        raise SystemExit(
+            f"--m1m2-mem-size {args.m1m2_mem_size} is outside the "
+            f"architecture's band [1024, 4096] (two global memories, "
+            f"shared across the 24 linear layers) — refuse")
 
     print(f"\n[1] Loading model (m1m2_mem_size={args.m1m2_mem_size})...")
     model, _ = load_model(args.artifacts_dir, args.heads_dir,
@@ -183,7 +199,14 @@ def main() -> int:
     cfg = GatesTrainConfig(
         lr=args.lr, tau=args.tau, max_steps=args.max_steps,
         batch_pairs=args.batch_pairs,
-        freeze_read_gate=not args.train_read_gate)
+        freeze_read_gate=not args.train_read_gate,
+        memopt=False if args.no_memopt else None)
+    if args.no_memopt:
+        print("    [A/B] plain autograd replay (the W17 OOM path) — "
+              "boundary states retained")
+    else:
+        print("    [W18] exact-gradient memory-safe replay "
+              "(O(state + k/v), no boundary-state chain)")
 
     def cache_factory():
         return TQCache(config=model.config, bits=args.bits, online=True)

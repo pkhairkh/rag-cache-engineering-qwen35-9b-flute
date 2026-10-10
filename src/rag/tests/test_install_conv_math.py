@@ -50,6 +50,7 @@ from transformers.models.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from ingest import SystemState, reseed_cache, ingest_chunk
 from install import install_snapshot
 from tq_cache import TQCache
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # every (b, d) here resolves against committed codebooks (no npz writes):
 # cb_b{3,4}_d2048.npz (S) and cb_b{3,4}_d768.npz (conv).
@@ -77,7 +78,7 @@ def _rel_mse(a, b) -> float:
 
 def _tokens(n: int, seed: int) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
-    return torch.randint(0, VOCAB, (B, n), generator=g).cuda()
+    return torch.randint(0, VOCAB, (B, n), generator=g).to(DEVICE)
 
 
 def _config() -> Qwen3_5Config:
@@ -105,7 +106,7 @@ class _ResidualGDNStack(torch.nn.Module):
         for m in self.modules():
             for p in m.parameters():
                 if p.dim() > 1:
-                    p.data = torch.randn(p.shape, generator=g).cuda() * 0.1
+                    p.data = torch.randn(p.shape, generator=g).to(DEVICE) * 0.1
                 else:
                     p.data.fill_(1.0)
         for lyr in self.gdn:
@@ -132,7 +133,7 @@ def _raw_state_cache(model, cfg, s, c) -> DynamicCache:
     geometry), then the states are loaded in place."""
     cache = DynamicCache(config=cfg)
     with torch.no_grad():
-        model(input_ids=torch.zeros(B, 1, dtype=torch.long),
+        model(input_ids=torch.zeros(B, 1, dtype=torch.long, device=DEVICE),
               past_key_values=cache)
     for i in range(N_LAYERS):
         cache.layers[i].recurrent_states[0].copy_(s[i])
@@ -146,7 +147,7 @@ def rig():
     """The shared experiment state (deterministic)."""
     torch.manual_seed(SEED)
     cfg = _config()
-    model = _ResidualGDNStack(cfg, SEED).eval()
+    model = _ResidualGDNStack(cfg, SEED).eval().to(DEVICE)
     sys_ids, doc_ids = _tokens(N_SYS, 1), _tokens(N_DOC, 2)
     qry_ids, dec_ids = _tokens(N_QUERY, 3), _tokens(N_DECODE, 4)
 
