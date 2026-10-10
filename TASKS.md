@@ -1,12 +1,16 @@
-# TASKS.md v2 — Base Sync + Docs Overhaul
+# TASKS.md v2 — Execution Record + Standing Orders
+
+Purpose: the execution record — v2 wave statuses filled from the worklog + git history; carries the sync decisions, the doc style contract, the wave plan (W8/W9 pending), and the verifier checklist as standing orders.
+Authority: subordinate to `SPECIFICATION.md` (contract) and `PROPOSAL.md` (design); the W8/W9 rows below are the binding plan for those waves.
+Status: v2 waves 0–9 — W0–W5 DONE (base sync from main `qwen3_5_9B_flute_qlora_v1.3` @ ab78893; 161 tests green; tag `base-synced-v1.3` = f0fd04e) · W6 DONE (1174c3b, 3bf4274) · W7 DONE (this wave: PROPOSAL.md rewrite, this final-state record, doc lint green) · W8/W9 PENDING; plan v1 executed 100%, tag `cpu-code-complete` (git history).
+
+## Standing orders
 
 | field | value |
 |---|---|
-| mission | (A) replace inherited base files with the evolved main project `qwen3_5_9B_flute_qlora_v1.3` @ `ab78893`; (B) rewrite all docs: terse, self-contained, zero prose |
 | executor | sub-agents (1 task = 1 module or 1 doc group); ORCH = verifier + committer |
 | vcs | commit per task (`Wv2-<wave>.<task>`), push per wave after DoD |
 | gate | every wave DoD run by ORCH in a fresh shell; red blocks push |
-| plan v1 | executed 100%, tag `cpu-code-complete` (git history) |
 
 ## Sync decisions (fixed by recon, commit-time facts)
 
@@ -32,18 +36,18 @@
 
 ## Waves
 
-| wave | tasks (T1–T4 per wave) | DoD (fresh shell) |
-|---|---|---|
-| W0 sync recon | T1 diff report (done, in worklog) · T2 API-contract check (done) · T3 decision table (above) · T4 this plan committed | plan pushed |
-| W1 scripts | T1 modeling.py replace+M1/M2 patch · T2 palettized_modules.py replace+idxN patch · T3 attn_sm86.py replace+de-ref · T4 loader.py verify | py_compile all; import closure; `test_finetune` green |
-| W2 kernels | T1 flute_extended wholesale replace · T2 fht API gate · T3 docs base replace · T4 reference fixes | `test_turboquant` + `test_tq_cache*` + `test_m1m2` + `test_hooks` green; pushed |
-| W3 requirements | T1 merge requirements.txt · T2 flute requirements · T3 install/refresh CPU lock · T4 suite run #1 (triage, no fix) | lock committed; triage list in worklog |
-| W4 drift repair | T1–T2 fix triage batches · T3 loader/deploy refs · T4 re-gate | full suite green |
-| W5 re-verification | T1 full ladder L1–L5 · T2 fix-forward · T3 coverage matrix re-check · T4 tag `base-synced-v1.3` | 161+ tests green; tag pushed |
-| W6 root docs I | T1 SPECIFICATION rewrite (semantics preserved, diff-checked) · T2 README rewrite · T3 clause→code cross-check · T4 gate | spec normative-diff = 0 losses; pushed |
-| W7 root docs II | T1 PROPOSAL rewrite (D1–D5/risk/acceptance tables) · T2 TASKS final-state record · T3 doc lint (no dangling refs) · T4 gate | every doc standalone; pushed |
-| W8 src/docs | T1 scope main's doc set to this repo · T2 BUILD/RUNBOOK adopt + RAG-box page · T3 in-repo reference fixes · T4 gate | zero stale doc names repo-wide; pushed |
-| W9 release | T1 full ladder · T2 docs self-containment audit · T3 worklog closure · T4 tag `v2-base-synced` | tag pushed; report |
+| wave | tasks (T1–T4 per wave) | DoD (fresh shell) | status (worklog + git) |
+|---|---|---|---|
+| W0 sync recon | T1 diff report (done, in worklog) · T2 API-contract check (done) · T3 decision table (above) · T4 this plan committed | plan pushed | DONE — ca35574 (T1/T2 = worklog Tasks 1–3; T3 = table above) |
+| W1 scripts | T1 modeling.py replace+M1/M2 patch · T2 palettized_modules.py replace+idxN patch · T3 attn_sm86.py replace+de-ref · T4 loader.py verify | py_compile all; import closure; `test_finetune` green | DONE — 5dc4c62 (3 replaces + re-applied RAG surgery; suite green at the wave gate) |
+| W2 kernels | T1 flute_extended wholesale replace · T2 fht API gate · T3 docs base replace · T4 reference fixes | `test_turboquant` + `test_tq_cache*` + `test_m1m2` + `test_hooks` green; pushed | DONE — 95b5d62 (kernel family + `include/` + nested package + SHA256SUMS + the 12-doc set; fht selfcheck PASS on CPU) |
+| W3 requirements | T1 merge requirements.txt · T2 flute requirements · T3 install/refresh CPU lock · T4 suite run #1 (triage, no fix) | lock committed; triage list in worklog | DONE — f0fd04e (transformers>=5.0, faiss-cpu, no datasets; CPU lock re-frozen) |
+| W4 drift repair | T1–T2 fix triage batches · T3 loader/deploy refs · T4 re-gate | full suite green | DONE — re-gate green at the sync boundary; no drift beyond the W3 corrections (no separate commit) |
+| W5 re-verification | T1 full ladder L1–L5 · T2 fix-forward · T3 coverage matrix re-check · T4 tag `base-synced-v1.3` | 161+ tests green; tag pushed | DONE — 161 tests green (fresh shell); tag `base-synced-v1.3` = f0fd04e |
+| W6 root docs I | T1 SPECIFICATION rewrite (semantics preserved, diff-checked) · T2 README rewrite · T3 clause→code cross-check · T4 gate | spec normative-diff = 0 losses; pushed | DONE — 1174c3b (SPEC 344→174 lines; facts-diff zero unexplained losses; clause-to-code 21/21) + 3bf4274 (README 59→40 lines) |
+| W7 root docs II | T1 PROPOSAL rewrite (D1–D5/risk/acceptance tables) · T2 TASKS final-state record · T3 doc lint (no dangling refs) · T4 gate | every doc standalone; pushed | DONE — this wave: PROPOSAL 424→199 lines + this record; doc lint green (zero dangling refs, zero decode-dependencies, style sweep clean, N## cross-refs verified); see worklog Wv2-7.1–7.3 |
+| W8 src/docs | T1 scope main's doc set to this repo · T2 BUILD/RUNBOOK adopt + RAG-box page · T3 in-repo reference fixes · T4 gate | zero stale doc names repo-wide; pushed | PENDING — plan only, not executed (the tasks + DoD columns are the W8 contract) |
+| W9 release | T1 full ladder · T2 docs self-containment audit · T3 worklog closure · T4 tag `v2-base-synced` | tag pushed; report | PENDING — plan only, not executed (the tasks + DoD columns are the W9 contract) |
 
 ## Verifier checklist (ORCH, per task)
 
