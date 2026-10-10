@@ -14,7 +14,7 @@ Two execution paths:
     flute_extended/idxN.py (loaded standalone, no CUDA extension
     needed), used by CPU debugging. The reference path
     is mathematically identical to the kernel's dequantization (same LUT
-    gather, DEQUANT_SPEC sections 3 and 8).
+    gather, src/docs/QUANTIZATION.md sections 3 and 4).
 
 Residual branch (LQER serving form):
     y = qgemm_idx4(x) + (x B^T) A^T
@@ -73,7 +73,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 # --------------------------------------------------------------------------- #
 # Standalone idxN producer (no CUDA extension import; safe on CPU-only
-# machines). idx4.py was removed in the unification — idxN.py is the sole
+# machines). The idx4.py twin was removed in the unification (main
+# project — not part of this repo); idxN.py is the sole
 # producer (pack_idxn(·, 4) is byte-identical to the legacy pack_idx4,
 # asserted by its self_test) — so every 4-bit unpack goes through it too.
 # --------------------------------------------------------------------------- #
@@ -126,8 +127,8 @@ def reference_dequant(indices_blob, lut, N: int, K: int, group_size: int,
     """CPU-reference dequantization: W[n, k] = LUT[n // gs, idx(n, k)].
 
     Returns an (N, K) fp32 tensor on `lut`'s device. Uses the canonical
-    unpackers, so it is exactly the kernel's semantics (DEQUANT_SPEC
-    sections 2-8): LSB-first fields, the idxN tile permutation undone by
+    unpackers, so it is exactly the kernel's semantics (src/docs/QUANTIZATION.md
+    sections 2-4): LSB-first fields, the idxN tile permutation undone by
     idx4.unpack_idx4 (b=4) / idxN.unpack_idxn (b in 1..3).
 
     The unpack runs on CPU (numpy, canonical producer logic) but the
@@ -268,7 +269,7 @@ def _bits_of_artifact_name(index_file: str) -> int:
 
 def _lut_name_of(index_file):
     """The LUT file name paired with an idxN index file, following the
-    writer's naming convention (palettize_qwen3_5_9b.py::_lut_name_of,
+    writer's naming convention (main project: palettize_qwen3_5_9b.py::_lut_name_of,
     mirrored verbatim): '<san>.idx{b}' -> '<san>.lut_scalar',
     '<san>.idx{b}.<tag>' -> '<san>.lut_scalar.<tag>'."""
     if not index_file:
@@ -401,8 +402,8 @@ class PalettizedLinear(nn.Module):
     compensation. "rotate_then_awq" (the LEGACY producer order of the
     2026-10-04 box run: W' = (W @ T) diag(s)) does NOT: the deployed
     composition is x @ (D^-1 T D T^T) @ W^T — the root cause of the
-    bad-greedy-decode round (see scripts/diagnose_greedy_bug.py:
-    0.999 gates, garbage decode). The loader compensates EXACTLY by
+    bad-greedy-decode round (see scripts/diagnose_greedy_bug.py,
+    main project: 0.999 gates, garbage decode). The loader compensates EXACTLY by
     serving the input rotation M = D T D^-1 (scale -> FHT -> unscale)
     with the per-channel s recovered from norm_gain_edits.json; the
     per-layer cos gates stay honest because they measured Q vs W'
@@ -598,7 +599,7 @@ class PalettizedLinear(nn.Module):
         "rotate_then_awq" with a live awq_scale) get the compensated
         transform x @ (D T D^-1) = fht(x * s) / s — the exact inverse
         of the fold the legacy producer applied (proof:
-        scripts/diagnose_greedy_bug.py, claim 4). The compensation runs
+        main project: scripts/diagnose_greedy_bug.py, claim 4). The compensation runs
         in fp32 (the 1/s unscale can push small activations through
         fp16 subnormals).
 
@@ -871,6 +872,7 @@ class PalettizedLinear(nn.Module):
         qgemm_gemv_stream launch for the M == 1 decode shape — both
         streams, the rank-16 residual and the bias, no tensor cores (the
         whole-forward CUDA-graph replays of scripts/eval_greedy_match.py
+        (main project)
         are M == 1; the box report: 13.514 tok/s = 74.0 ms/token of
         GPU-side kernel time, the dual mma kernel ~12x above the code-
         stream memory floor at that shape).
@@ -894,7 +896,7 @@ class PalettizedLinear(nn.Module):
         # NOTE: no is_cuda gate here, deliberately — same rationale as
         # the dual route's note (the _C entry refuses loudly; keeping
         # the gate device-free keeps the routing unit-testable on CPU
-        # boxes, tests/test_gemv.py).
+        # boxes; main project: tests/test_gemv.py).
         b2 = self.bitwidth2 if self.has_stream2 else 0
 
         def _ok(t, *dtypes):
@@ -1163,7 +1165,7 @@ class PalettizedLinear(nn.Module):
         # _C.qgemm_dual_stream — the same "All tensors must be CUDA"
         # refusal the two-launch qgemm_per_group_lut path has always
         # given. Keeping the gate CUDA-free also keeps the routing
-        # unit-testable on CPU boxes (tests/test_dual_stream.py).
+        # unit-testable on CPU boxes (main project: tests/test_dual_stream.py).
         if xh.shape[0] > flute_extended.DUAL_STREAM_MAX_M:
             return None
         b2 = self.bitwidth2 if self.has_stream2 else 0
@@ -1405,8 +1407,8 @@ class SplitQKV(nn.Module):
     # the grouped decode route — the QKV merge.
     #
     # ONE qgemm_gemv_multi(_fht) launch replaces the three per-component
-    # M == 1 GEMV launches + the torch.cat (docs/A10G_DECODE_INVESTIGATION
-    # .md §12.4 item 1): the components share one input row, so the merged
+    # M == 1 GEMV launches + the torch.cat (main project:
+    # docs/A10G_DECODE_INVESTIGATION.md §12.4 item 1): the components share one input row, so the merged
     # grid stacks their fixed paths on the machine together (the
     # the latency-bound split-K GEMV's barriers hide behind each other) and the outputs
     # land STRAIGHT in one persistent [1, N_total] buffer — the cat and
@@ -1650,7 +1652,7 @@ class FusedPalettizedMLP(nn.Module):
     silu in fp32 on the folded partials and writes the product with ONE
     fp16 round — the act/mul elementwise kernels and one output write
     disappear, and the two modules' fixed paths stack on the machine
-    together; docs/A10G_DECODE_INVESTIGATION.md §12.4 item 2).
+    together; main project: docs/A10G_DECODE_INVESTIGATION.md §12.4 item 2).
 
     Every other shape, an un-fusable pair, FLUTE_NO_MERGE=1 or an older
     extension takes the ORIGINAL per-module chain below verbatim (a
@@ -1697,8 +1699,8 @@ class FusedPalettizedMLP(nn.Module):
             return None
         # NOTE: no is_cuda gate here, deliberately — same rationale as
         # the per-module _gemv_decode: the extension entry refuses
-        # loudly on CPU and the fake-surface unit tests (tests/
-        # test_gemv_merge.py) drive the wiring with CPU tensors.
+        # loudly on CPU and the fake-surface unit tests (main project:
+        # tests/test_gemv_merge.py) drive the wiring with CPU tensors.
         try:
             import flute_extended as fx
         except ImportError:
@@ -1942,7 +1944,7 @@ def _install_fused_mlp(model):
 
 def _unpack_logical_indices(blob, N: int, K: int, bits: int = 4) -> np.ndarray:
     """(N, K) uint8 logical indices from a packed idxN blob (LSB-first
-    through the canonical unpacker, DEQUANT_SPEC sections 2 and 8)."""
+    through the canonical unpacker, src/docs/QUANTIZATION.md sections 2 and 4)."""
     arr = np.ascontiguousarray(blob.detach().cpu().numpy() if torch.is_tensor(blob) else blob,
         dtype=np.uint8).reshape(-1)
     return _get_idxn().unpack_idxn(arr, N, K, int(bits))
@@ -2504,7 +2506,7 @@ def _read_stream2(meta: Dict, artifacts_dir: str, ctx: str, N: int, K: int,
     """Read + validate the SECOND member of a declared "streams" set
     (, Route A; single tensors and QKV components share this).
 
-    The writer's pinned entry schema (palettize_qwen3_5_9b.py::
+    The writer's pinned entry schema (main project: palettize_qwen3_5_9b.py::
     _stream_entry): {file, sha256, sha256_lut, n_groups, gs,
     derivation} — `file` is the stream-2 idxN blob name
     ("<san>.idx4.2" for hybrid422, "<san>.idx2.2" for a mixed 4,2
@@ -3001,7 +3003,7 @@ def replace_linear_with_palettized(model, metadata, artifacts_dir: str,
     if n_compensated:
         print(f"  [ROT] legacy rotate-then-AWQ fold order compensated on "
               f"{n_compensated} tensor group(s) — exact loader-side fix "
-              f"(M = D T D^-1; scripts/diagnose_greedy_bug.py claim 4)",
+              f"(M = D T D^-1; main project: scripts/diagnose_greedy_bug.py claim 4)",
               flush=True)
     # the stale-group_size aggregate (see _note_gs_mismatch — the
     # per-tensor lines are now first-only + count)
@@ -3029,7 +3031,7 @@ def apply_norm_gain_edits(model, artifacts_dir: str,
                           strict: bool = True) -> Dict:
     """Apply AWQ norm-gain edits (norm_gain_edits.json + norm_edits/*.npy).
 
-    Artifact contract (palettize_qwen3_5_9b.py::_write_norm_gain_edit): each
+    Artifact contract (main project: palettize_qwen3_5_9b.py::_write_norm_gain_edit): each
     .npy stores the complete edited RMSNorm gain parameter; it is copied
     into the named parameter (cast to that parameter's dtype/device) after
     from_pretrained and before swapping palettized modules. Idempotent —
@@ -3138,7 +3140,7 @@ def _recover_awq_scales(model, artifacts_dir: str, metadata: Dict,
     on every alpha>0 group (in_proj_qkv / in_proj_z / gate_proj /
     up_proj) that the per-layer cosine gates are blind to (both gate
     operands carry the same scrambler). Proof + numbers:
-    scripts/diagnose_greedy_bug.py.
+    main project: scripts/diagnose_greedy_bug.py.
 
     THE RECOVERY: the producer folded the inverse scale into the
     zero-centered RMSNorm gain exactly — w' = (1 + w)/s - 1 — and the
@@ -3268,7 +3270,8 @@ def load_palettized_model(artifacts_dir: str, model_name: str,
                           heads_dir: Optional[str] = None):
     """Load the base model and swap in the idx4 artifacts.
 
-    Shared by the evaluators (eval_greedy_match, eval_ppl) and reusable by
+    Shared by the evaluators (main project: eval_greedy_match, eval_ppl)
+    and reusable by
     the capture/energy harnesses.
 
     Applies norm_gain_edits.json (when present) between from_pretrained and

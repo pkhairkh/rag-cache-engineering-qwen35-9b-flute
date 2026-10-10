@@ -36,11 +36,11 @@ namespace {
 
 // split-K GEMV — flute_kernel_gemv_splitk (entries qgemm_cutlass_gemv_splitk_stream
 // and qgemm_cutlass_gemv_splitk_fht_stream). The box probe
-// (scripts/probe_decode_routing.py) measured the plain-GEMV GEMV at ~90-110
+// (main project: scripts/probe_decode_routing.py) measured the plain-GEMV GEMV at ~90-110
 // GB/s effective — 5-6.5x below the A10G's 600 GB/s wall (aggregate
 // module-GEMM 52.57 ms/token for 5.38 GiB => 109.9 GB/s; the route split:
 // dual_stream 31.17 ms / two_launch 17.31 ms / w28 4.09 ms). Three structural
-// causes (docs/A10G_DECODE_INVESTIGATION.md section 4):
+// causes (main project: docs/A10G_DECODE_INVESTIGATION.md section 4):
 //   (1) grid = N/128 CTAs with NO K-split — k/v_proj run 8 CTAs on 80 SMs;
 //   (2) no prefetch — one g-tile of code loads in flight per warp, the
 //       ~600-900 ns DRAM stall is exposed 8-10 warps/SM deep;

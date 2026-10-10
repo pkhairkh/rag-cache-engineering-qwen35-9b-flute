@@ -49,7 +49,8 @@ def load_palettized_weight(weight_name: str, model_dir: Path):
 
 def dequantize_reference(blob: torch.Tensor, lut: torch.Tensor,
                          dense_shape, group_size: int) -> torch.Tensor:
-    """Reference dequantization (docs/DEQUANT_SPEC.md sections 2-6).
+    """Reference dequantization (src/docs/QUANTIZATION.md
+    sections 1-4, 8).
 
     The on-disk blob is unpacked back to the logical packed matrix with
     flute_extended.idx4.unpack_idx4 first; groups run along N:

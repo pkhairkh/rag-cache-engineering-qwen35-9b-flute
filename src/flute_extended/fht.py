@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """fht.py — Fast Hadamard Transform: the boundary-fold rotation, in O(K log K).
 
-FLUTE Extension (EXTENSION_REQUIREMENT.md). This module replaces the
+FLUTE Extension (EXTENSION_REQUIREMENT.md, main project — not part of
+this repo). This module replaces the
 explicit K x K rotation-matrix multiply of the Hadamard boundary fold
 
     x_rot = x @ T,     T = blockdiag_b( H_b @ diag(s_b) / sqrt(b) )
@@ -106,7 +107,8 @@ def rotation_signs(K: int, seed: int) -> torch.Tensor:
 
     Deterministic in (K, seed); bitwise-identical to the palettizer's
     `s = randint(0, 2, (K,), generator=manual_seed(seed + 4242)) * 2 - 1`
-    (palettize_qwen3_5_9b.py::_rot_matrix and the loader twin). Storage:
+    (main project: palettize_qwen3_5_9b.py::_rot_matrix and the loader
+twin). Storage:
     (K,) float32 — ~16 KB at K=4096 instead of the ~64 MB K x K matrix.
     """
     g = torch.Generator().manual_seed(int(seed) + 4242)

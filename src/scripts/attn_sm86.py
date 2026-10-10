@@ -3,7 +3,8 @@
 Full-attention student layers get a Triton flash-attention kernel at the
 model geometry, where torch SDPA dispatches to the math backend and
 materializes (B, H, S, S) fp32 scores. The teacher stays on torch SDPA.
-Design of record: reports/design_attn_sm86.md.
+Design of record: reports/design_attn_sm86.md (main project — not
+part of this repo).
 
 Public surface:
   - kernel_available -> (bool, reason): the guard callers must check
@@ -130,7 +131,7 @@ def _check_qkv(ctx, q, k, v, out=None, grad_out=None, lse=None):
     if grad_out is not None:
         d_parts.append(f"grad_out D={D_g}")
     assert D == 256, (f"{ctx}: design geometry is D=256 "
-        f"(reports/design_attn_sm86.md); got " + ", ".join(d_parts))
+        f"(src/docs/MODEL_GEOMETRY.md); got " + ", ".join(d_parts))
     assert H % H_kv == 0 and H_kv_v == H_kv, (f"{ctx}: GQA requires H % H_kv == 0 and k/v "
         f"to share H_kv; got H={H}, H_kv={H_kv} (k), H_kv={H_kv_v} (v); "
         f"shapes q {tuple(q.shape)}, k {tuple(k.shape)}, "
@@ -998,7 +999,7 @@ class Sm86AttentionFn(torch.autograd.Function):
                         f"(shape {tuple(grad.shape)}; q {tuple(q.shape)}, "
                         f"k {tuple(k.shape)}, v {tuple(v.shape)}, dtype "
                         f"{q.dtype}, sm_scale={sm_scale}); see "
-                        f"reports/design_attn_sm86.md — FLUTE_ATTN_DEBUG_NAN")
+                        f"src/docs/MODEL_GEOMETRY.md — FLUTE_ATTN_DEBUG_NAN")
 
         return dq, dk, dv, None
 
@@ -1042,7 +1043,7 @@ def flute_sm86_attention(q, k, v, sm_scale):
         f"share H_kv; got q {tuple(q.shape)}, k {tuple(k.shape)}, "
         f"v {tuple(v.shape)}")
     assert D == 256, (f"flute_sm86_attention: design geometry is D=256 "
-        f"(reports/design_attn_sm86.md); got q D={D}, k D={D_k}, "
+        f"(src/docs/MODEL_GEOMETRY.md); got q D={D}, k D={D_k}, "
         f"v D={D_v}")
     assert H % H_kv == 0, (f"flute_sm86_attention: GQA requires H % H_kv == 0; got H={H}, "
         f"H_kv={H_kv} (q {tuple(q.shape)}, k {tuple(k.shape)}, "

@@ -26,7 +26,7 @@ indices_layout:
     "idxN" (N in {1,2,3,4}, written "idx1"/"idx2"/"idx3"/"idx4"):
              the canonical on-disk artifact layout family — a flat tensor
              of N*K*b/8 bytes produced by flute_extended.idxN.pack_idxN
-             (see docs/DEQUANT_SPEC.md section 8 and
+             (see src/docs/QUANTIZATION.md section 4 and
              flute_extended/idxN.py). The kernel dequantizes straight
              into MMA registers. Requires N % 128 == 0 and K % 64 == 0 —
              the packer refuses other shapes and the kernel rejects the
@@ -867,7 +867,7 @@ def qgemm_gemv_splitk_stream(
 # =========================================================================
 # The multi kernel merges 2-4 SAME-SPEC modules that share one input row
 # into ONE split-K launch over the concatenated tile space (the # fixed-path amortization — see kernel_streaming.cu's  header
-# and docs/A10G_DECODE_INVESTIGATION.md §12.4 item 1). The Python side
+# and main project: docs/A10G_DECODE_INVESTIGATION.md §12.4 item 1). The Python side
 # owns: the spec-equality gate, the per-segment contract mirrors, the
 # persistent output buffers (the C pointers must be stable so the
 # segment table stays valid across CUDA-graph replays — every row is

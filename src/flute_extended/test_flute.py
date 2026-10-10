@@ -96,7 +96,8 @@ QWEN_LAYERS = {
     "attn_out":   dict(N=4096,  K=4096, group_size=64),
 }
 
-# the kernel's full GS support set (scripts/HANDOVER.md issue 1).
+# the kernel's full GS support set (main project: scripts/HANDOVER.md
+# issue 1).
 GS_ALL = (16, 32, 64, 128, 256, 512)
 
 

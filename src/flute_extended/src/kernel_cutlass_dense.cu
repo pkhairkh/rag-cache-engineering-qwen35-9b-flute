@@ -247,7 +247,7 @@ torch::Tensor qgemm_cutlass_dense(torch::Tensor /*A*/,
     TORCH_CHECK(false,
         "CUTLASS dense kernel not built — rebuild with FLUTE_HAVE_CUTLASS "
         "defined and CUTLASS include path on the build line "
-        "(see DEPLOY.md). The production cutlass_streaming kernel does "
+        "(see src/docs/BUILD.md). The production cutlass_streaming kernel does "
         "NOT need CUTLASS and should still work.");
 }
 

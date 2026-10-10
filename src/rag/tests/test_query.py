@@ -48,7 +48,8 @@ Gates (all deterministic; plain asserts; dirs under pytest tmp):
       with a loader that has no .disk_dir, and with a retrieved id whose
       npz is not on disk, all raise ValueError with the culprit named.
 
-THE STUB (TopicStubModel, calibrated after the ORCH's smoke_query.py):
+THE STUB (TopicStubModel, calibrated after the ORCH's smoke_query.py —
+not in this repo):
   * Topic-marker S update (STRONG marker 6.0*topic_dir + LOW noise 0.05).
     On the real model this query/chunk separation is the §7 fine-tune's
     job; here it is baked in so the retrieval + answer gates test the

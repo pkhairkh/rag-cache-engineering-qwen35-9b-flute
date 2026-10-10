@@ -66,7 +66,8 @@ __device__ __forceinline__ int group_of(int n, int group_size) {
 }
 
 // ---------------------------------------------------------------------------
-// Sub-byte pair decode (idxN family: 1/2/3-bit, DEQUANT_SPEC section 8).
+// Sub-byte pair decode (idxN family: 1/2/3-bit, src/docs/QUANTIZATION.md
+// section 4).
 // The unit of consumption is the k-PAIR (k, k+1) with k even: two
 // consecutive values that dequantize into one mma.m16n8k16 B-fragment
 // u32 {W[k], W[k+1]} (low half = W[k]). In the LOGICAL LSB-first stream

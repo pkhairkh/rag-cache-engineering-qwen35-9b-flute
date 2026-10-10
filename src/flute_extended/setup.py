@@ -53,7 +53,8 @@ without it (the box's 30-min serial builds were exactly that).
 First build on the A10G: append -Xptxas -v to nvcc_flags temporarily and
 check the register count of the streaming kernels (~200-238 expected;
 ptxas must report 0 spills — the local compile verification
-script, scripts/compile_check.sh, asserts this on every TU).
+script, scripts/compile_check.sh (main project), asserts this on
+ every TU).
 """
 
 import os

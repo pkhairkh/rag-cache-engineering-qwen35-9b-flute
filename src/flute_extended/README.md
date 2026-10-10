@@ -92,7 +92,7 @@ src/                kernel TUs (one ninja job per family):
                     kernel_debug_simple.cu differential twin
                     kernel_cutlass_dense.cu CUTLASS baseline
                     bindings.cpp, gemv_host.cpp
-flute_extended/     Python package: API wrapper, idxN.py, idx4.py
+flute_extended/     Python package: API wrapper, idxN.py, idx4.py (main project)
 tools/              ncu_profile.sh, lock_clocks.sh
 benchmark_kernel.py box benchmark (prefill + decode sweeps)
 test_flute.py       GPU multi-backend + differential gates

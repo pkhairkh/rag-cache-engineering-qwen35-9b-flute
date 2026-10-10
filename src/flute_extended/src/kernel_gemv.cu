@@ -39,7 +39,8 @@ namespace {
 // qgemm_cutlass_gemv_stream). ONE memory-bound launch computes
 //     C[1, N] = A @ W1^T  (+ A @ W2^T)  +  (A @ resB^T) @ resA^T  +  bias
 // for the DECODE shape (M == 1) — the shape the whole-forward CUDA-graph
-// replays of scripts/eval_greedy_match.py dominate with (the box
+// replays of scripts/eval_greedy_match.py (main project) dominate
+// with (the box
 // report: both arms decode_backend "graphs", 13.514 tok/s = 74.0 ms/token
 // of GPU-side kernel time; the dual mma kernel above is ~12x above the
 // code-stream memory floor at that shape).

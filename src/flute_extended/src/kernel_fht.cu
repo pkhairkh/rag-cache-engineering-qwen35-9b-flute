@@ -2,7 +2,8 @@
  * src/kernel_fht.cu
  *
  * FLUTE Extension: the Fast Hadamard Transform kernel (see
- * include/flute/fht.cuh for the math contract and EXTENSION_REQUIREMENT.md
+ * include/flute/fht.cuh for the math contract and
+ * EXTENSION_REQUIREMENT.md (main project — not part of this repo)
  * for the requirement).
  *
  * Entry points (bound in src/bindings.cpp):
@@ -29,7 +30,8 @@
  * is safe because a segment is fully staged into shared memory before
  * any of its columns are written back.
  *
- * Resource accounting (sm_86, docs/PTX_NOTES.md section 1 — the * checklist):
+ * Resource accounting (sm_86, main project: docs/PTX_NOTES.md
+ * section 1 — the * checklist):
  *   * one CUDA block per row (grid.x = M), THREADS in {128..1024}
  *     chosen from the largest segment (>= 4 elements per thread);
  *   * dynamic smem = 4 * b_max bytes: 16 KiB (K=4096), 32 KiB

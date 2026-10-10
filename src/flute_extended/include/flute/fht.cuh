@@ -3,7 +3,8 @@
  *
  * Fast Walsh-Hadamard Transform (FHT) device primitives.
  *
- * FLUTE Extension (EXTENSION_REQUIREMENT.md): replace the explicit K x K
+ * FLUTE Extension (EXTENSION_REQUIREMENT.md, main project — not part of
+ * this repo): replace the explicit K x K
  * rotation-matrix multiply of the Hadamard boundary fold
  *
  *     x_rot = x @ T,      T = blockdiag_b( H_b diag(s_b) / sqrt(b) )
@@ -34,7 +35,7 @@
  *
  * which reproduces the Sylvester-constructed H_b EXACTLY (same row
  * order — verified bit-level against hadamard(b) matmul in
- * tests/test_fht.py).
+ * tests/test_fht.py (main project)).
  *
  * Storage layout: one row of x per CUDA block; the active segment is
  * staged in dynamic shared memory as fp32 (requirement: "FP16
@@ -43,7 +44,8 @@
  * inside the kernel; each segment's butterfly is independent (the
  * off-diagonal blocks of T are zero).
  *
- * sm_86 budget (docs/PTX_NOTES.md section 1): dynamic smem is
+ * sm_86 budget (docs/PTX_NOTES.md section 1, main project — not part
+ * of this repo): dynamic smem is
  * 4 * b_max bytes (16 KiB at K=4096, 32 KiB at the K=12288 8192-segment
  * — under the 48 KiB static-equivalent default; a > 48 KiB segment
  * opts in via cudaFuncSetAttribute at launch time). THREADS in
@@ -62,7 +64,8 @@ namespace flute {
 // All THREADS threads of the block cooperate; each thread takes pair
 // indices p = tid, tid + THREADS, ... (pair p = group g = p >> sh, offset
 // o = p & (len-1), elements (2*g*len + o, 2*g*len + o + len)). The stage
-// is indexed by STAGE SHIFT sh (len = 1 << sh) rather than len: the // re-read of the split-K GEMV critical path (docs/A10G_DECODE_INVESTIGATION.md
+// is indexed by STAGE SHIFT sh (len = 1 << sh) rather than len: the // re-read of the split-K GEMV critical path (main project:
+// docs/A10G_DECODE_INVESTIGATION.md
 // §12.3) found the runtime `p / len` and `p - g*len` compile to a full
 // integer division + remainder (~20 SASS instructions each pair-visit on
 // sm_86) because the compiler cannot prove len is a power of two — a
@@ -75,8 +78,8 @@ namespace flute {
 // Bank behaviour: stage len=1 pairs read (2t, 2t+1) — stride-2 words,
 // 2-way conflict on the even/odd halves; every other stage is
 // conflict-free or 2-way. At 12 stages per K=4096 row this is noise
-// (the kernel is launch-latency bound at decode batch sizes; see
-// docs/FHT.md benchmarks).
+// (the kernel is launch-latency bound at decode batch sizes; see the
+// FHT benchmarks in src/docs/KERNELS.md section 5).
 // ---------------------------------------------------------------------------
 template <int THREADS>
 __device__ __forceinline__ void fht_stage_sh(float* __restrict__ s, int b,

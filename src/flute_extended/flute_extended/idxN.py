@@ -14,12 +14,12 @@ registers with no shared-memory round trip.
 For every width the artifact is ``<name>.idx{b}`` + ``<name>.lut_scalar``
 with ``2**b`` fp16 entries per group, and the dequantization semantics
 are unchanged: ``W[n, k] = LUT[n // group_size, idx[n, k]]`` (pure
-codebook lookup, DEQUANT_SPEC sections 3-4).
+codebook lookup, src/docs/QUANTIZATION.md sections 1, 3).
 
 Eligibility (all widths): ``N % 128 == 0`` and ``K % 64 == 0``. Anything
 else raises — there is no fallback layout and no silent remap.
 
-LOGICAL packing (generalizes DEQUANT_SPEC section 2, LSB-first):
+LOGICAL packing (generalizes src/docs/QUANTIZATION.md section 2, LSB-first):
 
 * b=4: two indices per byte (the classic nibble layout; the nibble pair
   is exactly one k-pair ``{W[k], W[k+1]}`` of one output row);
@@ -65,7 +65,8 @@ Paired-LUT dequant style per width (why the layout is shaped this way):
   field, one LDS + one field extraction per u32.
 
 This module is the ONLY producer of the family in the repository:
-scripts/palettize_qwen3_5_9b.py writes artifacts with it, the test
+scripts/palettize_qwen3_5_9b.py (main project) writes artifacts with
+it, the test
 suite synthesizes reference blobs with it, and loaders verify artifacts
 with it. This is now the sole implementation for all widths.
 4-bit producer (idxN defers to its contract at b=4 and is asserted
@@ -292,7 +293,7 @@ def unpack_idxn(blob: np.ndarray, N: int, K: int, bits: int) -> np.ndarray:
 
 def pack_idxn_from_packed(q: np.ndarray, bits: int) -> np.ndarray:
     """Pack a logical packed row stream [N, K*b/8] (LSB-first, the layout
-    DEQUANT_SPEC section 2 generalizes) into the idxN blob.
+    src/docs/QUANTIZATION.md section 2 generalizes) into the idxN blob.
 
     Kept for parity with idx4.pack_idx4_from_packed: the logical stream is
     unpacked to indices and re-packed through the canonical path.
@@ -336,7 +337,7 @@ def self_test(shapes=((128, 64), (256, 128), (384, 192), (1024, 512)),
         _m = _ilu.module_from_spec(_spec)
         _spec.loader.exec_module(_m)
     except FileNotFoundError:
-        # idx4.py not co-located (packaged layout) — the equivalence is
+        # idx4.py not co-located (main project; packaged layout) — the equivalence is
         # still enforced by the repo test suite; skip here.
         _m = None
     if _m is not None:

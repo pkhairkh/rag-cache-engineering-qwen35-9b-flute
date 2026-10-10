@@ -187,7 +187,8 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
 # ---------------------------------------------------------------------------
 # the fla linear-attention wiring (the decode path only).
 #
-# The box audit (docs/A10G_DECODE_INVESTIGATION.md section 6) found
+# The box audit (main project: docs/A10G_DECODE_INVESTIGATION.md
+# section 6) found
 # the GDN decode running pure-torch fallbacks: the per-token recurrent
 # update (~8-10 small kernels on the [1, 32, 128, 128] state) and the
 # causal-conv update (cat + copy_ + F.conv1d with groups=8192) — ~35-45

@@ -2,7 +2,8 @@
  * src/kernel_streaming.cu
  *
  * The streaming/prefill GEMM family (Tensor Cores, SM_80+) and the * dual-stream fused decode kernel — extracted from the former kernel_streaming.cu monolith (6290 lines) into its own
- * translation unit. See docs/A10G_DECODE_INVESTIGATION.md section 14 for
+ * translation unit. See main project: docs/A10G_DECODE_INVESTIGATION.md
+ * section 14 for
  * the split map and the compile-time rationale (per-TU ninja jobs +
  * FLUTE_CUDA_ARCHES).
  *
@@ -104,7 +105,7 @@ struct TileConfig {
     static constexpr int SMEM_BYTES = (SA_ELEMS + SW_ELEMS) * 2 + LUT_WORDS * 4;
 
     // ---- fragment-direct path constants (E1+E2+E3) ------------------------
-    // Layout "idx4" (tools/repack_idx4.py): no sW, no smem Q, no
+    // Layout "idx4" (tools/repack_idx4.py, main project): no sW, no smem Q, no
     // B-operand ldmatrix. Shared memory = FD_STAGES A buffers (E3) + the
     // 256-entry byte-indexed paired LUT (E1, PLUT_WORDS u32). FD_WORDS =
     // u32 Q words per thread per K-tile (one 64-B chunk per 64-k group).
@@ -310,7 +311,8 @@ __device__ __forceinline__ void dequant_tile(const uint32_t (&q)[Cfg::QW],
 
 // ---------------------------------------------------------------------------
 // Fragment-direct path (E1+E2+E3) — requires the offline-repacked
-// "idx4" Q layout (tools/repack_idx4.py is the normative spec).
+// "idx4" Q layout (main project: tools/repack_idx4.py is the
+// normative spec).
 // ---------------------------------------------------------------------------
 // One packed byte = one B-fragment u32 of mma.m16n8k16 ({W[k], W[k+1]} of
 // one output row), and the repack permutes the .idx4 bytes so that every
