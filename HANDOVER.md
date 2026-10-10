@@ -1,77 +1,217 @@
 # RAGGA Handover Document
 
-## Current State (post-W11)
+## Current State (post-W12)
 
 | item | status |
 |---|---|
-| CPU suite | 175 tests green (`python3 -m pytest src/rag/tests -q`; CPU lock: torch 2.14.1+cpu, transformers 5.19.0, faiss-cpu 1.15.1) |
-| S-install math | ADJUDICATED CLEAN at real GDN fidelity (`src/rag/tests/test_install_real_math.py`): install ≈ ground truth 0.048 < 0.06; query-output tracking 0.019; contractivity 0.0014; reseed-vs-install separation 0.71 vs 0.019 |
-| conv geometry | FIXED: full-window policy, d = 24,576 (segments 16,384 + 8,192, every FHT tile ≤ 64 KiB) — the GPU session's 16,384 truncation (which zeroed the last 8,192 coordinates of every conv read: every ingestion delta, every installed window, every decode window ran on a one-third-blinded conv state) is gone, with a pinned regression test |
-| FHT dispatch | kernel auto-engages only for K it can tile (`fht._kernel_eligible`: multiple of 32, in [32, 65,504], every segment ≤ 16,384); K = 524,288 (S) and K ≥ 32,768 run the torch reference on-device — the 32,768-unit's 128 KiB single-segment tile no longer traps consumer GPUs |
-| GPU tools | consolidated under `scripts/gpu/` (see below); the 15 root-level scripts and the committed `query_output*.txt` are gone |
+| CPU suite | 175 tests green (`python3 -m pytest src/rag/tests -q`) |
+| conv geometry | FIXED: full-window policy, d = 24,576 (segments 16,384 + 8,192) |
+| ingestion | ✅ 100 chunks re-ingested with correct 24,576 conv geometry |
+| index | ✅ Flat IndexFlatIP built (100 < 256 threshold) |
+| verification | 5/6 stages pass |
+| **BLOCKER** | G5 (full install_snapshot) fails → garbage output |
 
-## The W11 Findings (what the "generation garbage after install" was)
+---
 
-1. The pushed GPU-session code (62a3e2a) TRUNCATED the 24,576-coordinate conv
-   window to 16,384 at `_init_conv` ("just truncate to 16384 elements for
-   now" + TODO) while its own edited tests expected 24,576 — 7 tests failed
-   on the pushed tree (the "165 tests passing" claim predates the truncation
-   edit). Every conv read returned the window with coordinates 16,384:24,576
-   (channels 4,096–6,143) ZEROED: ingestion deltas, chunk conv installs and
-   decode windows were all built on that blinded state. The answer prefill
-   consumes the installed (blinded) conv window at its boundary — that is
-   the pipeline's generation corruption.
-2. The S path is exonerated by construction: the install sum, the codes
-   setters, the read path and the quantizer identity are bit-clean
-   (test_install_real_math.py gate 1), the values the debug script verified
-   were correct, and the delta rule is CONTRACTIVE in the state (5% state
-   noise moves query outputs by 0.14%) — quantization-scale noise cannot
-   produce garbage. Any residual GPU-side corruption after the conv fix is
-   a kernel-route defect, not the math: run `bisect_install.py` (below).
-3. The handover's isolation table (layer-0-S-only install → garbage) could
-   not distinguish the conv corruption (present in BOTH its ✅ and ❌ rows —
-   the ✅ "immediate `<|im_end|>`" is itself the degraded mode) from the
-   state-scale difference; the fixed conv geometry removes the common
-   defect.
+## The W12 Finding: S-read DRIFT
 
-## REQUIRED GPU-Box Procedure (after pulling W11)
+### Bisection Results
 
-```bash
-cd /home/ubuntu/RAGGA && git pull
-
-# 1. RE-INGEST — the pre-W11 snapshots carry 16,384-truncated conv codes;
-#    installing them into a full-window layer raises the frame guard
-#    ("...must be RE-INGESTED") by design.
-python3 scripts/gpu/run_ingestion.py            # defaults: 100 docs, ingested_50k
-
-# 2. Index (flat IP under 256 chunks; IVFADC above)
-python3 scripts/gpu/run_index.py
-
-# 3. Staged verification ladder (G1 pure model → G6 e2e; conf/rep metrics)
-python3 scripts/gpu/verify_pipeline.py
-
-# 4. If any stage fails: bisect one axis at a time (install content ×
-#    kernel route), incl. the conv-tail dead-energy detector
-python3 scripts/gpu/bisect_install.py           # and/or: --fla-off
+```
+variant      S-read   conv-tail  gen   
+reseed       DRIFT    OK         OK    
+s-only       DRIFT    OK         OK    
+conv-only    DRIFT    OK         OK    
+full         DRIFT    OK         GARBAGE
 ```
 
-`--fla-off` sets `FLUTE_NO_FLA=1` (pure-torch decode kernels, bit-identical
-contract per modeling.py's wiring block) — the A/B that rules the FLA Triton
-decode route in or out of any residual corruption.
+**All variants show S-read DRIFT** (rel-MSE 7.66e-01 for reseed/conv-only, 1.47e-02 for s-only/full).
 
-## Tools (scripts/gpu/)
+### What This Means
 
-| script | purpose |
-|---|---|
-| `run_ingestion.py` | the §5 ingestion driver (argparse: corpus, n-docs, system prompt, bits, out-dir; resumable) |
-| `run_index.py` | flat IndexFlatIP under 256 chunks, IVFADC above |
-| `run_query.py` | the §6 flow: query prefill → vector → rerank → install → decode |
-| `verify_pipeline.py` | the G1–G6 generation ladder with confidence/repetition metrics (exit code = failures) |
-| `bisect_install.py` | install-content × kernel-route bisection: S-read drift check, conv-tail energy check, per-variant decode |
+> **S-read DRIFT => device/frame bug in the quant path**
 
-## Reference
+The S codes are not reading back correctly. When `dequant` is called on installed/seeded codes, the reconstructed values drift from expected.
 
-- Contract: `SPECIFICATION.md` (N16.1 = the conv full-window policy; §6 = the install math).
-- Design: `PROPOSAL.md` (D3 rotation frames, D4 delta protocol).
-- RAG-plane page: `src/docs/RAG_PIPELINE.md` (module map, run matrix, disk layout).
-- Execution record: `TASKS.md` (W10, W11 rows); narrative: the repo worklog.
+**Key observations:**
+1. `reseed` (just system, no install) shows DRIFT - the baseline is already broken
+2. `s-only` and `full` show LOWER drift (1.47e-02) vs `reseed` (7.66e-01) - installing S codes IMPROVES drift
+3. Conv-tail is OK - the W11 conv fix worked
+4. Only `full` produces garbage - the combination of S + conv triggers failure
+
+### Hypothesis
+
+The S quant path has a device mismatch or frame rotation bug:
+
+1. **Device mismatch**: Codes stored on CPU, dequant expects CUDA tensors
+2. **Frame rotation mismatch**: The D3 rotation seed differs between quant and dequant
+3. **Layer state not updated**: `set_s_codes` stores codes but doesn't propagate to layer computation
+
+The DRIFT in `reseed` suggests the system state itself has the bug - stored codes don't reconstruct correctly.
+
+---
+
+## Code Paths to Investigate
+
+### 1. Quant Path (`src/rag/turboquant.py`)
+
+```python
+class TurboQuant:
+    def quant(self, x: np.ndarray) -> TQCodes:
+        # Applies D3 rotation, quantizes to idx_lo/idx_hi
+        # Check: is rotation applied on CPU but expected on CUDA?
+    
+    def dequant(self, codes: TQCodes) -> torch.Tensor:
+        # Reconstructs from idx_lo/idx_hi
+        # Check: returns CPU or CUDA tensor?
+        # Check: does it apply inverse rotation correctly?
+```
+
+### 2. TQCache S-code Path (`src/rag/tq_cache.py`)
+
+```python
+def set_s_codes(self, layer_idx: int, codes: TQCodes) -> None:
+    # Stores codes for layer
+    # Check: does this update the layer's internal state?
+    # Check: is _device set correctly?
+
+def _ensure_s_layer(self, layer_idx: int) -> TQLinearAttentionLayer:
+    # Creates/gets layer
+    # Check: does layer have correct device/context?
+```
+
+### 3. Install Math (`src/rag/install.py`)
+
+```python
+def sum_turboquant_codes(system, deltas, kind, bits):
+    q = resolve_quantizer(kind, system.d, bits)
+    # Check: does resolve_quantizer return correct seed?
+    acc = q.dequant(system)
+    for d in deltas:
+        acc = acc + q.dequant(d)
+    return q.quant(acc)
+    # Check: is the returned TQCodes on correct device?
+```
+
+### 4. Resolve Quantizer (`src/rag/tq_cache.py`)
+
+```python
+def resolve_quantizer(kind: str, d: int, bits: float) -> TurboQuant:
+    # Returns a TurboQuant instance
+    # Check: is seed derived correctly for kind?
+    # Check: is device correct?
+```
+
+---
+
+## Specific Questions
+
+1. **Where is `resolve_quantizer` defined and what seed does it use?**
+   - The seed must match between quant and dequant
+   - Different seeds = different rotations = garbage reconstruction
+
+2. **Does `TurboQuant.dequant` return CPU or CUDA tensors?**
+   - If CPU, the forward pass may operate on wrong device
+   - Need to trace device through the entire path
+
+3. **What does `set_s_codes` actually do?**
+   - Does it just store codes in a dict?
+   - Does it propagate to the layer's computation state?
+   - Is there a `_device` field that needs setting?
+
+4. **Why does `reseed` (no install) show DRIFT?**
+   - The system state was created during fresh ingestion
+   - If re-reading system codes produces drift, the save/load path is broken
+
+---
+
+## GPU Tests to Run
+
+```bash
+# 1. Check S-code device/content
+python3 -c "
+from tq_cache import TQCache, resolve_quantizer
+from ingest import load_system_state
+import torch
+
+system = load_system_state('/home/ubuntu/RAGGA/disk/ingested_50k')
+s0 = system.s_codes[0]
+q = resolve_quantizer('S', s0.d, 3.5)
+dequant = q.dequant(s0)
+print(f'dequant device: {dequant.device}')
+print(f'dequant mean: {dequant.mean()}, std: {dequant.std()}')
+"
+
+# 2. Check if set_s_codes updates layer state
+python3 -c "
+from loader import load_quant_model
+from tq_cache import TQCache
+import torch
+
+model, _ = load_quant_model(
+    '/home/ubuntu/qwen3_5_9B_palettized',
+    'Qwen/Qwen3.5-9B',
+    device='cuda',
+    heads_dir='/home/ubuntu/qwen3_5_9B_palettized_heads'
+)
+cache = TQCache(config=model.config, bits=3.5, online=True)
+# Check internal state before/after set_s_codes
+"
+
+# 3. Run with --fla-off to test kernel route
+python3 scripts/gpu/bisect_install.py --fla-off
+```
+
+---
+
+## Files to Read (Priority Order)
+
+1. **`src/rag/tq_cache.py`** - `set_s_codes()`, `resolve_quantizer()`, layer management
+2. **`src/rag/turboquant.py`** - `TurboQuant.quant()`, `TurboQuant.dequant()`, device handling
+3. **`src/rag/install.py`** - `sum_turboquant_codes()`, seed validation
+4. **`src/rag/snapshot.py`** - How codes are saved/loaded (may affect device)
+5. **`src/rag/ingest.py`** - `reseed_cache()`, system state creation
+
+---
+
+## Verification Matrix
+
+| Stage | Description | Status |
+|-------|-------------|--------|
+| G1 | Pure model generation | ✅ PASS |
+| G2 | TQCache without install | ✅ PASS |
+| G3 | reseed(system) only | ✅ PASS |
+| G4 | S-only install | ✅ PASS |
+| G5 | Full install (S + conv) | ❌ FAIL |
+| G6 | answer_query e2e | ✅ PASS |
+
+**G5 is the blocker** - full install_snapshot produces garbage.
+
+---
+
+## Success Criteria
+
+The bug is fixed when:
+1. `bisect_install.py` shows S-read OK (no DRIFT)
+2. `verify_pipeline.py` shows 6/6 stages pass
+3. G5 produces coherent text or valid `<|im_end|>`
+
+---
+
+## Model Details
+
+- Qwen3.5-9B palettized
+- Located at `/home/ubuntu/qwen3_5_9B_palettized`
+- Heads at `/home/ubuntu/qwen3_5_9B_palettized_heads`
+- vocab_size: 248320
+- EOS token: `<|im_end|>` (id: 248046)
+
+---
+
+## Test Command
+
+```bash
+cd /home/ubuntu/RAGGA && python3 -m pytest src/rag/tests/ -q --tb=short
+```
+
+All 175 tests pass on CPU.
