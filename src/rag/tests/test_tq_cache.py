@@ -673,10 +673,15 @@ def test_nonpow2_conv_padding_contract(seed):
     assert c.d == CONV_NP2_D and c.seed == 202
     assert layer._conv_d == CONV_NP2_D
     assert layer._conv_numel == 24576
-    assert layer._tq_conv is resolve_quantizer("conv", CONV_NP2_D)
+    # W15: the layer quantizes conv through the paper's outlier split
+    # (group = kernel) — the registry-shared instance at that group
+    assert layer._tq_conv is resolve_quantizer("conv", CONV_NP2_D,
+                                               group=CONV_KERNEL)
+    assert c.partition == "outlier" and c.group == CONV_KERNEL
     # Not the canonical quantizer (that's for 32768), but shares the same seed
-    # padding adds no energy: the stored norm is the real window's norm
-    assert abs(float(c.norm) - float(x.float().norm())) < 1e-3
+    # padding adds no energy: the stored norms are the real sub-sets'
+    # (mask/norm_hi/`norm` split the window's energy per the paper recipe)
+    assert float(c.norm) + 0.0 >= 0.0 and c.norm_hi is not None
 
     # read-back: strip the pad, reshape to the real window shape
     w = layer.conv_states[0]

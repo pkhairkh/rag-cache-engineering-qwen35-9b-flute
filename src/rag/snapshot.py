@@ -125,10 +125,14 @@ _NPZ_EXT = ".npz"
 # pre-W9.2 to_arrays() surface) + the OPTIONAL W9.2 qjl sketch keys
 # (present only when the codes were quantized with qjl=True; a unit
 # carrying exactly ONE of the pair is a corruption signal, refused
-# loudly in _read_unit). Still derived from the dataclass so a REQUIRED
-# field change fails loudly here; the optional pair is carved out and
-# mirrored by hand.
-_OPTIONAL_CODE_FIELDS: tuple = ("qjl_signs", "gamma")
+# loudly in _read_unit) + the OPTIONAL W15 outlier-split keys
+# (group/mask/norm_hi — present IFF partition == "outlier"; the triple
+# is all-or-none, refused loudly when partial). Still derived from the
+# dataclass so a REQUIRED field change fails loudly here; the optional
+# sets are carved out and mirrored by hand.
+_OPTIONAL_CODE_FIELDS: tuple = ("qjl_signs", "gamma", "group", "mask",
+                                 "norm_hi")
+_SPLIT_CODE_FIELDS: tuple = ("group", "mask", "norm_hi")
 _CODE_FIELDS: tuple = tuple(f.name for f in _dc_fields(TQCodes)
                             if f.name not in _OPTIONAL_CODE_FIELDS)
 assert set(_OPTIONAL_CODE_FIELDS) <= {f.name for f in _dc_fields(TQCodes)}
@@ -270,6 +274,13 @@ def _unit_digest_bytes(tag: str, codes: TQCodes) -> bytes:
     if codes.qjl_signs is not None and codes.gamma is not None:
         out += np.ascontiguousarray(codes.qjl_signs, dtype=np.int8).tobytes()
         out += np.asarray(codes.gamma, dtype=np.float32).tobytes()
+    # W15: the outlier split's channel mask + second norm + group — a
+    # tampered mask must change the digest. "half" units (mask is None)
+    # digest BYTE-IDENTICALLY to the pre-W15 formula.
+    if codes.mask is not None:
+        out += np.ascontiguousarray(codes.mask, dtype=np.uint8).tobytes()
+        out += np.asarray(codes.norm_hi, dtype=np.float32).tobytes()
+        out += np.asarray(int(codes.group or 1), dtype=np.int64).tobytes()
     return out
 
 
@@ -594,7 +605,23 @@ def _read_unit(z: np.lib.npyio.NpzFile, prefix: str) -> TQCodes:
             f"load_chunk: unit '{label}' carries a PARTIAL QJL sketch — "
             f"{ql_key if has_q else gm_key} is present but "
             f"{gm_key if has_q else ql_key} is missing (corrupt npz?)")
+    # W15: the outlier-split triple (group/mask/norm_hi) — present IFF
+    # partition == "outlier" (all-or-none; a partial triple or a stray
+    # triple on a "half" unit is a corruption signal).
+    split_present = [f for f in _SPLIT_CODE_FIELDS
+                     if f"{prefix}{f}" in z.files]
     raw = {f: z[f"{prefix}{f}"] for f in _CODE_FIELDS}
+    part = str(np.asarray(raw["partition"]))
+    if part == "outlier":
+        if len(split_present) != len(_SPLIT_CODE_FIELDS):
+            raise ValueError(
+                f"load_chunk: unit '{label}' is partition=outlier but the "
+                f"split members {split_present} are incomplete (needs "
+                f"{list(_SPLIT_CODE_FIELDS)} — corrupt npz?)")
+    elif split_present:
+        raise ValueError(
+            f"load_chunk: unit '{label}' is partition={part!r} but carries "
+            f"stray split members {split_present} (corrupt npz?)")
     for f in ("idx_lo", "idx_hi"):
         a = np.asarray(raw[f])
         if a.dtype != np.uint8 or a.ndim != 1:
@@ -624,6 +651,27 @@ def _read_unit(z: np.lib.npyio.NpzFile, prefix: str) -> TQCodes:
                 f"scalar, got dtype={g.dtype}, size={g.size}")
         raw["qjl_signs"] = s
         raw["gamma"] = g
+    if part == "outlier":
+        m = np.asarray(z[f"{prefix}mask"])
+        if m.dtype != np.uint8 or m.ndim != 1:
+            raise ValueError(
+                f"load_chunk: unit '{label}' mask must be a 1-D uint8 "
+                f"packed channel mask, got dtype={m.dtype}, ndim={m.ndim}")
+        grp = np.asarray(z[f"{prefix}group"])
+        if grp.dtype != np.int64 or grp.size != 1 or int(grp) < 1:
+            raise ValueError(
+                f"load_chunk: unit '{label}' group must be a positive int "
+                f"scalar, got dtype={grp.dtype}, value={grp!r}")
+        if int(raw["d"]) % int(grp) != 0:
+            raise ValueError(
+                f"load_chunk: unit '{label}' d={int(raw['d'])} is not a "
+                f"multiple of group={int(grp)} (corrupt npz?)")
+        nhi = np.asarray(z[f"{prefix}norm_hi"])
+        if nhi.dtype != np.float32 or nhi.size != 1:
+            raise ValueError(
+                f"load_chunk: unit '{label}' norm_hi must be a single fp32 "
+                f"scalar, got dtype={nhi.dtype}, size={nhi.size}")
+        raw["group"], raw["mask"], raw["norm_hi"] = int(grp), m, nhi
     try:
         return TQCodes.from_arrays(raw)
     except Exception as e:

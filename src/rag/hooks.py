@@ -160,16 +160,29 @@ def hook_map(layer_types: Sequence[str]) -> List[CapturePoint]:
 def _codes_bits(codes: TQCodes) -> float:
     """The float bit-width a TQCodes unit was quantized at (uniform b ->
     b; split -> floor(x) + hi-set fraction), for resolving the kind's
-    quantizer at capture_vector time."""
+    quantizer at capture_vector time.
+
+    W15: for partition="outlier" units n_hi is the PADDED sub-unit size
+    (not the real hi-coordinate count), so the realized fraction is
+    recomputed from the channel mask (k = popcount, coords = k*group)."""
     if codes.bits_lo == codes.bits_hi:
         return float(codes.bits_lo)
+    if getattr(codes, "partition", "half") == "outlier" \
+            and codes.mask is not None and codes.group is not None:
+        # popcount over the packed channel mask (np.packbits zero-pads)
+        k = sum(bin(int(b)).count("1") for b in codes.mask)
+        return float(codes.bits_lo) + (k * int(codes.group) / codes.d)
     return float(codes.bits_lo) + (codes.n_hi / codes.d)
 
 
 def _dequant_codes(kind: str, codes: TQCodes) -> torch.Tensor:
     """Dequantize one unit through the KIND's quantizer (the D3-seeded
-    frame, at whatever scale the codes carry), fp32, shape (d,)."""
-    quantizer = resolve_quantizer(kind, codes.d, _codes_bits(codes))
+    frame, at whatever scale the codes carry), fp32, shape (d,).
+
+    W15: conv units quantized with the outlier split carry their group
+    on the codes — resolved from there (legacy "half" units: group=1)."""
+    group = int(codes.group) if getattr(codes, "group", None) is not None else 1
+    quantizer = resolve_quantizer(kind, codes.d, _codes_bits(codes), group=group)
     return quantizer.dequant(codes, dtype=torch.float32)
 
 

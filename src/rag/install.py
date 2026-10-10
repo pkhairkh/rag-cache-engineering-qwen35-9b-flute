@@ -32,13 +32,19 @@ __all__ = ["sum_turboquant_codes", "install_snapshot", "install_from_disk"]
 
 
 def sum_turboquant_codes(system: TQCodes, deltas: Iterable[TQCodes],
-                         kind: str, bits: float = 3.5) -> TQCodes:
+                         kind: str, bits: float = 3.5,
+                         qjl: bool = False) -> TQCodes:
     """dequant-sum-requant ONCE: quant(dequant(sys) + Σ dequant(deltas)).
 
     `kind` is the unit's kind ("S" | "M1" | "M2" — the caller knows it; the
     codes' own `.kind` may be "custom" at test scales but the SEED still
-    identifies the frame). Raises on frame drift (seed mismatch)."""
-    q = resolve_quantizer(kind, system.d, bits)
+    identifies the frame). Raises on frame drift (seed mismatch).
+
+    W15 `qjl`: when the cache runs the Alg.-2 A/B (TQCache(qjl=True)), the
+    requantized SUM re-attaches the residual sketch (the deltas' own
+    sketches are consumed by their dequants; the sum's fresh sketch
+    covers the sum's residual)."""
+    q = resolve_quantizer(kind, system.d, bits, qjl=qjl)
     if system.seed != q.seed:
         raise ValueError(
             f"sum_turboquant_codes({kind}): system codes seed {system.seed} "
@@ -75,32 +81,44 @@ def install_snapshot(cache: TQCache, system: SystemState,
       conv per layer:   the LAST retrieved chunk's codes, verbatim
 
     Returns a report {layer: {"mode": "sum"|"last"|"none", ...}} for the
-    evals ledger. The full-attn layers are untouched (spec §2.4)."""
+    evals ledger. The full-attn layers are untouched (spec §2.4).
+
+    W15: the requant inherits the CACHE's qjl A/B setting (the codes are
+    self-describing; a qjl cache requantizes the sum WITH the sketch so
+    the installed state keeps the Alg.-2 compensation)."""
     bits = system.bits
+    # the cache's Alg.-2 setting (any TQ linear layer's S quantizer; the
+    # default False is bit-identical to the pre-W15 install)
+    qjl = False
+    for l in cache.layers:
+        if isinstance(l, TQLinearAttentionLayer) and l._tq_s is not None:
+            qjl = bool(l._tq_s.qjl)
+            break
     report: dict = {}
     for L in sorted(system.s_codes):
         deltas = [s.s_codes[L] for s in retrieved
                   if L in s.s_codes and s.s_codes[L] is not None]
         summed = sum_turboquant_codes(system.s_codes[L], deltas,
-                                      kind="S", bits=bits)
+                                      kind="S", bits=bits, qjl=qjl)
         cache.set_s_codes(L, summed)
 
         conv = _last_conv(retrieved, L)
         if conv is not None:
             cache.set_conv_codes(L, conv)
-            report[L] = {"mode": "sum+last-conv", "n_deltas": len(deltas)}
+            report[L] = {"mode": "sum+last-conv", "n_deltas": len(deltas),
+                         "conv_partition": conv.partition}
         else:
             report[L] = {"mode": "sum", "n_deltas": len(deltas),
                          "conv": "system"}
     if system.m1_codes is not None:
         m1_deltas = [s.m1_codes for s in retrieved if s.m1_codes is not None]
         cache.m1_codes = sum_turboquant_codes(
-            system.m1_codes, m1_deltas, kind="M1", bits=bits)
+            system.m1_codes, m1_deltas, kind="M1", bits=bits, qjl=qjl)
         report["M1"] = {"mode": "sum", "n_deltas": len(m1_deltas)}
     if system.m2_codes is not None:
         m2_deltas = [s.m2_codes for s in retrieved if s.m2_codes is not None]
         cache.m2_codes = sum_turboquant_codes(
-            system.m2_codes, m2_deltas, kind="M2", bits=bits)
+            system.m2_codes, m2_deltas, kind="M2", bits=bits, qjl=qjl)
         report["M2"] = {"mode": "sum", "n_deltas": len(m2_deltas)}
     return report
 

@@ -35,15 +35,27 @@ M1/M2 slots (spec §2.2/§5): the two global memories are cache STATE —
 `update_m1/read_m1/m1_codes` (+ M2) quantize/dequantize with their own
 kinds and D3 seeds, exactly like S.
 
-Quantizer resolution: the production shapes hit the canonical kinds
-(S: 1×32×128×128 = 524,288; conv unit d = 32,768). A conv window whose
-flattened size is NOT a power of two (the Qwen3.5 in_proj Q+V geometry:
-1×6144×4 = 24,576) is zero-padded to the next power of two before the
-FHT — 24,576 → 32,768, the canonical conv d, so the D3 frame (seed 202)
-stays shared across geometries; dequant strips the pad (the stored norm
-is unchanged — zeros add no energy; SPECIFICATION §3.3). Smaller
-power-of-two shapes (tests) resolve to a custom-size quantizer that keeps
-the KIND's seed, so the D3 frame contract holds at every scale.
+Quantizer resolution: the production S shape hits the canonical kind
+(1×32×128×128 = 524,288). The conv unit resolves at the window's flat
+size rounded up to a multiple of 32 (the Qwen3.5 in_proj Q+V geometry:
+1×6144×4 = 24,576 — exactly a multiple) through the W11 full-window
+policy: no truncation, no power-of-two padding of the UNIT (the pow2
+pads live INSIDE the W15 split sub-units — see below). Custom sizes
+keep the KIND's seed (D3 frame contract at every scale).
+
+THE W15 OUTLIER SPLIT (the paper's §LongBench recipe, conv default):
+`_init_conv` resolves the conv quantizer with `group = kernel` — the
+window's (channel, tap) flat layout is one group per channel, and
+TurboQuant(group=kernel) quantizes the top-round(frac·n_ch) energy
+channels at bits_hi with their OWN power-of-two full rotation + norm
+(the paper: "two independent instances of TurboQuant"). The codes carry
+the channel mask / group / second norm and are SELF-DESCRIBING — the
+conv_codes setter and every generic reader (hooks, index, bisect)
+resolve from the codes' own group, and dequant routes on
+codes.partition, so pre-W15 partition="half" snapshots decode
+unchanged. Measured: ~3x lower conv write-path distortion than the
+legacy fixed coordinate split at the same effective bits (the W15 wave
+— see turboquant.py's module docstring).
 
 THE W9.2 `graph_safe` FLAG (P7 CUDA-graph capture hooks — DEFAULT OFF):
 TQCache(..., graph_safe=True) / TQLinearAttentionLayer(..., graph_safe=True)
@@ -112,7 +124,8 @@ def _conv_quant_dim(numel: int) -> int:
     return ((numel + 31) // 32) * 32
 
 
-def resolve_quantizer(kind: str, numel: int, bits: float = 3.5) -> TurboQuant:
+def resolve_quantizer(kind: str, numel: int, bits: float = 3.5,
+                       group: int = 1, qjl: bool = False) -> TurboQuant:
     """The quantizer for a kind at a given flattened size.
 
     Production sizes hit the canonical kinds (shared rotation per kind,
@@ -125,16 +138,30 @@ def resolve_quantizer(kind: str, numel: int, bits: float = 3.5) -> TurboQuant:
     can tile — fht._kernel_eligible: multiple of 32, every segment
     <= 16,384). The CALLING layer picks the d (the conv policy rounds
     the window up to a multiple of 32; S/M1/M2 use their canonical d).
+
+    W15 `group` (default 1): the paper's §LongBench outlier split for
+    channel-grouped units — the conv window's (channel, tap) layout, one
+    group per channel (group = the conv kernel width). group > 1 and
+    non-integer bits quantize the top-round(frac·n_ch) energy channels
+    at bits_hi with their own frame/norm (see TurboQuant). Codes are
+    self-describing: dequant routes on codes.partition, so a
+    split-configured quantizer still decodes legacy partition="half"
+    codes exactly (through the flat twin).
+
+    W9.2 `qjl` (default False): the Alg.-2 residual-sketch A/B flag,
+    plumbed through the cache stack (TQCache(qjl=...)) so the GPU box
+    can run the paper's two-stage estimator end-to-end.
     """
     if numel < 1:
         raise ValueError(f"resolve_quantizer({kind}): numel must be >= 1, got {numel}")
     canonical_d, seed = KINDS[kind]
-    if numel == canonical_d:
+    if numel == canonical_d and group == 1 and not qjl:
         return tq.get_quantizer(kind, bits)
-    key = f"{kind}:{bits}:{numel}"
+    key = f"{kind}:{bits}:{numel}:{group}:{int(qjl)}"
     reg = tq._REGISTRY
     if key not in reg:
-        reg[key] = TurboQuant(kind="custom", bits=bits, d=numel, seed=seed)
+        reg[key] = TurboQuant(kind="custom", bits=bits, d=numel, seed=seed,
+                               qjl=qjl, group=group)
     return reg[key]
 
 
@@ -199,13 +226,16 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
     """
 
     def __init__(self, number_of_states: int = 1, bits: float = 3.5,
-                 online: bool = True, graph_safe: bool = False):
+                 online: bool = True, graph_safe: bool = False,
+                 qjl: bool = False):
         super().__init__(number_of_states=number_of_states)
         self.bits = float(bits)
         self.online = bool(online)
         # W9.2 P7 flag (DEFAULT OFF — pure contract marker on CPU; see the
         # module docstring): carried on the layer, passed through by TQCache.
         self.graph_safe = bool(graph_safe)
+        # W15: the Alg.-2 qjl A/B flag, plumbed through (default OFF).
+        self.qjl = bool(qjl)
         self._tq_s: Optional[TurboQuant] = None
         self._tq_conv: Optional[TurboQuant] = None
         self._s_codes: Optional[TQCodes] = None
@@ -273,7 +303,7 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
 
     def _init_s(self, tensor: torch.Tensor, state_idx: int) -> None:
         n = tensor.numel()
-        self._tq_s = resolve_quantizer("S", n, self.bits)
+        self._tq_s = resolve_quantizer("S", n, self.bits, qjl=self.qjl)
         self._s_shape = tuple(tensor.shape)
         self._s_dtype = tensor.dtype
         if self._device is None:
@@ -296,7 +326,12 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         # CUDA kernel cannot tile: 128 KiB > the ~99 KiB consumer opt-in;
         # 24,576 segments as 16,384 + 8,192 — every tile fits 64 KiB).
         d = _conv_quant_dim(n)
-        self._tq_conv = resolve_quantizer("conv", d, self.bits)
+        # W15: the paper's outlier split — the conv window's flat layout is
+        # (channel, tap), so ONE GROUP per channel (group = kernel). The
+        # split routes through TurboQuant(group=kernel): top-k energy
+        # channels at bits_hi with their own frame/norm (class docstring).
+        self._tq_conv = resolve_quantizer("conv", d, self.bits,
+                                          group=kernel, qjl=self.qjl)
         self._conv_shape = tuple(window_shape)
         self._conv_numel = n
         self._conv_d = d
@@ -452,7 +487,12 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         self._conv_codes = codes
         if codes is not None:
             if not self.is_conv_states_initialized.get(0):
-                self._tq_conv = resolve_quantizer("conv", codes.d, self.bits)
+                # W15: the group comes from the CODES (self-describing):
+                # partition="outlier" units carry it; legacy "half" units
+                # are flat (group=1).
+                grp = int(codes.group) if codes.group is not None else 1
+                self._tq_conv = resolve_quantizer("conv", codes.d, self.bits,
+                                                  group=grp, qjl=self.qjl)
                 if self._conv_shape is None:
                     self._conv_shape = (codes.d,)  # flat until a real shape is known
                 # flat (d,) unit: numel == d until a forward/reseed teaches
@@ -541,12 +581,16 @@ class TQCache(DynamicCache):
 
     def __init__(self, config=None, layer_types: Optional[Iterable[str]] = None,
                  bits: float = 3.5, online: bool = True,
-                 graph_safe: bool = False):
+                 graph_safe: bool = False, qjl: bool = False):
         self._tq_bits = float(bits)
         self._online = bool(online)
         # W9.2 P7 flag (DEFAULT OFF) — passed through to every wrapped /
         # built TQLinearAttentionLayer; a no-op on CPU (module docstring).
         self._graph_safe = bool(graph_safe)
+        # W15: the paper's Alg.-2 qjl A/B flag, plumbed to every layer's
+        # quantizers (DEFAULT OFF — the D1 A/B contract; the GPU box's
+        # Phase-5 decision measures it end-to-end with TQCache(qjl=True)).
+        self._tq_qjl = bool(qjl)
         self._m1_codes: Optional[TQCodes] = None
         self._m2_codes: Optional[TQCodes] = None
         self._tq_m1: Optional[TurboQuant] = None
@@ -565,7 +609,7 @@ class TQCache(DynamicCache):
                 if lt == "linear_attention":
                     layers.append(TQLinearAttentionLayer(
                         bits=self._tq_bits, online=self._online,
-                        graph_safe=self._graph_safe))
+                        graph_safe=self._graph_safe, qjl=self._tq_qjl))
                 else:
                     cls = DYNAMIC_LAYER_TYPE_MAPPING.get(lt)
                     if cls is None:
@@ -585,7 +629,7 @@ class TQCache(DynamicCache):
                 self.layers[i] = TQLinearAttentionLayer(
                     number_of_states=layer.number_of_states,
                     bits=self._tq_bits, online=self._online,
-                    graph_safe=self._graph_safe)
+                    graph_safe=self._graph_safe, qjl=self._tq_qjl)
 
     def linear_layer_indices(self) -> List[int]:
         return [i for i, l in enumerate(self.layers)

@@ -91,6 +91,9 @@ def main() -> int:
     ap.add_argument("--bits", type=float, default=3.5)
     ap.add_argument("--fla-off", action="store_true",
                     help="FLUTE_NO_FLA=1 — pure-torch decode kernels")
+    ap.add_argument("--qjl", action="store_true",
+                    help="W15: the paper Alg.-2 A/B — TQCache(qjl=True) "
+                         "(the residual-sketch compensation, end-to-end)")
     args = ap.parse_args()
     if args.fla_off:
         os.environ["FLUTE_NO_FLA"] = "1"
@@ -116,7 +119,8 @@ def main() -> int:
                                    f"chunk_{args.chunk:05d}.npz"))
 
     def fresh_cache():
-        return TQCache(config=model.config, bits=args.bits, online=True)
+        return TQCache(config=model.config, bits=args.bits, online=True,
+                       qjl=args.qjl)
 
     # G1 — pure generation (no cache)
     print(f"\nG1  pure generation: {args.prompt!r}")

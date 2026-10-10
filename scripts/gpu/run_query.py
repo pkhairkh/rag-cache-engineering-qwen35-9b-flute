@@ -40,6 +40,8 @@ def main() -> int:
     ap.add_argument("--top-k", type=int, default=3)
     ap.add_argument("--max-new-tokens", type=int, default=128)
     ap.add_argument("--bits", type=float, default=3.5)
+    ap.add_argument("--qjl", action="store_true",
+                    help="W15: the paper Alg.-2 A/B — TQCache(qjl=True)")
     args = ap.parse_args()
 
     print("=" * 60)
@@ -70,7 +72,8 @@ def main() -> int:
                 questions.append(q.get("text", q.get("question", "")))
 
     def cache_factory():
-        return TQCache(config=model.config, bits=args.bits, online=True)
+        return TQCache(config=model.config, bits=args.bits, online=True,
+                       qjl=args.qjl)
 
     print(f"\n[4] Running {len(questions)} queries "
           f"(direct rerank over {len(chunks)} chunks)...")

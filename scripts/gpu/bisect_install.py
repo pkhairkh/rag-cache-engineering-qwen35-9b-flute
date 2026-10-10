@@ -21,52 +21,53 @@ src/rag/tests/test_install_real_math.py (the S install math) and
 test_install_conv_math.py (the S+conv COMBINATION through the real GDN
 forward — the gap the W12 matrix pointed at, now closed).
 
+W15 REVISION — the checks the matrix still lacked:
+
+  * frame (PURE): the old frame check's floor WAS the codebook noise
+    (~0.02 rel-MSE = the Lloyd-Max distortion itself) — a subtle
+    kernel/reference transform mismatch HIDES under it. The new pure
+    check compares the TRANSFORMS with no quantization in between:
+    (a) adjoint∘apply == identity (T is orthogonal — exact to fp32
+    rounding), (b) the CUDA kernel vs the torch reference output at the
+    production d's. Pass/fail at 1e-4, no noise floor.
+  * TRUE-dist (NEW): the write-path distortion the read checks CANNOT
+    see — the installed codes' dequant vs the RAW doc state the true-doc
+    control materializes (the W14 matrix compared reads against the
+    codes' own reference dequant, never against the truth). Printed
+    per-variant for S and conv with the W15 budgets.
+  * --qjl (NEW): the paper Alg.-2 A/B — TQCache(qjl=True) plumbs the
+    residual-sketch compensation through the whole flow (ingest-free:
+    the bisect quantizes live).
+
 Axes and checks:
 
   axis A — install content:  reseed / s-only / conv-only / full +
-                             true-doc (the raw semantic control, new)
+                             true-doc (the raw semantic control)
   axis B — kernel route:     FLA Triton kernels vs FLUTE_NO_FLA=1
                              (pure-torch decode, bit-identical contract)
+  axis C — W15 recipe:       --split-half (legacy fixed coordinate split)
+                             vs default (the paper's outlier split) —
+                             the conv write-path A/B
   checks —
     S-read   the layer-0 S state the model reads vs the CORRECT
              per-variant reference: dequant(sys) for reseed/conv-only
              (bit-clean, 1e-4), dequant(sys)+dequant(delta) for
              s-only/full (the single-requant budget, 0.06);
-    frame    the one GPU-only frame risk: quant() on a CUDA input takes
-             the FHT CUDA kernel (the conv window's 24,576 = 16,384 +
-             8,192 is kernel-eligible) while dequant() ALWAYS runs the
-             torch reference (numpy codebook lookup -> from_numpy ->
-             CPU butterfly, then .to(device)). A kernel/reference
-             transform mismatch would put the conv codes in a rotation
-             no read path can undo. The check quantizes a random tensor
-             ON DEVICE and dequantizes through the normal path: rel-MSE
-             at the Lloyd-Max level (~0.02) = frames consistent; ~1.0 =
-             frame split (the smoking gun);
+    frame    the PURE transform checks above (no codebook noise floor);
     conv     the cache-read conv window vs the direct reference dequant
              of the installed codes (read-path validation) + the dead
              tail detector (a zeroed 16,384:24,576 slice = stale
              pre-W11 snapshots — re-ingest);
-    gen      greedy decode conf/rep/text — now printed WITH the numbers
-             in the matrix (the W12 matrix's OK/GARBAGE hid them; a
-             0.21-vs-0.19 conf cliff and a 0.9-vs-0.01 cliff read very
-             differently);
-    true-doc the decisive SEMANTIC control for the G5 failure: prefill
-             [system + chunk tokens] on a RAW cache (no TQ anywhere),
-             drop the full-attn KV (DynamicLayer.reset — the G5
-             geometry: the linear state carries the document, full-attn
-             starts empty), then the same query + greedy decode. If
-             true-doc ALSO fails the gen gate, the G5 "garbage" is the
-             model faithfully CONTINUING FROM THE DOCUMENT STATE (the
-             installed state equals exactly this raw state within
-             quantization) — a design-level behavior, not install
-             corruption. If true-doc generates confidently, the gap
-             between true-doc and full isolates the TQ path (then read
-             the frame/S-read/conv rows).
+    TRUE-dist the installed dequant vs the RAW [system+doc] state
+             (write-path validation — the NEW W15 row);
+    gen      greedy decode conf/rep/text — printed WITH the numbers;
+    true-doc the decisive SEMANTIC control for the G5 failure.
 
 Run AFTER re-ingesting with the W11+ code. Examples:
     python3 scripts/gpu/bisect_install.py
     python3 scripts/gpu/bisect_install.py --fla-off
     python3 scripts/gpu/bisect_install.py --chunk 0 --question "What is 2+2?"
+    python3 scripts/gpu/bisect_install.py --qjl
 """
 from __future__ import annotations
 
@@ -122,6 +123,13 @@ def main() -> int:
     ap.add_argument("--bits", type=float, default=3.5)
     ap.add_argument("--fla-off", action="store_true",
                     help="FLUTE_NO_FLA=1 — pure-torch decode kernels")
+    ap.add_argument("--qjl", action="store_true",
+                    help="W15: the paper Alg.-2 A/B — TQCache(qjl=True), "
+                         "the residual-sketch compensation end-to-end")
+    ap.add_argument("--split-half", action="store_true",
+                    help="W15 A/B: force the legacy fixed coordinate "
+                         "half-split for conv (the pre-W15 recipe) — "
+                         "isolates the paper outlier-split's effect")
     args = ap.parse_args()
     if args.fla_off:
         os.environ["FLUTE_NO_FLA"] = "1"
@@ -145,36 +153,56 @@ def main() -> int:
     snap = load_chunk(os.path.join(args.disk_dir, "snapshots",
                                    f"chunk_{args.chunk:05d}.npz"))
     device = next(model.parameters()).device
-    q_s = resolve_quantizer("S", system.s_codes[0].d, args.bits)
+    q_s = resolve_quantizer("S", system.s_codes[0].d, args.bits,
+                            qjl=args.qjl)
     delta0 = snap.s_codes.get(0)
 
     def fresh_cache():
-        return TQCache(config=model.config, bits=args.bits, online=True)
+        return TQCache(config=model.config, bits=args.bits, online=True,
+                       qjl=args.qjl)
 
-    # ------------------------------------------------ the frame check ----
-    # quant() on-device (CUDA kernel route for kernel-eligible d — the
-    # conv window's 24,576) vs dequant() (always the torch reference):
-    # the ONE spot where a GPU-only transform mismatch could split the
-    # D3 frame. ~0.02 = consistent; ~1.0 = frame split.
-    print("\n[frame] on-device quant -> reference dequant roundtrip")
+    # -------------------------------------------- the PURE frame check ----
+    # W15: the old check's floor WAS the codebook noise (~0.02) — a subtle
+    # kernel/reference mismatch hides under it. The pure check compares
+    # the TRANSFORMS with no quantization in between:
+    #   (a) adjoint(apply(x)) == x  (T orthogonal — exact to fp32 rounding)
+    #   (b) the CUDA kernel output vs the torch reference output
+    # Both at 1e-4 rel — no noise floor. d's: the production S unit, the
+    # conv window's split sub-units (16,384) and the legacy 24,576.
+    import fht
+    print("\n[frame] PURE transform checks (no codebook noise floor)")
     frame_ok = True
-    for kind, codes in (("S", system.s_codes[0]),
-                        ("conv", next(iter(system.conv_codes.values())))):
-        q = resolve_quantizer(kind, codes.d, args.bits)
-        g = torch.Generator(device="cpu").manual_seed(777 + codes.d)
-        x = torch.randn(codes.d, generator=g).to(device)
-        codes_rt = q.quant(x)                       # the device route
-        xr = q.dequant(codes_rt)                    # the reference route
-        rel = float(((xr - x.float().cpu()) ** 2).sum()
-                    / (x.float().cpu() ** 2).sum())
-        ok = rel < 0.06                             # the Lloyd-Max level
+    for dd in (16384, 24576, system.s_codes[0].d):
+        signs = fht.rotation_signs(dd, seed=dd)
+        g = torch.Generator(device="cpu").manual_seed(777 + dd)
+        x = torch.randn(1, dd, generator=g).to(device)
+        y = fht.fht_apply(x, signs)                    # auto: kernel if CUDA
+        xr = fht.fht_adjoint(y, signs)                 # the exact inverse
+        rel_rt = float(((xr - x) ** 2).sum() / (x ** 2).sum())
+        y_ref = fht.fht_reference(x.cpu(), signs).to(device)
+        rel_kr = float(((y - y_ref) ** 2).sum() / (y_ref ** 2).sum())
+        ok = rel_rt < 1e-4 and rel_kr < 1e-4
         frame_ok = frame_ok and ok
         verdict = "OK" if ok else (
             "FRAME SPLIT — the CUDA FHT kernel and the reference "
-            "disagree; every conv quant on this box writes codes no "
-            "read can undo")
-        print(f"    {kind:<5} d={codes.d:>7}: rel-MSE {rel:.2e} "
-              f"({verdict})")
+            "disagree; every quant on this box writes codes no read "
+            "can undo")
+        print(f"    d={dd:>7}: adjoint-roundtrip {rel_rt:.2e} "
+              f"kernel-vs-reference {rel_kr:.2e} ({verdict})")
+    # the W15 write-path A/B: --split-half forces the legacy fixed split
+    if args.split_half:
+        from tq_cache import resolve_quantizer as _rq
+        import turboquant as _tq
+        for key in [k for k in list(_tq._REGISTRY) if k.startswith("conv")]:
+            del _tq._REGISTRY[key]
+        _orig_init = _tq.TurboQuant.__init__
+
+        def _no_split_init(self, *a, **kw):
+            kw["group"] = 1          # force the legacy flat split
+            _orig_init(self, *a, **kw)
+        _tq.TurboQuant.__init__ = _no_split_init
+        print("    [--split-half] conv quantizers forced to the legacy "
+              "fixed coordinate half-split (the pre-W15 recipe)")
     q = q_s  # the S quantizer, reused by the checks below
 
     # --------------------------------------------------- the checks ----
@@ -197,14 +225,17 @@ def main() -> int:
     def conv_check(cache):
         """The conv window: read-path fidelity (the cache read vs the
         direct reference dequant of the installed codes — catches device/
-        frame drift in the read) + the truncation detector (dead tail)."""
+        frame drift in the read) + the truncation detector (dead tail).
+        W15: the reference resolves at the CODES' group (outlier-partition
+        units carry it; legacy units are flat)."""
         layer = cache.layers[0]
         codes = layer.conv_codes
         if codes is None:
             print("    conv: no codes installed")
             return False
         w = layer.conv_states[0].reshape(-1).float().cpu()
-        w_ref = resolve_quantizer("conv", codes.d, args.bits) \
+        grp = int(codes.group) if codes.group is not None else 1
+        w_ref = resolve_quantizer("conv", codes.d, args.bits, group=grp) \
             .dequant(codes).float().cpu()
         rel = float(((w - w_ref) ** 2).sum() / (w_ref ** 2).sum())
         head = w[:16384].abs().mean().item()
@@ -238,9 +269,16 @@ def main() -> int:
         return ok, conf, rep
 
     # --------------------------------------------- the true-doc flow ----
+    raw_truth = {}   # layer -> {"s": tensor, "conv": tensor} (the W15
+                     # TRUE-dist reference: the raw [system+doc] end state)
+
     def true_doc_flow():
         """The raw semantic control: [system + chunk] prefilled on a RAW
-        cache, full-attn KV dropped (the G5 geometry), query + decode."""
+        cache, full-attn KV dropped (the G5 geometry), query + decode.
+        W15: also snapshots the raw linear-layer end states — the WRITE-
+        PATH truth the new TRUE-dist row compares the installed codes
+        against (the read checks only ever compare against the codes'
+        OWN reference dequant)."""
         path = args.corpus
         if not os.path.exists(path):
             print(f"    [true-doc SKIPPED — corpus not found: {path}]")
@@ -266,6 +304,16 @@ def main() -> int:
                                          dtype=torch.long,
                                          device=device),
                   past_key_values=cache)
+            # W15: capture the raw doc-loaded states (layer 0 + a middle
+            # layer) BEFORE the full-attn reset — the write-path truth
+            for L in (0, 12):
+                lin = cache.layers[L]
+                if isinstance(lin, LinearAttentionCacheLayerMixin):
+                    raw_truth[L] = {
+                        "s": lin.recurrent_states[0].reshape(-1)
+                                .float().cpu().clone(),
+                        "conv": lin.conv_states[0].reshape(-1)
+                                  .float().cpu().clone()}
             # drop the full-attn KV: G5's geometry (fresh full-attn; the
             # linear state carries the doc). DynamicLayer.reset() drops
             # keys/values; the linear layers are untouched.
@@ -285,15 +333,57 @@ def main() -> int:
               f"rep {rep:.2f} text {text!r}")
         return ok, conf, rep
 
+    def true_dist_check(cache, variant):
+        """W15 — the write-path row the W14 matrix lacked: the installed
+        codes' dequant vs the RAW doc state (layer 0). The read checks
+        cannot see this — they compare the cache read against the SAME
+        codes' reference dequant. Budgets: S <= 0.15 (the online
+        ingestion drift compounds through the recurrence; the install
+        math itself is ~1.3x single-shot — test_install_real_math),
+        conv <= 0.03 (the split's measured write-path level; the legacy
+        fixed split sat at 0.02-0.025)."""
+        if not raw_truth or variant not in ("s-only", "full",
+                                            "conv-only", "reseed"):
+            return None
+        L = 0
+        truth = raw_truth[L]
+        # the expected TRUE state per variant: reseed/conv-only -> the
+        # SYSTEM state (the doc never installed); s-only/full -> the doc
+        # state. The system truth is dequant(sys); compare only where it
+        # is meaningful (reseed/conv-only vs the system reference).
+        got_s = cache.layers[L].recurrent_states[0].reshape(-1).float().cpu()
+        got_c = cache.layers[L].conv_states[0].reshape(-1).float().cpu()
+        if variant in ("reseed", "conv-only"):
+            exp_s = q.dequant(system.s_codes[L])
+            rel_s = float(((got_s - exp_s) ** 2).sum()
+                          / (exp_s ** 2).sum().clamp_min(1e-30))
+            rel_c = None
+            rel_s_budget = 1e-4
+        else:
+            exp_s = truth["s"]
+            rel_s = float(((got_s - exp_s) ** 2).sum()
+                          / (exp_s ** 2).sum().clamp_min(1e-30))
+            rel_c = float(((got_c - truth["conv"]) ** 2).sum()
+                          / (truth["conv"] ** 2).sum().clamp_min(1e-30))
+            rel_s_budget = 0.15
+        line = (f"    TRUE-dist: S {rel_s:.3f} (<= {rel_s_budget:g})")
+        if rel_c is not None:
+            line += f" conv {rel_c:.3f} (<= 0.03)"
+        print(line)
+        if rel_c is not None:
+            return rel_s <= rel_s_budget and rel_c <= 0.03
+        return rel_s <= rel_s_budget
+
     # ------------------------------------------------------- the run ----
-    variants = ["reseed", "s-only", "conv-only", "full", "true-doc"]
+    # true-doc runs FIRST so the raw_truth capture feeds TRUE-dist
+    variants = ["true-doc", "reseed", "s-only", "conv-only", "full"]
     results = {}
     for variant in variants:
         print(f"\n[{variant}] " + "-" * 50)
         with torch.no_grad():
             if variant == "true-doc":
                 ok_gen, conf, rep = true_doc_flow()
-                results[variant] = (None, None, ok_gen, conf, rep)
+                results[variant] = (None, None, None, ok_gen, conf, rep)
                 continue
             cache = fresh_cache()
             reseed_cache(cache, system)
@@ -311,21 +401,25 @@ def main() -> int:
                 install_snapshot(cache, system, [snap])
             ok_read = s_read_check(cache, variant)
             ok_conv = conv_check(cache)
+            ok_true = true_dist_check(cache, variant)
             state_scale(cache)
             ok_gen, conf, rep = gen_check(cache)
-            results[variant] = (ok_read, ok_conv, ok_gen, conf, rep)
+            results[variant] = (ok_read, ok_conv, ok_true, ok_gen, conf, rep)
 
     print("\n" + "=" * 60)
-    print(f"BISECTION MATRIX{' (FLA OFF)' if args.fla_off else ''}")
-    print(f"{'variant':<12} {'S-read':<8} {'conv':<8} {'gen':<8} "
-          f"{'conf':>6} {'rep':>5}")
-    for v, (a, b, c, conf, rep) in results.items():
+    print(f"BISECTION MATRIX{' (FLA OFF)' if args.fla_off else ''}"
+          f"{' (QJL ON)' if args.qjl else ''}"
+          f"{' (LEGACY HALF SPLIT)' if args.split_half else ''}")
+    print(f"{'variant':<12} {'S-read':<8} {'conv':<8} {'TRUE':<6} "
+          f"{'gen':<8} {'conf':>6} {'rep':>5}")
+    for v, (a, b, t, c, conf, rep) in results.items():
         s = "-" if a is None else ("OK" if a else "DRIFT")
         cv = "-" if b is None else ("OK" if b else "DRIFT")
+        tv = "-" if t is None else ("OK" if t else "HIGH")
         gen = "??" if c is None else ("OK" if c else "GARBAGE")
         conf_s = "nan" if conf is None else f"{conf:.3f}"
         rep_s = "nan" if rep is None else f"{rep:.2f}"
-        print(f"{v:<12} {s:<8} {cv:<8} {gen:<8} {conf_s:>6} {rep_s:>5}")
+        print(f"{v:<12} {s:<8} {cv:<8} {tv:<6} {gen:<8} {conf_s:>6} {rep_s:>5}")
     print("-" * 60)
     print(f"frame check: {'OK' if frame_ok else 'FRAME SPLIT'}")
     print("Reading the matrix:")
@@ -333,13 +427,18 @@ def main() -> int:
     print("  * frame SPLIT => the CUDA FHT kernel disagrees with the")
     print("    reference at a kernel-eligible d (conv) — every conv code")
     print("    on the box is then written in an unreadable rotation;")
+    print("  * TRUE-dist HIGH with reads OK => the WRITE path is the")
+    print("    distortion owner (the codes decode fine, they ENCODE")
+    print("    badly) — the W15 recipe (outlier split / --qjl) is the")
+    print("    lever; re-ingest with the W15 code to activate it;")
     print("  * true-doc GARBAGE (with reads + frame OK) => the G5 failure")
     print("    is SEMANTIC: the model faithfully continues from the")
     print("    document state — a prompt/flow design matter, not")
     print("    corruption. Compare true-doc's text with full's text;")
     print("  * reads/frame/true-doc all OK but full GARBAGE => the TQ")
     print("    quantization layer itself — rerun with --fla-off and")
-    print("    compare (the Triton decode route is then the suspect).")
+    print("    compare (the Triton decode route is then the suspect),")
+    print("    then --qjl and --split-half for the W15 write-path A/Bs.")
     print("=" * 60)
     return 0
 

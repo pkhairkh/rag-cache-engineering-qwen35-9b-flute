@@ -35,6 +35,27 @@ Q(a+b) ≠ Q(a)+Q(b) — install math (SPECIFICATION §6) therefore requantizes
 SUMS of dequantized vectors (see rag/install.py); this module intentionally
 offers no code-plus-code operation.
 
+THE W15 OUTLIER SPLIT (the paper's OWN non-integer-bit recipe — the
+conv kind's default; see TurboQuant(group=...)): arXiv:2504.19874 §5.3
+quantizes KV-cache-like tensors by "splitting channels into outlier and
+non-outlier sets, and applying two independent instances of TurboQuant
+to each, allocating higher bit precision to outliers". The conv window
+(channel, tap) layout quantizes through TWO sub-instances: the top-k
+energy channels (k = round(frac·n_ch)) at bits_hi with their OWN
+power-of-two full rotation (seed+555) and own fp norm; the rest at
+bits_lo with the kind's seed. The membership mask (packed channel
+bits), the group and the second norm ride in TQCodes — the codes are
+self-describing and dequant routes on codes.partition, so pre-W15
+partition="half" snapshots decode UNCHANGED (through the flat twin) and
+legacy-only paths (hooks/index) read split codes exactly (through the
+split twin). Measured at production conv geometry (channel-structured
+windows): ~3x lower write-path rel-MSE than the fixed coordinate
+half-split at the SAME effective bits — the fixed split hands the 4-bit
+half to a fixed coordinate range that ignores the channel-energy
+structure, while the paper's split spends them where the energy is.
+group=1 (S/M1/M2 — no channel structure; the full 2^19 rotation already
+mixes everything) keeps the legacy flat split, BIT-IDENTICAL.
+
 THE W9.2 `qjl` FLAG (P7 / D1's flagged prod-variant A/B — DEFAULT OFF):
 `TurboQuant(..., qjl=True)` additionally computes the structured QJL
 residual sketch (PROPOSAL §1.2, the paper's Alg. 2 "TurboQuant_prod"):
@@ -104,9 +125,18 @@ __all__ = [
 # (kind -> (d, seed)); the seeds are the D3 rotation keys — persisted in the
 # index side-metadata by rag/index.py; do not change them once an index
 # exists (frame drift would silently corrupt retrieval).
+# NOTE (W15): KINDS["conv"]'s canonical d (32,768) is the HISTORICAL
+# power-of-two unit. The production conv window (Qwen3.5 in_proj Q+V:
+# 1×6144×4 = 24,576) resolves through the CUSTOM-d path (kind="custom",
+# seed 202 preserved — the D3 frame contract), and quantizes through the
+# paper's outlier split (TurboQuant(group=kernel); see the module
+# docstring). The canonical entry is kept UNCHANGED so pre-W15
+# 24,576-dim "custom" codes still pass _check_codes against the custom
+# path (flipping the canonical d would silently change the resolved
+# kind string and strand every existing snapshot).
 KINDS: Dict[str, Tuple[int, int]] = {
     "S":   (524_288, 101),   # per-layer recurrent state (spec §2.1)
-    "conv": (32_768, 202),   # per-layer conv state (spec §2.3)
+    "conv": (32_768, 202),   # per-layer conv state (spec §2.3; see NOTE)
     "M1":  (524_288, 303),   # global key-memory (spec §2.2)
     "M2":  (524_288, 404),   # global value-memory (spec §2.2)
 }
@@ -115,6 +145,11 @@ SEEDS: Dict[str, int] = {k: v[1] for k, v in KINDS.items()}
 # W9.2 qjl flag: the QJL sketch's own sign-draw seed offset, added to the
 # kind's D3 rotation seed (a SECOND deterministic draw — same d).
 QJL_SEED_OFFSET = 7777
+# The paper's §LongBench outlier-split recipe ("splitting channels into
+# outlier and non-outlier sets, two independent instances of TurboQuant"):
+# the OUTLIER sub-quantizer's own D3 frame seed offset, added to the kind's
+# seed (the regular sub-quantizer keeps the kind's own seed).
+SPLIT_SEED_OFFSET = 555
 # The paper's Alg.-2 IP-estimator constant (PROPOSAL §1.2: (√(π/2)/d)·γ·Sᵀ·qjl
 # with S unit-variance; folded with S = √d·FHT -> (√(π/2)/√d)·γ·FHT_adjoint).
 QJL_C = math.sqrt(math.pi / 2.0)
@@ -185,14 +220,30 @@ class TQCodes:
     idx_lo: np.ndarray                     # packed uint8 bit-stream
     idx_hi: np.ndarray                     # packed uint8 bit-stream
     seed: int                              # the D3 rotation seed (persisted)
-    partition: str = "half"                # "half" (default) | "outlier" (W9 A/B)
+    partition: str = "half"                # "half" (legacy) | "outlier" (paper §LongBench)
+    # W15 — the paper's outlier split (partition="outlier", conv kind):
+    # group   = coords per channel (the conv kernel width; 1 = flat).
+    #           Present IFF partition == "outlier" (backward compatible).
+    # mask    = packed per-channel outlier membership (ceil(n_ch/8) uint8;
+    #           bit i = 1 -> channel i is an OUTLIER (hi set). Present IFF
+    #           partition == "outlier".
+    # norm_hi = the outlier sub-set's fp32 norm (the regular set's norm is
+    #           `norm`, parallel to idx_lo/idx_hi). Present IFF partition ==
+    #           "outlier". For "half" codes the single `norm` field holds
+    #           the whole unit's norm (unchanged legacy contract).
+    # NOTE: for "outlier" codes, n_lo/n_hi are the PADDED sub-quantizer
+    # unit sizes (power-of-two per sub-set — see TurboQuant._quant_split);
+    # the real-coordinate counts are (n_ch - k)*group and k*group with
+    # k = mask bit-count, n_ch = 8*len(mask).
+    group: Optional[int] = None
+    mask: Optional[np.ndarray] = None
+    norm_hi: Optional[np.float32] = None
     # W9.2 qjl A/B (DEFAULT None = flag OFF / legacy codes): the structured
     # QJL residual sketch — (d,) int8 ±1 = sign(FHT(r/γ, seed+7777)) — and
     # the fp32 residual norm γ. Present IFF quantized with qjl=True;
     # serialization writes them ONLY when present (backward compatible).
     qjl_signs: Optional[np.ndarray] = None
     gamma: Optional[np.float32] = None
-
     # ---- serialization ---------------------------------------------------
     def to_arrays(self) -> Dict[str, np.ndarray]:
         """Flat array dict for embedding into a larger npz (snapshot.py).
@@ -213,6 +264,13 @@ class TQCodes:
             "idx_lo": self.idx_lo,
             "idx_hi": self.idx_hi,
         }
+        if self.partition == "outlier":
+            if self.group is not None:
+                out["group"] = np.array(int(self.group), dtype=np.int64)
+            if self.mask is not None:
+                out["mask"] = np.ascontiguousarray(self.mask, dtype=np.uint8)
+            if self.norm_hi is not None:
+                out["norm_hi"] = np.array(self.norm_hi, dtype=np.float32)
         if self.qjl_signs is not None:
             out["qjl_signs"] = np.ascontiguousarray(self.qjl_signs,
                                                    dtype=np.int8)
@@ -227,6 +285,10 @@ class TQCodes:
         qjl_signs/gamma == None — the flag-off dequant path."""
         qjl = a.get("qjl_signs") if hasattr(a, "get") else None
         gam = a.get("gamma") if hasattr(a, "get") else None
+        part = str(a.get("partition", "half")) if hasattr(a, "get") else "half"
+        grp = a.get("group") if hasattr(a, "get") else None
+        msk = a.get("mask") if hasattr(a, "get") else None
+        nhi = a.get("norm_hi") if hasattr(a, "get") else None
         return cls(
             kind=str(a["kind"]),
             d=int(a["d"]),
@@ -238,7 +300,11 @@ class TQCodes:
             idx_lo=np.asarray(a["idx_lo"], dtype=np.uint8),
             idx_hi=np.asarray(a["idx_hi"], dtype=np.uint8),
             seed=int(a["seed"]),
-            partition=str(a["partition"]),
+            partition=part,
+            group=(None if grp is None else int(grp)),
+            mask=(None if msk is None
+                  else np.asarray(msk, dtype=np.uint8)),
+            norm_hi=(None if nhi is None else np.float32(nhi)),
             qjl_signs=(None if qjl is None
                        else np.asarray(qjl, dtype=np.int8)),
             gamma=(None if gam is None else np.float32(gam)),
@@ -246,6 +312,10 @@ class TQCodes:
 
     def nbytes(self) -> int:
         n = self.idx_lo.nbytes + self.idx_hi.nbytes + 4  # + fp32 norm
+        if self.partition == "outlier":   # W15: mask + second fp32 norm
+            if self.mask is not None:
+                n += int(self.mask.nbytes)
+            n += 4
         if self.qjl_signs is not None:      # W9.2 A/B: +1 bit/coordinate
             n += int(self.qjl_signs.nbytes)  # (d,) int8 sketch
         if self.gamma is not None:
@@ -273,11 +343,31 @@ class TurboQuant:
         carry the fields (a qjl=False instance dequantizes qjl codes
         correctly — the codes are self-describing). Flag OFF is
         bit-identical to the pre-W9.2 behavior (parity gate).
+    group : int, default 1 — W15, the paper's §LongBench outlier-split
+        recipe ("splitting channels into outlier and non-outlier sets, and
+        applying two independent instances of TurboQuant to each, allocating
+        higher bit precision to outliers"). group > 1 selects it: the d
+        coordinates are CHANNEL GROUPS of `group` coords (the conv window's
+        (channel, tap) layout — group = the kernel width), k = round(frac·d/group)
+        highest-energy channels quantize at bits_hi with their OWN
+        power-of-two full rotation (frame seed = kind seed + 555) and their
+        OWN fp norm; the remaining channels at bits_lo with the kind's own
+        seed frame. The membership mask (packed, ceil(n_ch/8) bytes) and the
+        second norm ride in the codes (TQCodes.mask / norm_hi) — measured
+        at production conv geometry this is ~3x lower write-path rel-MSE
+        than the fixed coordinate half-split at the SAME effective bits
+        (the fixed split puts the 4 bits on a fixed coordinate half that
+        ignores the channel-energy structure; the paper's split puts them
+        on the channels that carry the energy). group == 1 (S/M1/M2 — and
+        any flat vector) keeps the legacy coordinate half-split exactly
+        (partition="half", bit-identical to pre-W15). dequant() routes on
+        the CODES' partition field, so old "half" snapshots load and
+        decode unchanged through a split-configured quantizer.
     """
 
     def __init__(self, kind: str = "S", bits: float = 3.5,
                  d: Optional[int] = None, seed: Optional[int] = None,
-                 qjl: bool = False):
+                 qjl: bool = False, group: int = 1):
         if kind not in KINDS:
             if d is None or seed is None:
                 raise ValueError(
@@ -311,13 +401,45 @@ class TurboQuant:
             self.bits_lo, self.bits_hi = lo, hi
             frac = float(bits) - lo
         # coordinate split: frac is the fraction at the hi bit-width
-        n_hi = int(round(frac * self.d))
-        self.n_lo, self.n_hi = self.d - n_hi, n_hi
-        self._cb_lo = codebooks.get_codebook(self.bits_lo, self.d)
-        self._cb_hi = (self._cb_lo if self.bits_hi == self.bits_lo
-                       else codebooks.get_codebook(self.bits_hi, self.d))
-        # the D3 rotation: one sign vector per kind, generated once
-        self._signs = fht.rotation_signs(self.d, self.seed)
+        self.group = int(group)
+        if self.group < 1:
+            raise ValueError(f"TurboQuant: group must be >= 1, got {group}")
+        if self.d % self.group != 0:
+            raise ValueError(
+                f"TurboQuant({kind}): d={self.d} is not a multiple of the "
+                f"channel group size {self.group}")
+        self.n_channels = self.d // self.group
+        self.split = self.group > 1 and not float(bits).is_integer()
+        if self.split:
+            k = int(round(frac * self.n_channels))
+            if not (1 <= k < self.n_channels):
+                raise ValueError(
+                    f"TurboQuant({kind}): the outlier split needs 1 <= k < "
+                    f"n_channels, got k={k} of {self.n_channels} channels "
+                    f"(d={self.d}, group={self.group}, bits={bits})")
+            self.k_out = k
+            reg_real = (self.n_channels - k) * self.group
+            out_real = k * self.group
+            self.reg_d, self.out_d = _next_pow2(reg_real), _next_pow2(out_real)
+            # W15: for a SPLIT quantizer n_lo/n_hi are the PADDED sub-unit
+            # sizes (the codes' idx streams cover the padded sub-d's — the
+            # pad carries quantization noise that the un-rotation spreads,
+            # and the strip at dequant discards; measured: the padded full
+            # rotation beats the exact-size segmented rotation, P1).
+            self.n_lo, self.n_hi = self.reg_d, self.out_d
+            # the sub-codebooks resolve lazily through _sub_quantizer
+            self._cb_lo = self._cb_hi = None
+            self._signs = None
+        else:
+            n_hi = int(round(frac * self.d))
+            self.n_lo, self.n_hi = self.d - n_hi, n_hi
+            self.k_out = 0
+            self.reg_d = self.out_d = self.d
+            self._cb_lo = codebooks.get_codebook(self.bits_lo, self.d)
+            self._cb_hi = (self._cb_lo if self.bits_hi == self.bits_lo
+                           else codebooks.get_codebook(self.bits_hi, self.d))
+            # the D3 rotation: one sign vector per kind, generated once
+            self._signs = fht.rotation_signs(self.d, self.seed)
         # W9.2 qjl flag (DEFAULT OFF — the fields below are computed
         # unconditionally but USED only on qjl paths, so flag-off output
         # is bit-identical to the pre-W9.2 behavior):
@@ -327,6 +449,23 @@ class TurboQuant:
         self._qjl_signs_vec = fht.rotation_signs(self.d,
                                                  self.seed + QJL_SEED_OFFSET)
 
+    # ------------------------------------------------------ sub-quantizers --
+    def _sub_quantizer(self, role: str) -> "TurboQuant":
+        """One of the two paper-recipe sub-instances ("reg" | "out") for a
+        SPLIT quantizer: uniform integer bits, power-of-two d (its own FULL
+        single-segment rotation — the paper's invariant), deterministic
+        frame seed (regular keeps the kind's seed; outlier = seed + 555).
+        Resolved through the process registry so instances are shared."""
+        assert self.split
+        bits = self.bits_lo if role == "reg" else self.bits_hi
+        d = self.reg_d if role == "reg" else self.out_d
+        seed = self.seed if role == "reg" else self.seed + SPLIT_SEED_OFFSET
+        key = f"{self.kind}:{bits}:{d}:{seed}:sub"
+        reg = _REGISTRY
+        if key not in reg:
+            reg[key] = TurboQuant(kind="custom", bits=bits, d=d, seed=seed)
+        return reg[key]
+
     # ---------------------------------------------------------------- API --
     def quant(self, x: torch.Tensor) -> TQCodes:
         """Quantize ONE unit: x is a (d,) tensor (any float dtype).
@@ -335,7 +474,10 @@ class TurboQuant:
         the ORIGINAL-frame residual r = x − dequant_mse(codes), its fp32
         norm γ, and qjl = sign(FHT(r/γ, seed+7777)) (module docstring has
         the exact formulation). The MSE layer (idx/norm) is computed
-        IDENTICALLY with and without the flag — the A/B is purely additive."""
+        IDENTICALLY with and without the flag — the A/B is purely additive.
+
+        group > 1 (the constructor's W15 paper-recipe flag) routes to the
+        outlier-channel split: see the class docstring."""
         x = torch.as_tensor(x)
         if x.dim() != 1 or x.shape[0] != self.d:
             raise ValueError(
@@ -344,6 +486,8 @@ class TurboQuant:
         if not torch.is_floating_point(x):
             raise TypeError(f"TurboQuant: x must be floating point, got {x.dtype}")
         x32 = x.detach().to(torch.float32)
+        if self.split:
+            return self._quant_split(x32)
         norm = float(x32.norm().item())
         if norm == 0.0:  # degenerate: all-zero unit (codes of zero)
             codes = TQCodes(self.kind, self.d, np.float32(0.0),
@@ -391,9 +535,135 @@ class TurboQuant:
         codes.qjl_signs = signs
         codes.gamma = np.float32(gamma)
 
+    # ------------------------------------------- W15: the outlier split ----
+    def _quant_split(self, x32: torch.Tensor) -> TQCodes:
+        """The paper's §LongBench recipe at work (see the class docstring):
+        top-k channels by energy → the outlier sub-set (bits_hi, own frame
+        seed+555, own norm, pow2-padded own rotation); the rest → the
+        regular sub-set (bits_lo, the kind's seed, own norm). Deterministic
+        (stable argsort on the channel energies)."""
+        n_ch, g = self.n_channels, self.group
+        x_np = x32.cpu().numpy() if x32.is_cuda else x32.numpy()
+        xg = x_np.reshape(n_ch, g)
+        energy = np.einsum("ij,ij->i", xg, xg)
+        order = np.argsort(-energy, kind="stable")
+        out_ch = np.sort(order[: self.k_out])
+        reg_ch = np.sort(order[self.k_out:])
+        mask = np.zeros(n_ch, dtype=bool)
+        mask[out_ch] = True
+        xreg = np.ascontiguousarray(xg[reg_ch].reshape(-1))
+        xout = np.ascontiguousarray(xg[out_ch].reshape(-1))
+        q_reg, q_out = self._sub_quantizer("reg"), self._sub_quantizer("out")
+        c_reg = q_reg.quant(_pad_to(xreg, self.reg_d))
+        c_out = q_out.quant(_pad_to(xout, self.out_d))
+        codes = TQCodes(
+            self.kind, self.d, np.float32(c_reg.norm),
+            self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
+            c_reg.idx_lo, c_out.idx_lo, self.seed,
+            partition="outlier", group=g,
+            mask=np.packbits(mask),
+            norm_hi=np.float32(c_out.norm))
+        if self.qjl:
+            self._attach_qjl(codes, x32)
+        return codes
+
+    def _split_channels(self, codes: TQCodes) -> tuple:
+        """(reg_ch, out_ch) from the codes' packed mask — validated."""
+        if codes.mask is None or codes.group is None:
+            raise ValueError(
+                f"TurboQuant({self.kind}): outlier-partition codes without a "
+                f"mask/group — corrupted serialization?")
+        n_ch = self.d // int(codes.group)
+        bits_ = np.unpackbits(np.ascontiguousarray(codes.mask, dtype=np.uint8))
+        if bits_.shape[0] < n_ch:
+            raise ValueError(
+                f"TurboQuant({self.kind}): mask covers {bits_.shape[0]} "
+                f"channels, the unit needs {n_ch}")
+        mask = bits_[:n_ch].astype(bool)
+        out_ch = np.nonzero(mask)[0]
+        reg_ch = np.nonzero(~mask)[0]
+        if out_ch.shape[0] != self.k_out:
+            raise ValueError(
+                f"TurboQuant({self.kind}): mask says {out_ch.shape[0]} outlier "
+                f"channels, the geometry says k={self.k_out} — frame drift?")
+        return reg_ch, out_ch
+
+    def _dequant_split_mse(self, codes: TQCodes,
+                           dtype: torch.dtype) -> torch.Tensor:
+        """The outlier-partition MSE reconstruction: two sub-dequants
+        (each through its own frame + norm), pad-strip, scatter to the
+        channel layout."""
+        reg_ch, out_ch = self._split_channels(codes)
+        q_reg, q_out = self._sub_quantizer("reg"), self._sub_quantizer("out")
+        c_reg = TQCodes(q_reg.kind, q_reg.d, codes.norm,
+                        q_reg.bits_lo, q_reg.bits_hi, q_reg.n_lo, q_reg.n_hi,
+                        codes.idx_lo, np.zeros(0, np.uint8), q_reg.seed)
+        c_out = TQCodes(q_out.kind, q_out.d, codes.norm_hi,
+                        q_out.bits_lo, q_out.bits_hi, q_out.n_lo, q_out.n_hi,
+                        codes.idx_hi, np.zeros(0, np.uint8), q_out.seed)
+        reg_real, out_real = reg_ch.shape[0] * int(codes.group), \
+            out_ch.shape[0] * int(codes.group)
+        x = np.zeros(self.d, dtype=np.float32)
+        xg = x.reshape(self.n_channels, int(codes.group))
+        if float(codes.norm) != 0.0:
+            v = q_reg.dequant(c_reg, dtype=torch.float32) \
+                .numpy()[: reg_real]
+            xg[reg_ch] = v.reshape(-1, int(codes.group))
+        if codes.norm_hi is not None and float(codes.norm_hi) != 0.0:
+            v = q_out.dequant(c_out, dtype=torch.float32) \
+                .numpy()[: out_real]
+            xg[out_ch] = v.reshape(-1, int(codes.group))
+        return torch.from_numpy(x).to(dtype)
+
+    def _flat_twin(self) -> "TurboQuant":
+        """The legacy flat-semantics twin of a SPLIT quantizer (same kind /
+        bits / d / seed, group=1) — dequantizing pre-W15 partition="half"
+        codes through it keeps every legacy contract exact (the codes are
+        self-describing; old snapshots load and decode unchanged)."""
+        key = f"{self.kind}:{self.bits_spec}:{self.d}:{self.seed}:flat"
+        if key not in _REGISTRY:
+            _REGISTRY[key] = TurboQuant(
+                kind=self.kind, bits=self.bits_spec, d=self.d,
+                seed=self.seed, qjl=self.qjl)
+        return _REGISTRY[key]
+
+    def _split_twin(self, group: int) -> "TurboQuant":
+        """The split-semantics twin at `group` coords per channel — the
+        reverse of _flat_twin: a FLAT-configured quantizer (group=1, e.g.
+        resolved by a generic codes-only path) dequantizing
+        partition="outlier" codes routes here so the sub-quantizer frames
+        resolve from the codes' own geometry."""
+        key = f"{self.kind}:{self.bits_spec}:{self.d}:{self.seed}:split{group}"
+        if key not in _REGISTRY:
+            _REGISTRY[key] = TurboQuant(
+                kind=self.kind, bits=self.bits_spec, d=self.d,
+                seed=self.seed, qjl=self.qjl, group=group)
+        return _REGISTRY[key]
+
+    def _route_for(self, codes: TQCodes) -> "TurboQuant":
+        """The quantizer that owns CODES' partition (self, or the twin with
+        the right group semantics). Codes are self-describing: outlier
+        codes need split semantics (self's group must equal the codes'
+        group); half codes need flat semantics."""
+        part = getattr(codes, "partition", "half")
+        if part == "outlier":
+            grp = int(codes.group) if codes.group is not None else 1
+            if self.split and self.group == grp:
+                return self
+            return self._split_twin(grp)
+        if self.split:
+            return self._flat_twin()
+        return self
+
     def dequant(self, codes: TQCodes,
                 dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """Dequantize ONE unit back to a (d,) tensor of `dtype`.
+
+        Routing (W15): the CODES are self-describing — partition="outlier"
+        dequantizes through the split sub-quantizers; partition="half"
+        (all pre-W15 codes, and every S/M1/M2 unit) dequantizes through the
+        flat frame — through the legacy twin when self is split-configured,
+        so old snapshots load unchanged.
 
         When the codes carry the QJL sketch (qjl_signs + gamma, the W9.2
         flag — present IFF quantized with qjl=True), the reconstruction is
@@ -401,43 +671,75 @@ class TurboQuant:
         FHT_adjoint(qjl)  ==  x̃_mse + (√(π/2)/d)·γ·Sᵀ·qjl with the
         structured projection S = √d·FHT(d, codes.seed+7777) (module
         docstring). Codes WITHOUT the fields: exactly the pre-W9.2 path."""
+        if getattr(codes, "partition", "half") == "outlier":
+            q = self._route_for(codes)
+            q._check_codes(codes)
+            out = q._dequant_split_mse(codes, dtype=torch.float32)
+            # NOTE: no whole-unit zero-norm early return here — `norm` is
+            # the REGULAR sub-set's norm; a zero regular set with a live
+            # outlier set (or vice versa) is handled per sub-set above.
+            out = self._qjl_compensation_term(codes, out)
+            return out.to(dtype)
+        q = self._route_for(codes)
+        return q._dequant_flat(codes, dtype)
+
+    def _qjl_compensation_term(self, codes: TQCodes,
+                               out: torch.Tensor) -> torch.Tensor:
+        """The Alg.-2 residual term, shared by both partitions (the sketch
+        lives in the ORIGINAL frame — partition-agnostic)."""
+        if codes.qjl_signs is None and codes.gamma is None:
+            return out
+        if codes.qjl_signs is None or codes.gamma is None:
+            raise ValueError(
+                f"TurboQuant({self.kind}, bits={self.bits_spec}, "
+                f"d={self.d}, seed={self.seed}): codes carry a PARTIAL "
+                f"QJL sketch (qjl_signs={'set' if codes.qjl_signs is not None else 'None'}, "
+                f"gamma={'set' if codes.gamma is not None else 'None'}) — "
+                f"corrupted serialization?")
+        s = np.asarray(codes.qjl_signs)
+        if s.dtype != np.int8 or s.ndim != 1 or s.shape[0] != codes.d:
+            raise ValueError(
+                f"TurboQuant({self.kind}): qjl_signs must be a "
+                f"({codes.d},) int8 ±1 sketch, got shape={s.shape}, "
+                f"dtype={s.dtype}")
+        gamma = float(codes.gamma)
+        if gamma != 0.0:
+            # _check_codes pins codes.seed == self.seed, so the cached
+            # second draw is the codes' own QJL sign vector.
+            # np.array(...) = a WRITABLE fp32 copy: torch.from_numpy on
+            # a read-only view (e.g. the zero-copy views onto mmap'd
+            # snapshot members) would warn + be UB on write.
+            s_t = torch.from_numpy(
+                np.array(s, dtype=np.float32)).reshape(1, self.d)
+            z = fht.fht_adjoint(s_t, self._qjl_signs_vec).reshape(self.d)
+            out = out + (QJL_C * gamma / math.sqrt(self.d)) * z
+        return out
+
+    def _dequant_flat(self, codes: TQCodes,
+                      dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        """The legacy (pre-W15) dequant body, VERBATIM — the flat path."""
         self._check_codes(codes)
         if float(codes.norm) == 0.0:
             # zero-norm unit ⇒ the quant-side residual was exactly zero ⇒
             # γ == 0 ⇒ the compensation term is exactly 0 — plain zeros.
             return torch.zeros(self.d, dtype=dtype)
         out = self._dequant_mse(codes, dtype=torch.float32)
-        if codes.qjl_signs is not None or codes.gamma is not None:
-            if codes.qjl_signs is None or codes.gamma is None:
-                raise ValueError(
-                    f"TurboQuant({self.kind}, bits={self.bits_spec}, "
-                    f"d={self.d}, seed={self.seed}): codes carry a PARTIAL "
-                    f"QJL sketch (qjl_signs={'set' if codes.qjl_signs is not None else 'None'}, "
-                    f"gamma={'set' if codes.gamma is not None else 'None'}) — "
-                    f"corrupted serialization?")
-            s = np.asarray(codes.qjl_signs)
-            if s.dtype != np.int8 or s.ndim != 1 or s.shape[0] != codes.d:
-                raise ValueError(
-                    f"TurboQuant({self.kind}): qjl_signs must be a "
-                    f"({codes.d},) int8 ±1 sketch, got shape={s.shape}, "
-                    f"dtype={s.dtype}")
-            gamma = float(codes.gamma)
-            if gamma != 0.0:
-                # _check_codes pins codes.seed == self.seed, so the cached
-                # second draw is the codes' own QJL sign vector.
-                # np.array(...) = a WRITABLE fp32 copy: torch.from_numpy on
-                # a read-only view (e.g. the zero-copy views onto mmap'd
-                # snapshot members) would warn + be UB on write.
-                s_t = torch.from_numpy(
-                    np.array(s, dtype=np.float32)).reshape(1, self.d)
-                z = fht.fht_adjoint(s_t, self._qjl_signs_vec).reshape(self.d)
-                out = out + (QJL_C * gamma / math.sqrt(self.d)) * z
+        out = self._qjl_compensation_term(codes, out)
         return out.to(dtype)
 
     def _dequant_mse(self, codes: TQCodes,
                      dtype: torch.dtype = torch.float32) -> torch.Tensor:
-        """The MSE-layer reconstruction (the pre-W9.2 dequant body, verbatim
-        — shared by dequant() and the qjl residual computation)."""
+        """The MSE-layer reconstruction. W15: dispatches on the codes'
+        partition through _route_for (the split path through the
+        sub-quantizers; the flat path through the twin when self carries
+        the other semantics)."""
+        if getattr(codes, "partition", "half") == "outlier":
+            q = self._route_for(codes)
+            q._check_codes(codes)
+            return q._dequant_split_mse(codes, dtype)
+        q = self._route_for(codes)
+        if q is not self:
+            return q._dequant_mse(codes, dtype)
         idx_lo = unpack_bits(codes.idx_lo, codes.bits_lo, codes.n_lo)
         idx_hi = unpack_bits(codes.idx_hi, codes.bits_hi, codes.n_hi)
         y = np.empty(self.d, dtype=np.float32)
@@ -468,6 +770,25 @@ class TurboQuant:
 
 def _packed_len(n: int, bits: int) -> int:
     return (n * bits + 7) // 8
+
+
+def _next_pow2(n: int) -> int:
+    """Smallest power of two >= n (n >= 1) — the W15 split sub-units."""
+    if n < 1:
+        raise ValueError(f"_next_pow2: n must be >= 1, got {n}")
+    return 1 << (n - 1).bit_length()
+
+
+def _pad_to(x: np.ndarray, d: int) -> torch.Tensor:
+    """Zero-pad the flat (n,) numpy vector UP to (d,) and return a
+    contiguous fp32 torch tensor (n <= d). The pad adds no energy — the
+    sub-quantizer's stored norm is the real sub-set's."""
+    if x.shape[0] > d:
+        raise ValueError(f"_pad_to: n={x.shape[0]} exceeds d={d}")
+    if x.shape[0] < d:
+        x = np.concatenate(
+            [x, np.zeros(d - x.shape[0], dtype=np.float32)])
+    return torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32))
 
 
 # -------------------------------------------------------------- registry ---
