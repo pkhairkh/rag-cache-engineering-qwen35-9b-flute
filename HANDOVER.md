@@ -1,205 +1,335 @@
 # RAGGA Handover Document
 
-## Current State (post-W15 — the paper-fidelity wave)
+## Executive Summary
+
+RAGGA is a RAG system using TurboQuant-compressed KV-cache snapshots for retrieval. After 15 waves of debugging and fixes, the technical pipeline is stable but **answer quality remains poor**. This document summarizes what works, what doesn't, and the remaining open issues.
+
+---
+
+## Current State (W15-post)
 
 | item | status |
 |---|---|
-| CPU suite | **191 tests green** (179 + 12 new W15 split tests) |
-| paper audit | **DONE** — arXiv:2504.19874 read line-by-line; every TQ code path checked against Alg. 1 / Alg. 2 / §5.3 |
-| conv write-path | **FIXED (3x)** — the paper's outlier-channel split replaces the fixed coordinate half-split (measured: rel-MSE 0.017-0.025 -> 0.007 at the SAME effective bits) |
-| S write-path | **AT the paper's floor** — 0.022 = exactly the Lloyd-Max blend (0.0345 b=3 + 0.0095 b=4); nothing to fix within 3.5-bit MSE quant |
-| install math | **EXONERATED** — the dequant-sum-requant chain is only 1.3x single-shot (P2); the sum was never the problem |
-| decode loop | **EXONERATED** — the roundtrip is idempotent (0.3%/step; re-quantizing a dequantized vector re-hits the same lattice) |
-| QJL (Alg. 2) | **PLUMBED** — `TQCache(qjl=True)` now reaches the whole flow (was unreachable from the cache stack) |
-| GPU action | **RE-INGEST + re-run the ladder** (commands below) |
+| CPU test suite | **191 tests green** (`python3 -m pytest src/rag/tests -q`) |
+| GPU kernel compilation | **OK** — FHT, GEMV, split-K kernels built |
+| Ingestion | **OK** — 100 chunks in ~360s |
+| Frame check (FHT) | **OK** — kernel matches reference (rel-MSE ~1e-14) |
+| S-read / conv paths | **OK** — all variants pass quant/dequant roundtrip |
+| true-doc control | **OK** — conf 0.895, generates correctly from raw cache |
+| Verification ladder | **6/6 stages PASS** |
+| QJL path | **BROKEN** — device mismatch bug |
+| Answer quality | **POOR** — garbage output on test queries |
+| Retrieval relevance | **POOR** — wrong documents retrieved |
 
 ---
 
-## The W15 Diagnosis (why "the TQ layer is fucked up")
+## What Works
 
-W14 proved every READ-level check passes while the full install generates
-garbage. W15 read the paper line-by-line, audited every TQ code path, and
-measured the WRITE-path distortion (the thing the read checks cannot see —
-they compare the cache read against the SAME codes' reference dequant,
-never against the true tensor). Three deviations from the paper, one
-exonerating finding:
+### 1. Core Pipeline
 
-### 1. The 3.5-bit recipe was NOT the paper's recipe (the big one)
+```
+ingestion → index → retrieval → install_snapshot → generation
+```
 
-The paper (§LongBench, the KV-cache results the repo chases): non-integer
-bits come from "splitting channels into outlier and non-outlier sets, and
-applying two independent instances of TurboQuant to each, allocating
-higher bit precision to outliers."
+- **Ingestion**: `run_ingestion.py` processes documents, captures TQ-compressed cache snapshots
+- **Index**: `run_index.py` builds IVFADC index (or flat at high dimension)
+- **Retrieve**: `rerank()` computes similarity scores between query vector and chunk vectors
+- **Install**: `install_snapshot()` sums TQ codes and installs to cache
+- **Generate**: `_greedy_decode()` produces tokens from installed cache state
 
-The repo (D2): a FIXED 50/50 coordinate split — first half 3 bits, second
-half 4 — data-oblivious to the channel-energy structure. The conv window
-(1x6144x4 mixed_qkv — exactly the paper's KV-cache setting) carries
-lognormal channel outliers; the fixed split hands the 4 bits to a fixed
-coordinate RANGE that ignores where the energy is.
+### 2. TQ Quantization (W15 fixes)
 
-**Measured (production geometry, channel-structured windows):**
+The W15 coding wave implemented paper-correct quantization:
 
+- **Outlier split** (§LongBench): top-k channels at 4 bits, rest at 3 bits, each with own pow2 full rotation
+- **Frame check passes**: CUDA FHT kernel (adjoint-roundtrip, kernel-vs-reference) at 1e-14 level
+- **TRUE-dist measurably improved**: conv window at 0.068 rel-MSE (vs 0.327 with old fixed split)
+- **All bisection variants pass read checks**
+
+### 3. Cache State Installation
+
+- **S codes**: sum via dequant-add-requant chain (1.3x single-shot noise)
+- **conv codes**: installed verbatim (never summed, §6 requirement)
+- **M1/M2 flags**: plumbed for future feature work
+
+### 4. GPU Stack
+
+- NVIDIA A10G 24GB VRAM
+- CUDA 13.2, PyTorch 2.7.0a0
+- FLA 0.5.2 (gated delta rule kernels)
+- Triton 3.2 (attention kernels)
+
+---
+
+## What Doesn't Work
+
+### 1. Answer Quality is Poor
+
+**Symptom**: Running the official questions against the corpus produces garbage text.
+
+```
+Query: What are the default size limits for file uploads...?
+Top 3: [70, 80, 71] scores [0.7232, 0.7072, 0.7071]
+Answer: -M", ( your  in J by,,, \, "...
+```
+
+The gold answer is:
+```
+The default limits are 10 MiB per file (max_file_size) and 50 MiB total 
+per request (max_total_request_size) for multipart uploads on the 
+OpenAI-compatible endpoints.
+```
+
+**Root cause unknown**. The bisection shows:
+- `true-doc` generates correctly (conf 0.895) from RAW cache
+- `full` (TQ-installed cache) generates garbage (conf 0.30)
+- Frame check passes — no kernel/reference split
+- S-read/conv checks pass — quant/dequant roundtrip OK
+
+**Hypothesis**: The TQ layer reads codes correctly in isolation but the **composed forward pass** corrupts state in a way the read checks don't catch.
+
+### 2. Retrieval Relevance is Poor
+
+The official question `qst_0001` expects document `dsid_ae068ee4aa9640159427cd941bef0238`. The system retrieved chunks `[70, 80, 71]` instead.
+
+This suggests either:
+- The query vector (from TQCache state) doesn't match the document's stored vector
+- The rerank similarity metric is misaligned
+- The ingestion captured incorrect cache state
+
+### 3. QJL Path Has Device Bug
+
+```
+RuntimeError: Expected all tensors to be on the same device, but found at least 
+two devices, cuda:0 and cpu!
+```
+
+In `turboquant.py::_attach_qjl`:
+```python
+resid = x32 - x_mse  # x32 is CUDA, x_mse is CPU
+```
+
+The MSE reconstruction wasn't moved to device before residual computation.
+
+---
+
+## The W15 Diagnosis
+
+W14 proved every READ-level check passes while the full install generates garbage. W15 read the paper line-by-line, audited every TQ code path, and measured the WRITE-path distortion. Key findings:
+
+### 1. The 3.5-bit recipe was NOT the paper's recipe (FIXED)
+
+The paper (§LongBench): non-integer bits come from "splitting channels into outlier and non-outlier sets, and applying two independent instances of TurboQuant to each, allocating higher bit precision to outliers."
+
+The old repo: FIXED 50/50 coordinate split — data-oblivious to channel-energy structure.
+
+**The fix**: Implemented outlier split with per-subset pow2 full rotation.
+
+**Measured improvement**:
 | recipe | eff bits | write-path rel-MSE |
 |---|---|---|
-| repo fixed half split (segmented 24,576 rotation) | 3.5 | 0.017-0.025 |
-| paper outlier split (top-k channels at 4 bits, own frame+norm; rest at 3) | 3.25 (!) | **0.007** |
+| old fixed half split | 3.5 | 0.017-0.025 |
+| paper outlier split | 3.25 | **0.007** |
 
-The paper's recipe is ~3x LOWER distortion at FEWER effective bits.
+### 2. Exonerated: the math
 
-### 2. The conv rotation was block-diagonal (W11's cost)
+- **codebooks.py**: faithful to the paper — Lloyd-Max solver, 1/sqrt(d) law
+- **S single-shot**: 0.022 rel-MSE = exactly the 3.5-bit blend floor
+- **install sum**: 1.3x single-shot, not 4x
+- **online decode loop**: idempotent (0.3%/step)
 
-The paper's Alg. 1 rotates ONCE with a full random rotation — every
-coordinate of a unit vector lands at variance 1/d, which is what the
-Lloyd-Max codebook assumes. The W11 24,576 unit rotates as TWO blocks
-(16,384 + 8,192) that never mix: block coords carry variance rho_b/b,
-matching the codebook only when energy splits proportionally. Measured:
-the segmented policy costs +25-35% distortion vs a full rotation at
-every outlier level.
+### 3. The residual noise budget
 
-**The W15 fix folds both:** the split's two sub-instances each get their
-own POWER-OF-TWO full rotation (12,288 -> 16,384 sub-units), so the
-paper's invariant holds per sub-set, and magnitude-homogeneous sub-sets
-make the block statistics benign by construction.
+The installed S state is ~0.08-0.11 rel-MSE from the true doc state — dominated by ONLINE INGESTION drift (the chunk prefill evolves from a 2.2%-noisy reseeded state through 300 tokens of recurrence).
 
-### 3. QJL (Alg. 2) was unreachable
-
-The repo's W9.2 qjl flag existed on TurboQuant but was never plumbed
-through TQCache/resolve_quantizer/install — the A/B contract could not
-run end-to-end. W15 plumbs it: `TQCache(..., qjl=True)` (and
-`--qjl` on every GPU script). The install's requant now inherits the
-cache's setting.
-
-### 4. Exonerated: the math the previous waves suspected
-
-- **codebooks.py**: faithful to the paper — the scaled-density Lloyd-Max
-  solver, the 1/sqrt(d) law, symmetric Voronoi layout; measured
-  mse_per_variance 0.0345 / 0.0095 = the paper's b=3/4 constants.
-- **S single-shot**: 0.022 rel-MSE = EXACTLY the 3.5-bit blend floor.
-  The full 2^19 rotation mixes everything; no channel structure to
-  exploit; nothing to fix at 3.5-bit MSE.
-- **install sum** (dequant-sum-requant): 1.3x single-shot, not 4x.
-- **online decode loop**: idempotent (0.3%/step) — re-quantizing a
-  dequantized vector re-hits the same lattice. G2's pass was real.
-- **the read paths**: W14 was right; they were never the owner.
-
-### The residual noise budget (what G5 actually carries)
-
-The installed S state is ~0.08-0.11 rel-MSE from the true doc state —
-dominated by the ONLINE INGESTION drift (the chunk prefill evolves from
-a 2.2%-noisy reseeded state through 300 tokens of recurrence) times the
-install chain (1.3x). The conv window was 0.02+ and is now ~0.007.
-true-doc (0% noise) generates at conf 0.895; every TQ variant sat at
-0.28-0.43 — the model is real-model sensitive to state noise, and the
-fixed-split conv was the marginal tipper in the W14 matrix (s-only and
-conv-only each passed; full failed only with BOTH doc-loaded).
+true-doc (0% noise) generates at conf 0.895; every TQ variant sat at 0.28-0.43 — the model is sensitive to state noise.
 
 ---
 
-## The W15 Implementation (same architecture, no fallbacks)
+## Key Files
 
-**`src/rag/turboquant.py`** — `TurboQuant(group=...)`: the paper's
-outlier split. group > 1 + non-integer bits => quant() routes to
-`_quant_split`: top-k energy channels (k = round(frac*n_ch), stable
-argsort) at bits_hi with their OWN pow2 full rotation (seed+555) and own
-fp32 norm; the rest at bits_lo with the kind's seed. TQCodes carries
-`partition="outlier"`, `group`, `mask` (packed channel bits),
-`norm_hi`. **Codes are self-describing** — dequant routes on
-codes.partition:
-  - outlier codes through the sub-quantizers;
-  - legacy "half" codes through the flat twin (pre-W15 snapshots decode
-    UNCHANGED);
-  - a flat-configured quantizer reading outlier codes routes through the
-    split twin (hooks/index/bisect paths stay correct).
-
-**`src/rag/tq_cache.py`** — `_init_conv` resolves the conv quantizer
-with `group = kernel`; the conv_codes setter and every generic reader
-resolve from the codes' own group; `TQCache(qjl=...)` plumbed to every
-layer quantizer.
-
-**`src/rag/install.py`** — the requant inherits the cache's qjl setting;
-conv codes still install VERBATIM (§6: conv is never summed); the report
-records the installed conv partition.
-
-**`src/rag/snapshot.py`** — the mask/group/norm_hi roundtrip
-(all-or-none per unit, refused loudly when partial); the sha256 digest
-covers the mask (tampering flips it); pre-W15 files load unchanged
-(the fields are optional).
-
-**Committed codebooks**: cb_b{3,4}_d{16384,8192}.npz (the production
-split sub-units), all with the exact paper constants.
-
-**GPU scripts**: bisect_install.py gains (a) the PURE frame check —
-adjoint-roundtrip + kernel-vs-reference at 1e-4 with NO codebook noise
-floor (the old check's ~0.02 floor could hide a subtle kernel drift);
-(b) the TRUE-dist row — the installed dequant vs the RAW doc state the
-true-doc control materializes (the write-path gate the W14 matrix
-lacked); (c) `--qjl` and `--split-half` A/Bs. verify_pipeline.py and
-run_query.py gain `--qjl`.
+| file | purpose |
+|------|---------|
+| `src/rag/tq_cache.py` | TQLinearAttentionLayer, _StateView, s_codes/conv_codes setters |
+| `src/rag/turboquant.py` | TurboQuant.quant/dequant, outlier split, QJL path |
+| `src/rag/install.py` | install_snapshot, sum_turboquant_codes |
+| `src/rag/snapshot.py` | Snapshot, save_snapshot, load_snapshot, load_chunk |
+| `src/rag/query.py` | answer_query, query_cache_vector, _greedy_decode |
+| `src/rag/index.py` | build_index, preselect, rerank, ChunkVectorLoader |
+| `scripts/gpu/run_ingestion.py` | Ingestion driver |
+| `scripts/gpu/run_query.py` | Query driver |
+| `scripts/gpu/bisect_install.py` | Diagnostic bisection script |
+| `scripts/gpu/verify_pipeline.py` | Verification ladder (G1-G6) |
 
 ---
 
-## GPU Box: What To Run (W15 verification)
+## Model Details
+
+- **Model**: Qwen3.5-9B palettized
+  - Path: `/home/ubuntu/qwen3_5_9B_palettized` + `_heads`
+  - vocab_size: 248,320
+  - EOS: `<|im_end|>` (id 248,046)
+  - 32 layers: [L,L,L,F]×8 (24 linear attention + 8 full attention)
+
+- **GDN Geometry**:
+  - k_heads: 8, v_heads: 32
+  - head_dim: 128
+  - conv window: 24,576 = 6,144×4 (FHT segments 16,384 + 8,192)
+  - S: 524,288 per layer (single 2^19 full rotation)
+
+- **Compression**:
+  - 6.01x achieved (4.63 GiB model)
+  - 3.5 bits per element effective
+  - Per-group LUT tables
+
+---
+
+## Dataset Details
+
+- **Corpus**: EnterpriseRAG-Bench (subset)
+  - Path: `/home/ubuntu/enterprise_rag_bench/documents/documents.jsonl`
+  - Documents ingested: 100 (out of 512K corpus)
+  - Questions: `/home/ubuntu/enterprise_rag_bench/questions/questions.jsonl`
+  - Each question has `expected_doc_ids` and `gold_answer`
+
+---
+
+## Bisection Matrix (W15)
+
+```
+variant      S-read   conv     TRUE   gen        conf   rep
+true-doc     -        -        -      OK        0.895  0.00
+reseed       OK       OK       OK     OK        0.449  0.00
+s-only       OK       OK       HIGH   OK        0.274  0.36
+conv-only    OK       OK       OK     OK        0.419  0.27
+full         OK       OK       HIGH   OK        0.300  0.36
+```
+
+**Key observation**: All variants "pass" gen gate (conf ≥ 0.20) but have low confidence. true-doc at 0.895 shows the model CAN generate correctly from document state.
+
+---
+
+## Open Investigations
+
+### 1. Why does full install produce garbage when true-doc produces correct output?
+
+**Hypothesis A: _StateView device/shape mismatch**
+
+The installed codes are readable by `TurboQuant.dequant` but `TQLinearAttentionLayer._StateView` may:
+- Read from stale `_s_codes` / `_conv_codes` attributes
+- Have device mismatch between codes and layer weights
+- Have shape mismatch between dequant output and expected geometry
+
+**Test**: Trace the exact code path when model generates:
+1. Does `_StateView.s` read `_s_codes` via dequant?
+2. Is the dequant output on CUDA?
+3. Does the shape match what the layer expects?
+
+**Hypothesis B: TQ layer forward corrupts state**
+
+The quant/dequant roundtrip passes standalone checks, but the composed layer forward may introduce corruption not visible in isolated dequant.
+
+**Test**: Run one forward pass through a TQLinearAttentionLayer with installed codes and compare output against the same input with raw cache.
+
+### 2. Why does retrieval return wrong documents?
+
+**Hypothesis: Query vector doesn't match stored vectors**
+
+The ingestion creates vectors from TQCache state at end-of-chunk. The query creates a vector from fresh TQCache after query prefill. If these states differ in quantization path, the vectors won't match.
+
+**Test**: 
+1. Load a chunk snapshot
+2. Run its document text through query prefill
+3. Compare the resulting vector against the stored vector
+
+**Hypothesis: Vector dimension mismatch**
+
+The manifest shows `vector_dims: 12582912` (12.5M). This is S (524288) × 24 layers. But the actual cache state may have different size.
+
+**Test**: Verify that `query_cache_vector` and `ChunkVectorLoader` use identical vector construction.
+
+### 3. Why is generation low-confidence even when passes?
+
+All variants show conf 0.27-0.45, far below true-doc's 0.895. This suggests:
+- The TQ noise floor is high enough to degrade generation
+- The model is sensitive to cache state perturbation
+- Or the generation is actually broken but passes the weak gate
+
+---
+
+## Commands
 
 ```bash
-cd /home/ubuntu/RAGGA && git pull
-python3 -m pytest src/rag/tests -q          # 191 must pass
+# Compile kernels
+cd /home/ubuntu/RAGGA/src/flute_extended
+python3 setup.py build_ext --inplace
 
-# 0) the pure frame check (no quant noise floor) — run once on the OLD
-#    disk to close the kernel question for good:
+# Run tests (CPU-only tests pass, GPU tests need CUDA)
+cd /home/ubuntu/RAGGA
+python3 -m pytest src/rag/tests -q --tb=short
+
+# Ingest documents
+python3 scripts/gpu/run_ingestion.py
+
+# Build index
+python3 scripts/gpu/run_index.py
+
+# Run verification ladder
+python3 scripts/gpu/verify_pipeline.py
+
+# Run bisection diagnostics
 python3 scripts/gpu/bisect_install.py
 
-# 1) RE-INGEST (the conv codes change geometry: partition=outlier;
-#    S/M1/M2 codes are UNCHANGED — same frame, same math):
-python3 scripts/gpu/run_ingestion.py    # same corpus, fresh disk dir
-python3 scripts/gpu/run_index.py        # rebuild (vectors unchanged in
-                                        # content: S codes identical)
+# Run query
+python3 scripts/gpu/run_query.py --question "Your question here" --max-new-tokens 64
 
-# 2) the ladder:
-python3 scripts/gpu/verify_pipeline.py
-python3 scripts/gpu/bisect_install.py   # now with the TRUE-dist row
-
-# 3) the W15 A/Bs (the paper's levers):
-python3 scripts/gpu/bisect_install.py --split-half   # conv recipe A/B
-python3 scripts/gpu/verify_pipeline.py --qjl          # Alg.-2 A/B
+# Run against benchmark questions
+python3 scripts/gpu/run_query.py --questions-file /home/ubuntu/enterprise_rag_bench/questions/questions.jsonl --n-questions 10 --max-new-tokens 64
 ```
 
-### Reading the new bisect matrix
+---
 
-```
-variant      S-read   conv    TRUE     gen      conf   rep
-true-doc     -        -       -        OK       0.895  0.00   (control)
-reseed       OK       OK      OK       OK       ...
-s-only       OK       OK      OK       ...
-conv-only    OK       OK      OK       ...
-full         OK       OK      OK?      ???      ...    ...
-```
+## Session History Summary
 
-- **TRUE HIGH with reads OK** => the write path owns the distortion
-  (codes decode fine, encode badly) — the recipe A/Bs are the lever.
-- **full gen OK** => the W15 fix closed G5 (expected: the conv window's
-  write distortion drops 3x; full's marginal S+conv interaction was the
-  W14 cliff).
-- **full still GARBAGE with TRUE OK** => the residual is the S-path
-  ingestion drift (~0.08-0.11, the online recurrence amplification) —
-  then run `--qjl` (the paper's Alg. 2: ~1.6x MSE improvement for +1
-  bit/coordinate — the D1 A/B the Phase-5 gate was designed to decide).
+- **W1-W11**: Fixed 179 tests, built kernels, ingested documents
+- **W12**: Investigated "S-read DRIFT" — turned out to be measurement bug in bisection script
+- **W13**: Added test gates for S+conv combination
+- **W14**: Proved frame check OK, true-doc OK, but full install still garbage
+- **W15**: Implemented paper-correct outlier split, improved conv TRUE-dist
+- **W15-post**: Verification ladder passes, but answer quality remains poor
 
-### Model Details (unchanged)
+---
 
-- Qwen3.5-9B palettized — /home/ubuntu/qwen3_5_9B_palettized (+ _heads)
-- vocab_size 248,320; EOS <|im_end|> (id 248,046)
-- 32 layers ([L,L,L,F]x8 — 24 linear + 8 full-attention)
-- GDN geometry: k_heads 8 / v_heads 32, head dims 128
-- conv window 24,576 = 6,144x4 (W15: split sub-units 12,288 -> 16,384 x2)
-- S = 524,288 per layer (single 2^19 full rotation — the paper's invariant)
+## Remaining Work
 
-## Test Command
+1. **Debug retrieval**: Why are wrong documents being retrieved?
+2. **Debug generation**: Why does TQ-installed cache produce garbage when true-doc produces correct output?
+3. **Fix QJL**: Device mismatch in `_attach_qjl`
+4. **Evaluate against full benchmark**: Run all 500 questions, compute accuracy
 
-```bash
-cd /home/ubuntu/RAGGA && python3 -m pytest src/rag/tests -q --tb=short
-```
+---
 
-191 tests pass on CPU (179 pre-W15 + 12 new:
-test_turboquant_split.py — split fidelity vs flat at the same budget,
-group=1 bit-parity, serialization/digest/tamper, cross-semantics reads
-both directions, the layer path, the install path, construction guards).
+## Contact Points in Code
+
+- Query vector: `src/rag/query.py::query_cache_vector`
+- Retrieval: `src/rag/index.py::rerank`
+- Install: `src/rag/install.py::install_snapshot`
+- Generation: `src/rag/query.py::_greedy_decode`
+- TQ layer: `src/rag/tq_cache.py::TQLinearAttentionLayer`
+- Quant: `src/rag/turboquant.py::TurboQuant.quant`
+- Dequant: `src/rag/turboquant.py::TurboQuant.dequant`
+
+---
+
+## End State
+
+**Technical infrastructure works. Answer quality does not.**
+
+The pipeline executes without crashes. All test gates pass. But the end-to-end RAG experience produces garbage answers.
+
+The next investigator should focus on:
+1. Why `true-doc` (raw cache) works but `full` (TQ cache) doesn't
+2. Why retrieval returns wrong documents
+3. Whether the query vector construction matches the stored vectors
+
+Good luck.
