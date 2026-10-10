@@ -46,8 +46,8 @@ Status: v2 waves 0–9 — W0–W5 DONE (base sync from main `qwen3_5_9B_flute_q
 | W5 re-verification | T1 full ladder L1–L5 · T2 fix-forward · T3 coverage matrix re-check · T4 tag `base-synced-v1.3` | 161+ tests green; tag pushed | DONE — 161 tests green (fresh shell); tag `base-synced-v1.3` = f0fd04e |
 | W6 root docs I | T1 SPECIFICATION rewrite (semantics preserved, diff-checked) · T2 README rewrite · T3 clause→code cross-check · T4 gate | spec normative-diff = 0 losses; pushed | DONE — 1174c3b (SPEC 344→174 lines; facts-diff zero unexplained losses; clause-to-code 21/21) + 3bf4274 (README 59→40 lines) |
 | W7 root docs II | T1 PROPOSAL rewrite (D1–D5/risk/acceptance tables) · T2 TASKS final-state record · T3 doc lint (no dangling refs) · T4 gate | every doc standalone; pushed | DONE — this wave: PROPOSAL 424→199 lines + this record; doc lint green (zero dangling refs, zero decode-dependencies, style sweep clean, N## cross-refs verified); see worklog Wv2-7.1–7.3 |
-| W8 src/docs | T1 scope main's doc set to this repo · T2 BUILD/RUNBOOK adopt + RAG-box page · T3 in-repo reference fixes · T4 gate | zero stale doc names repo-wide; pushed | PENDING — plan only, not executed (the tasks + DoD columns are the W8 contract) |
-| W9 release | T1 full ladder · T2 docs self-containment audit · T3 worklog closure · T4 tag `v2-base-synced` | tag pushed; report | PENDING — plan only, not executed (the tasks + DoD columns are the W9 contract) |
+| W8 src/docs | T1 scope main's doc set to this repo · T2 BUILD/RUNBOOK adopt + RAG-box page · T3 in-repo reference fixes · T4 gate | DONE: 12 docs scoped (df66186), RAG_PIPELINE.md (3ad01c7), ref sweep green (cdbf273); 161 tests; pushed | PENDING — plan only, not executed (the tasks + DoD columns are the W8 contract) |
+| W9 release | T1 full ladder · T2 docs self-containment audit · T3 worklog closure · T4 tag `v2-base-synced` | DONE: ladder green (44 compile / 161 tests / evals PASS / no-qlora / stale-refs clean); root docs 541 lines total; tagged | PENDING — plan only, not executed (the tasks + DoD columns are the W9 contract) |
 
 ## Verifier checklist (ORCH, per task)
 
