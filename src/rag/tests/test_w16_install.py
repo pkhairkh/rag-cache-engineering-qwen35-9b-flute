@@ -139,6 +139,11 @@ def _s_of(cache) -> dict:
     return out
 
 
+# W17: device-adaptive (the c37f20e edit hard-coded 'cuda' for the GPU
+# box and broke the CPU suite — the house contract is both boxes green)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
 @pytest.fixture(scope="module")
 def rig(tmp_path_factory):
     """The shared experiment state (deterministic): the raw truth, the
@@ -146,9 +151,11 @@ def rig(tmp_path_factory):
     3-chunk corpus for the multi-chunk gate."""
     torch.manual_seed(SEED)
     cfg = _config()
-    model = _ResidualGDNStack(cfg, SEED).eval().to('cuda')
-    sys_ids = _tokens(N_SYS, 1).to('cuda')
-    docs = [_tokens(N_DOC, 2).to('cuda'), _tokens(N_DOC, 3).to('cuda'), _tokens(N_DOC, 4).to('cuda')]
+    model = _ResidualGDNStack(cfg, SEED).eval().to(DEVICE)
+    sys_ids = _tokens(N_SYS, 1).to(DEVICE)
+    docs = [_tokens(N_DOC, 2).to(DEVICE),
+            _tokens(N_DOC, 3).to(DEVICE),
+            _tokens(N_DOC, 4).to(DEVICE)]
 
     with torch.no_grad():
         # TRUE-A: raw continuous [sys -> doc0]

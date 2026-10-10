@@ -17,7 +17,8 @@ __all__ = ["load_quant_model"]
 def load_quant_model(artifacts_dir, model_name, device,
                      residual=False, dtype=None, forward="kernel",
                      awq_compensation=True, heads_dir=None,
-                     use_m1m2=True, m1m2_mem_size=128):
+                     use_m1m2=True, m1m2_mem_size=128,
+                     m1m2_gates_path=None):
     """The quant loader. Returns (model, metadata).
 
     forward: "kernel" (the box default — the FLUTE fused path) or
@@ -33,8 +34,21 @@ def load_quant_model(artifacts_dir, model_name, device,
     transformer layers from artifacts_dir and embed_tokens/lm_head from
     heads_dir (the separate head-pass output with higher-quality LUT).
 
-    use_m1m2: enable M1/M2 global memories (default True for RAGGA).
-    m1m2_mem_size: memory size for M1/M2 (default 128).
+    use_m1m2 (W17): attach the SPECIFICATION §2.2 global memories by
+    instantiating through the VENDORED Qwen3.5 classes (the native
+    AutoModelForCausalLM class has no wiring — the flag was a silent
+    no-op before W17). Zero-init gates (P3) leave the model's outputs
+    bit-unchanged until the §7 fine-tune opens them.
+
+    m1m2_mem_size: the memories' slot count (spec §2.2 default 128 =
+    the canonical 524,288-element unit; 1024/4096/8192 are the
+    retrieval-capacity experiments — the §4 vector and the snapshot
+    grow accordingly; INGEST and QUERY must agree on it, the loaders
+    fail loudly on drift).
+
+    m1m2_gates_path: optional .npz of trained gates (§7 fine-tune,
+    rag/m1m2_finetune.py::save_gates) — loaded with geometry
+    validation; without it the gates stay at the P3 zero/one init.
     """
     if dtype is None:
         import torch
@@ -44,4 +58,5 @@ def load_quant_model(artifacts_dir, model_name, device,
         artifacts_dir, model_name, device=device, dtype=dtype,
         residual=residual, reference=(forward == "reference"),
         awq_compensation=awq_compensation, heads_dir=heads_dir,
-        use_m1m2=use_m1m2, m1m2_mem_size=m1m2_mem_size)
+        use_m1m2=use_m1m2, m1m2_mem_size=m1m2_mem_size,
+        m1m2_gates_path=m1m2_gates_path)

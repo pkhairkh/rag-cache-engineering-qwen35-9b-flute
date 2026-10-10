@@ -1099,6 +1099,17 @@ class Qwen3_5PreTrainedModel(PreTrainedModel):
         # We initialize with 0s to be 1 centered as the RMSNorm here does (1 + weight)
         elif isinstance(module, Qwen3_5RMSNorm):
             init.zeros_(module.weight)
+        # W17: the M1/M2 gates (duck-typed — the module is imported
+        # lazily in Qwen3_5TextModel.__init__): from_pretrained treats
+        # the gate vectors as MISSING keys (they never ride in a
+        # checkpoint) and re-initializes them through THIS hook —
+        # without the branch the P3 contract (write 0.0 / read 1.0)
+        # breaks and the loader serves garbage gates (test_w17_3).
+        elif hasattr(module, "write_gate_k") and hasattr(module, "read_gate") \
+                and torch.is_tensor(module.write_gate_k):
+            init.zeros_(module.write_gate_k)
+            init.zeros_(module.write_gate_v)
+            init.ones_(module.read_gate)
 
 
 @auto_docstring

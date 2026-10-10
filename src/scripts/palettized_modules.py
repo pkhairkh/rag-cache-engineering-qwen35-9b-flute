@@ -3269,7 +3269,8 @@ def load_palettized_model(artifacts_dir: str, model_name: str,
                           awq_compensation: bool = True,
                           heads_dir: Optional[str] = None,
                           use_m1m2: bool = True,
-                          m1m2_mem_size: int = 128):
+                          m1m2_mem_size: int = 128,
+                          m1m2_gates_path: Optional[str] = None):
     """Load the base model and swap in the idx4 artifacts.
 
     Shared by the evaluators (main project: eval_greedy_match, eval_ppl)
@@ -3296,18 +3297,83 @@ def load_palettized_model(artifacts_dir: str, model_name: str,
     (higher quality LUT with compensation streams + residual) with the
     layer artifacts from the main pass.
 
-    use_m1m2: enable M1/M2 global memories (default True for RAGGA).
-    m1m2_mem_size: memory size for M1/M2 (default 128).
+    W17 — M1/M2 (SPECIFICATION §2.2's two global memories, the retrieval
+    state the §7 fine-tune trains):
+
+    use_m1m2 (default True): instantiate through the VENDORED Qwen3.5
+    classes (this repo's src/scripts/modeling.py — the byte-faithful
+    text-only copy PLUS the M1/M2 wiring). `AutoModelForCausalLM`
+    resolves the NATIVE transformers class, which carries no wiring: the
+    use_m1m2 flag was a silent no-op there (the W16 handover's "M1/M2
+    NOT ACTIVATED"). The flags must ALSO land on the TEXT config —
+    Qwen3_5TextModel.__init__ unwraps the composite
+    (`_get_text_config(config)`) and reads them THERE; setting them on
+    the composite wrapper alone is the second silent no-op. Both are
+    done here.
+
+    m1m2_mem_size (default 128): the memories' slot count; the state is
+    (num_heads=32, mem_size, head_dim=128). 128 is the spec §2.2 geometry
+    (524,288 elements = the canonical M1/M2 quantization unit, d=2^19);
+    1024/4096/8192 are the retrieval-capacity experiments — the §4
+    vector grows by 2 x (32*mem*128) dims, the index/loader/manifest
+    adapt automatically (dims come from the codes on disk). Power-of-two
+    mem keeps the unit a power of two (recommended, NOT required — the
+    segmented FHT quantizes any d).
+
+    m1m2_gates_path: optional .npz of TRAINED gates (the §7 fine-tune,
+    rag/m1m2_finetune.py::save_gates) — loaded into the module with loud
+    geometry validation. Without it the gates stay at the P3 zero/one
+    init: M1/M2 are bit-unchanged no-ops (the untrained model's outputs
+    are IDENTICAL to the native class's; test_w17 pins this parity).
+
+    The composite-checkpoint key mapping (Qwen/Qwen3.5-9B saves the text
+    weights under `model.language_model.*`): from_pretrained's conversion
+    table resolves the PrefixChange for LIBRARY classes only — the
+    vendored module counts as "custom code" (is_custom_code: __module__
+    not under 'transformers.'), the lookup is SKIPPED, and the text
+    weights silently re-initialize (19/28 random at the rig — a
+    garbage-model generator). The official `key_mapping` kwarg carries
+    the SAME prefix strip explicitly; test_w17 verifies every text
+    weight loads bit-equal to the native-class load.
     """
-    from transformers import AutoModelForCausalLM, AutoConfig
+    from transformers import AutoConfig
     metadata = load_metadata(artifacts_dir)
-    # Load config and enable M1/M2 before model instantiation
+    # the vendored Qwen3.5 (text-only, byte-faithful, M1/M2-wired). The
+    # guarded import mirrors modeling.py's own lazy-anchor pattern: if
+    # this module is importable, its sibling `modeling` is reachable once
+    # src/scripts is anchored (house convention, src/rag/_paths.py).
+    try:
+        import modeling as _vendored
+    except ImportError:  # pragma: no cover — path not anchored by the caller
+        import os as _os
+        import sys as _sys
+        _here = _os.path.dirname(_os.path.abspath(__file__))
+        if _here not in _sys.path:
+            _sys.path.insert(0, _here)
+        import modeling as _vendored
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    # W17: the flags live on the TEXT config (the vendored TextModel
+    # unwraps the composite and reads them there); mirrored on the
+    # composite for visibility.
+    _tcfg = getattr(config, "text_config", None)
+    if _tcfg is None:
+        _tcfg = config
     if use_m1m2:
+        if isinstance(m1m2_mem_size, bool) or not isinstance(m1m2_mem_size, int) \
+                or m1m2_mem_size < 1:
+            raise ValueError(
+                f"load_palettized_model: m1m2_mem_size must be a positive "
+                f"int, got {m1m2_mem_size!r}")
+        _tcfg.use_m1m2 = True
+        _tcfg.m1m2_mem_size = int(m1m2_mem_size)
         config.use_m1m2 = True
-        config.m1m2_mem_size = m1m2_mem_size
-    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, dtype=dtype,
-        low_cpu_mem_usage=True, config=config)
+        config.m1m2_mem_size = int(m1m2_mem_size)
+    model = _vendored.Qwen3_5ForCausalLM.from_pretrained(
+        model_name, trust_remote_code=True, dtype=dtype,
+        low_cpu_mem_usage=True, config=config,
+        key_mapping=_TEXT_FROM_COMPOSITE_KEY_MAPPING)
+    if use_m1m2:
+        _verify_m1m2_attached(model, m1m2_mem_size)
     awq_scales: Dict = {}
     if apply_norm_edits:
         norm_doc = _read_norm_gain_doc(artifacts_dir)
@@ -3322,6 +3388,87 @@ def load_palettized_model(artifacts_dir: str, model_name: str,
                                    residual=residual, reference=reference,
                                    awq_scales=awq_scales,
                                    heads_dir=heads_dir)
+    if use_m1m2 and m1m2_gates_path:
+        # after the swap (orthogonal: the gates live on the M1M2 module,
+        # which holds no nn.Linear) — the trained gates from the §7
+        # fine-tune, geometry-validated.
+        _load_m1m2_gates(model, m1m2_gates_path)
     model = model.to(device)
     model.eval()
     return model, metadata
+
+
+#: W17: the official from_pretrained key mapping that strips the composite
+#: checkpoint's text-submodule prefix (`model.language_model.X` ->
+#: `model.X`) — what the library-internal conversion table resolves for
+#: NATIVE classes (PrefixChange) and what the vendored ("custom code")
+#: classes must carry explicitly (is_custom_code skips the table lookup;
+#: without this the text weights silently re-initialize).
+_TEXT_FROM_COMPOSITE_KEY_MAPPING = {
+    r"^model\.language_model\.(.+)$": r"model.\1",
+}
+
+
+def _verify_m1m2_attached(model, m1m2_mem_size: int) -> None:
+    """Loud verification that the M1/M2 wiring actually landed (the W17
+    bug this replaces was SILENT — flags set, no module, no writes).
+
+    Checks: the module exists on the inner text model; it is SHARED
+    (plain-object refs) by every linear-attention layer with ascending
+    ordinals; the geometry matches the requested mem_size; the gates sit
+    at the P3 init (write 0.0 / read 1.0) unless a checkpoint loaded
+    them (this runs pre-gates-load — from_pretrained leaves the new
+    params at init)."""
+    inner = getattr(model, "model", model)
+    m1m2 = getattr(inner, "m1m2", None)
+    if m1m2 is None:
+        raise RuntimeError(
+            "load_palettized_model(use_m1m2=True): the vendored "
+            "Qwen3_5TextModel did NOT attach m1m2 — the wiring contract "
+            "(modeling.py use_m1m2 flag on the TEXT config) broke; refusing "
+            "to return an unwired model silently (the W17 root cause)")
+    n_linear = 0
+    for layer in inner.layers:
+        if getattr(layer, "block_type", "") == "linear_attention":
+            la = layer.linear_attn
+            if getattr(la, "m1m2", None) is not m1m2:
+                raise RuntimeError(
+                    f"load_palettized_model: linear layer's m1m2 ref is "
+                    f"not the shared module (wiring broke at linear "
+                    f"ordinal {n_linear})")
+            if int(getattr(la, "m1m2_linear_ordinal", -1)) != n_linear:
+                raise RuntimeError(
+                    f"load_palettized_model: m1m2_linear_ordinal "
+                    f"{getattr(la, 'm1m2_linear_ordinal', -1)} != "
+                    f"{n_linear} — the ordinal wiring broke")
+            n_linear += 1
+    if m1m2.num_linear_layers != n_linear:
+        raise RuntimeError(
+            f"load_palettized_model: M1M2.num_linear_layers "
+            f"{m1m2.num_linear_layers} != the model's {n_linear} linear "
+            f"layers — gate-vector geometry mismatch")
+    if m1m2.mem_size != int(m1m2_mem_size):
+        raise RuntimeError(
+            f"load_palettized_model: M1M2.mem_size {m1m2.mem_size} != "
+            f"the requested {m1m2_mem_size}")
+    print(f"  [W17] M1/M2 ATTACHED: shared over {n_linear} linear layers, "
+          f"state ({m1m2.num_heads}, {m1m2.mem_size}, {m1m2.head_dim}) "
+          f"= {m1m2.num_heads * m1m2.mem_size * m1m2.head_dim:,} elements "
+          f"per memory; gates at P3 init (write 0.0 / read 1.0)",
+          flush=True)
+
+
+def _load_m1m2_gates(model, path: str) -> None:
+    """Load a trained-gates .npz into the model's M1M2 module (loud,
+    geometry-validated). Delegates to rag/m1m2_finetune.load_gates (the
+    same artifact the fine-tune saves)."""
+    import os as _os
+    import sys as _sys
+    _rag = _os.path.normpath(_os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)), "..", "rag"))
+    if _rag not in _sys.path:
+        _sys.path.insert(0, _rag)
+    from m1m2_finetune import load_gates
+    inner = getattr(model, "model", model)
+    load_gates(inner.m1m2, path)
+    print(f"  [W17] trained M1/M2 gates loaded from {path}", flush=True)

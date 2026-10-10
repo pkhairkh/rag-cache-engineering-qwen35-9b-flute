@@ -8,6 +8,13 @@ Every script under scripts/gpu/ does:
 (relative to this file — the tools run from anywhere); `load_model()` wraps
 src/scripts/loader.load_quant_model with the box's default artifact paths
 (all overridable per script).
+
+W17: `load_model` threads the M1/M2 activation through the real loader
+(`load_quant_model(use_m1m2=..., m1m2_mem_size=..., m1m2_gates_path=...)`
+— the vendored-class wiring; setting config flags on the loaded model
+AFTER instantiation wires nothing, the W16 lesson). INGEST and QUERY must
+agree on mem_size — pass the SAME --m1m2-mem-size to both (the loaders
+fail loudly on geometry drift).
 """
 import os
 import sys
@@ -36,18 +43,23 @@ DEFAULTS = {
 
 
 def load_model(artifacts_dir=None, heads_dir=None, model_name=None,
-               device=None, use_m1m2=True):
+               device=None, use_m1m2=True, m1m2_mem_size=128,
+               m1m2_gates_path=None):
     """load_quant_model with the box defaults (loader.py's entry point).
+
+    W17: use_m1m2/m1m2_mem_size/m1m2_gates_path pass through to the REAL
+    loader path (the vendored-class instantiation + wiring — see
+    palettized_modules.load_palettized_model's W17 docstring). Zero-init
+    gates are bit-unchanged no-ops, so use_m1m2=True is safe for every
+    flow; trained gates come from scripts/gpu/finetune_m1m2.py's artifact.
     """
     from loader import load_quant_model
     model, meta = load_quant_model(
         artifacts_dir=artifacts_dir or DEFAULTS["artifacts_dir"],
         model_name=model_name or DEFAULTS["model_name"],
         device=device or DEFAULTS["device"],
-        heads_dir=heads_dir or DEFAULTS["heads_dir"])
-    # Enable M1/M2 global memories
-    if use_m1m2:
-        model.config.use_m1m2 = True
-        model.config.m1m2_mem_size = getattr(model.config, 'm1m2_mem_size', 128)
+        heads_dir=heads_dir or DEFAULTS["heads_dir"],
+        use_m1m2=use_m1m2, m1m2_mem_size=m1m2_mem_size,
+        m1m2_gates_path=m1m2_gates_path)
     model = model.eval()
     return model, meta

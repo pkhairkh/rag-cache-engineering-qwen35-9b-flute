@@ -44,8 +44,9 @@ from _bootstrap import DEFAULTS, boot, load_model
 boot()
 
 from index import (ChunkVectorLoader, build_retrieval_frame,  # noqa: E402
-                   load_system_state, rerank)
-from ingest import reseed_cache  # noqa: E402
+                   rerank)
+from ingest import (check_m1m2_geometry, load_system_state,  # noqa: E402
+                    m1m2_mem_size_from_system, reseed_cache)
 from query import query_cache_vector  # noqa: E402
 from tq_cache import TQCache  # noqa: E402
 
@@ -79,23 +80,43 @@ def main() -> int:
     ap.add_argument("--n-questions", type=int, default=20)
     ap.add_argument("--top-k", type=int, default=3)
     ap.add_argument("--bits", type=float, default=3.5)
+    ap.add_argument("--m1m2-mem-size", type=int, default=None,
+                    help="W17: override the M1/M2 slot count (default: "
+                         "resolved from the corpus's system_state.npz)")
+    ap.add_argument("--m1m2-gates", default=None,
+                    help="W17: trained-gates .npz — the SAME artifact the "
+                         "corpus was ingested with")
+    ap.add_argument("--no-m1m2", action="store_true",
+                    help="W17: load without the wiring")
     args = ap.parse_args()
 
     print("=" * 60)
     print("RAGGA RETRIEVAL EVAL (scripts/gpu/eval_retrieval.py)")
     print("=" * 60)
 
-    print("\n[1] Loading model + tokenizer...")
-    model, _ = load_model(args.artifacts_dir, args.heads_dir, args.model_name)
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-
     print(f"\n[2] Loading corpus vectors from {args.disk_dir}...")
     loader = ChunkVectorLoader(args.disk_dir, bits=args.bits)
     system = load_system_state(args.disk_dir)
+    mem_size = args.m1m2_mem_size
+    if mem_size is None:
+        mem_size = m1m2_mem_size_from_system(system)
+        if mem_size is None and not args.no_m1m2:
+            mem_size = 128
     chunks = np.array(loader.chunk_ids())
     print(f"    {len(chunks)} chunks; layout "
-          f"{loader.manifest.get('chunk_protocol', 'delta-v1')}")
+          f"{loader.manifest.get('chunk_protocol', 'delta-v1')}; "
+          f"m1m2 mem_size {mem_size if mem_size else 'OFF'}")
+
+    print("\n[1] Loading model + tokenizer "
+          f"(m1m2_mem_size={mem_size or 128})...")
+    model, _ = load_model(args.artifacts_dir, args.heads_dir,
+                          args.model_name,
+                          use_m1m2=not args.no_m1m2,
+                          m1m2_mem_size=mem_size or 128,
+                          m1m2_gates_path=args.m1m2_gates)
+    check_m1m2_geometry(model, system, mem_size)
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
     print("\n[3] Building the centered frame (sys + corpus mean)...")
     frame = build_retrieval_frame(loader)

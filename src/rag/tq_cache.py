@@ -677,6 +677,8 @@ class TQCache(DynamicCache):
     def read_m1(self, dtype: torch.dtype = torch.float16) -> Optional[torch.Tensor]:
         if self._m1_codes is None:
             return None
+        self._check_m_geometry("read_m1", "M1", self._m1_codes.d,
+                               self._m1_shape)
         t = self._tq_m1.dequant(self._m1_codes, dtype=dtype).reshape(self._m1_shape)
         if self._m_device is not None and t.device != self._m_device:
             t = t.to(self._m_device)
@@ -708,10 +710,33 @@ class TQCache(DynamicCache):
     def read_m2(self, dtype: torch.dtype = torch.float16) -> Optional[torch.Tensor]:
         if self._m2_codes is None:
             return None
+        self._check_m_geometry("read_m2", "M2", self._m2_codes.d,
+                               self._m2_shape)
         t = self._tq_m2.dequant(self._m2_codes, dtype=dtype).reshape(self._m2_shape)
         if self._m_device is not None and t.device != self._m_device:
             t = t.to(self._m_device)
         return t
+
+    @staticmethod
+    def _check_m_geometry(op: str, which: str, d: int, shape) -> None:
+        """W17: the M1/M2 codes' flat dim must match the recorded state
+        shape — a mismatch (codes installed from another mem_size) is a
+        LOUD, actionable error, never a bare torch reshape failure."""
+        if shape is None:
+            return
+        numel = 1
+        try:
+            for s in shape:
+                numel *= int(s)
+        except TypeError:
+            return  # unknown geometry — the flat read is the contract
+        if int(d) != numel:
+            raise ValueError(
+                f"TQCache.{op}: the {which} codes carry d={int(d)} but "
+                f"the recorded state shape {tuple(shape)} holds {numel} "
+                f"elements — an M1/M2 geometry mismatch (the codes and "
+                f"the module/state were built at different mem_size; "
+                f"re-ingest or reload with the matching geometry)")
 
     @property
     def m2_codes(self) -> Optional[TQCodes]:

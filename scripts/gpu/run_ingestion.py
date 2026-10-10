@@ -40,6 +40,21 @@ def main() -> int:
                     help="truncate each document to N tokens (0 = full text)")
     ap.add_argument("--system-prompt", default="You are a helpful AI assistant.")
     ap.add_argument("--bits", type=float, default=3.5)
+    ap.add_argument("--m1m2-mem-size", type=int, default=1024,
+                    help="W17: the M1/M2 memories' slot count (spec §2.2 "
+                         "default 128; the handover's retrieval "
+                         "experiments: 1024/4096/8192). The snapshot "
+                         "gains 2 x (32*mem*128)-dim m1/m2 code units; "
+                         "query/index must use the SAME value (the "
+                         "loaders fail loudly on drift)")
+    ap.add_argument("--m1m2-gates", default=None,
+                    help="W17: trained-gates .npz (finetune_m1m2.py's "
+                         "artifact) — without it the gates stay at the "
+                         "P3 zero init and the m1/m2 units are zero (the "
+                         "retrieval signal appears only after training)")
+    ap.add_argument("--no-m1m2", action="store_true",
+                    help="W17: load without the M1/M2 wiring (the "
+                         "W16-exact A/B; snapshots carry no m1/m2 units)")
     ap.add_argument("--chunk-protocol", choices=("absolute", "delta-v1"),
                     default="absolute",
                     help="W16: 'absolute' (default) stores the cache's own "
@@ -55,7 +70,10 @@ def main() -> int:
     print("=" * 60)
 
     print("\n[1] Loading model...")
-    model, _ = load_model(args.artifacts_dir, args.heads_dir, args.model_name)
+    model, _ = load_model(args.artifacts_dir, args.heads_dir, args.model_name,
+                          use_m1m2=not args.no_m1m2,
+                          m1m2_mem_size=args.m1m2_mem_size,
+                          m1m2_gates_path=args.m1m2_gates)
 
     from transformers import AutoTokenizer
     print("[2] Loading tokenizer...")

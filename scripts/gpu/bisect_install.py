@@ -146,7 +146,8 @@ def main() -> int:
     from transformers import AutoTokenizer
     from transformers.cache_utils import DynamicLayer, LinearAttentionCacheLayerMixin
     from transformers import DynamicCache
-    from ingest import load_system_state, reseed_cache
+    from ingest import (check_m1m2_geometry, load_system_state,
+                        m1m2_mem_size_from_system, reseed_cache)
     from install import install_snapshot
     from snapshot import load_chunk
     from tq_cache import TQCache, resolve_quantizer
@@ -164,9 +165,13 @@ def main() -> int:
     print(f"{'FLUTE_NO_FLA=1 (torch decode) ' if args.fla_off else ''}")
     print("=" * 60)
 
-    model, _ = load_model(args.artifacts_dir, args.heads_dir, args.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     system = load_system_state(args.disk_dir)
+    mem_size = m1m2_mem_size_from_system(system)
+    model, _ = load_model(args.artifacts_dir, args.heads_dir,
+                          args.model_name,
+                          m1m2_mem_size=mem_size or 128)
+    check_m1m2_geometry(model, system, mem_size)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     snap = load_chunk(os.path.join(args.disk_dir, "snapshots",
                                    f"chunk_{args.chunk:05d}.npz"))
     print(f"    chunk layout: {snap.protocol} "

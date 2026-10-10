@@ -2,310 +2,211 @@
 
 ## Current State
 
-W16 fixes deployed and verified. Retrieval frame works correctly but cache-state vectors don't align questions with documents. **M1/M2 global memories are the intended retrieval mechanism but are currently inactive.**
+W17 deployed: **M1/M2 are ACTUALLY attached now** (the loader instantiates the vendored Qwen3.5 classes with the wiring), the §7 gate trainer exists end-to-end (capture/replay/InfoNCE/artifact), and the full pipeline (ingest → snapshot → index → query → install) is M1/M2-aware with loud geometry guards. **224 CPU tests green** (204 + 20 W17 gates). The box must run the TRAIN → RE-INGEST → EVAL sequence below.
 
 | Component | Status |
 |-----------|--------|
-| GPU kernels | ✓ Compiled |
-| Ingestion | ✓ 100 chunks with absolute protocol |
-| W16 tests | ✓ All 7 pass |
-| Retrieval frame | ✓ Works (perfect discrimination when vectors match) |
-| TRUE-dist | ✓ Improved (0.10 → 0.040) |
-| M1/M2 | ✗ NOT ACTIVATED - loader uses default model class |
+| M1/M2 activation (the loader) | ✓ FIXED (W17) — vendored class + text-config flags + `key_mapping` |
+| Gate fine-tune (§7) | ✓ NEW — `scripts/gpu/finetune_m1m2.py` + `src/rag/m1m2_finetune.py` |
+| m1m2_mem_size experiments | ✓ plumbed (ingest 1024 default; query auto-resolves from disk) |
+| Pipeline M1/M2 flow | ✓ snapshot/loader/index/install all geometry-adaptive |
+| CPU test suite | ✓ 224 passed (the c37f20e hard-coded `cuda` regression fixed) |
+| Retrieval quality with TRAINED gates | ⏳ PENDING the GPU box's fine-tune + re-ingest + eval |
 
 ---
 
-## The Problem
+## The W17 Root-Cause Diagnosis (why "M1/M2 NOT ACTIVATED")
 
-**Question vectors don't match document vectors:**
-- Cosine between question and its target doc: ~0.50-0.58
-- Cosine between doc and itself: 1.0
-- The S vectors (linear attention state) are not discriminative for retrieval
+The W16-post handover said "loader uses default model class" — the full
+picture is a **triple silent no-op**, each layer of which was pinned by a
+CPU gate:
 
-**Retrieval results (50% hit rate):**
-```
-Q0: Expected chunk 77 → Got [70, 82, 71] → MISS
-Q1: Expected chunk 80 → Got [70, 80, 82] → HIT (rank 2)
-Q2: Expected chunk 86 → Got [70, 71, 80] → MISS  
-Q3: Expected chunk 71 → Got [70, 71, 80] → HIT (rank 2)
-```
+1. **The native class has no wiring at all.** `AutoModelForCausalLM` on
+   `Qwen/Qwen3.5-9B` resolves the NATIVE transformers
+   `Qwen3_5ForCausalLM`. The M1/M2 read/write block exists ONLY in this
+   repo's vendored `src/scripts/modeling.py` (the byte-faithful text-only
+   copy + the wiring). Setting `config.use_m1m2 = True` on the native
+   class does nothing — there is no code that reads it.
 
----
+2. **The flags were set on the wrong config object.** The hub checkpoint
+   is COMPOSITE (`Qwen3_5Config` wrapping `text_config`). The vendored
+   `Qwen3_5TextModel.__init__` does `_get_text_config(config)` and reads
+   `use_m1m2`/`m1m2_mem_size` from the **TEXT** config. The c37f20e fix
+   set them on the composite wrapper — the second silent no-op.
 
-## The Solution: M1/M2 Global Memories
+3. **The vendored class silently re-initializes the text weights** (found
+   by the W17 prototype, would have been a garbage-model generator).
+   `from_pretrained`'s conversion table maps the composite checkpoint's
+   `model.language_model.*` keys → `model.*` for LIBRARY classes only:
+   the vendored module counts as "custom code" (`is_custom_code()`:
+   `__module__` not under `"transformers."`) and the lookup is SKIPPED —
+   19/28 text weights re-initialize at random. Fix: the OFFICIAL
+   `key_mapping` kwarg carries the same prefix strip explicitly
+   (`_TEXT_FROM_COMPOSITE_KEY_MAPPING` in palettized_modules.py).
 
-M1/M2 are two global memory matrices shared across ALL 24 linear attention layers. They are designed for retrieval:
+Plus one found by the new tests: **from_pretrained re-initializes the
+gate vectors through `_init_weights`** (they are always MISSING keys) —
+the vendored `_init_weights` now restores the P3 zeros/ones (without it
+the loader served denormal garbage gates).
 
-**From SPECIFICATION.md §2.2:**
-- M1 (global key-memory): shape (32, mem_size, 128)
-- M2 (global value-memory): shape (32, mem_size, 128)
-- Read: `softmax(q @ M1ᵀ) @ M2` — retrieves from global memory
-- Write: gated additive per-token scatter — path-independent deltas
+## The Fix (all within the architecture, no fallbacks)
 
-**Why M1/M2 will work:**
-1. Questions and documents that are semantically similar should produce similar M1/M2 states
-2. The gated write can be trained to extract discriminative features
-3. Global scope across all layers = more expressive than per-layer S
+`load_palettized_model(..., use_m1m2=True, m1m2_mem_size=128,
+m1m2_gates_path=None)`:
 
----
+- instantiates `modeling.Qwen3_5ForCausalLM.from_pretrained(...,
+  config=config, key_mapping=_TEXT_FROM_COMPOSITE_KEY_MAPPING)`;
+- sets the flags on the TEXT config (mirrored on the composite);
+- **verifies the wiring landed** (loud RuntimeError — shared module,
+  ordinals, geometry; the W16 failure was SILENT);
+- loads the trained-gates artifact when given (geometry-validated).
 
-## What Needs to Be Done
+Zero-init gates are bit-unchanged no-ops: `use_m1m2=True` reproduces the
+native class's outputs EXACTLY (pinned by test_w17_2 through a TQCache
+forward) — activation is safe for every flow; the retrieval signal
+appears only after the §7 fine-tune opens the gates.
 
-### 1. ALWAYS Attach M1/M2 (CRITICAL)
+## The §7 Gate Trainer (corpus-INDEPENDENT by design)
 
-The current loader uses `AutoModelForCausalLM.from_pretrained` which instantiates the default Qwen3.5 model class. This class does NOT have M1/M2 wiring.
+**The gradient problem it solves**: the production online loop is
+gradient-dead for the WRITE gates BY DESIGN (quantize-on-write severs
+autograd — "the cache states act as constants in the graph"). The
+trainer builds the differentiable state OUTSIDE the quantized loop:
 
-**The custom `Qwen3_5TextModel` in `src/scripts/modeling.py` has the M1/M2 wiring at lines 1135-1158:**
+1. **CAPTURE** (`prefill_capture_calls`): the text prefills under
+   `no_grad` through the production TQCache (reseeded from the system
+   reset point); forward hooks on the shared m1m2 module record every
+   layer's call (k, v, layer_idx, positions) detached. `m_init` is read
+   BEFORE the prefill (the reseeded system state — reading it after
+   hands the replay the final state; the test rig caught exactly this).
+2. **REPLAY** (`replay_states`): the recorded calls re-run under
+   `enable_grad` through the module's own `write` on a live chain — the
+   additive write makes the result exactly
+   `m_init + Σ_L g_L·Δ_L` (the §2.2 path-independence property) —
+   the noise-free, gate-differentiable proxy of the cache's held state
+   (pinned within quant-rel-MSE by test_w17f_2).
+3. **LOSS**: InfoNCE with in-batch negatives over the B pair-states
+   (sim = 0.5·(cos_m1 + cos_m2), temperature tau) on GENERAL similarity
+   pairs — MRPC/QQP/PAWS/SNLI/MNLI/STS-B/SQuAD converted to a pairs
+   JSONL (`{"text1", "text2", "label": 1}`); the served corpus is NEVER
+   a training input.
 
-```python
-# modeling.py line 1135
-if getattr(config, "use_m1m2", False):
-    import m1m2 as _m1m2
-    self.m1m2 = _m1m2.M1M2(...)
-    for _layer in self.layers:
-        if _layer.block_type == "linear_attention":
-            object.__setattr__(_layer.linear_attn, "m1m2", self.m1m2)
-```
+Trained: ONLY the 3 gate vectors (`freeze_all_but_gates`, fp32 masters,
+everything else frozen). `read_gate` stays at the P3 one-init by default
+(the contrastive loss never sees it — the READ affects generation, not
+the retrieval state; the installed memories steering generation through
+the read IS the spec's design).
 
-**Problem:** `AutoModelForCausalLM` doesn't use this class. It uses the default transformers `Qwen3_5ForCausalLM`.
+**Artifacts**: `save_gates`/`load_gates` (.npz: the 3 gate vectors +
+geometry identity; a mem_size-mismatched file is a LOUD error). Serving:
+`load_quant_model(..., m1m2_gates_path=...)`.
 
-**Fix Required:**
-1. Modify `src/scripts/loader.py` and `src/scripts/palettized_modules.py` to:
-   - Load config with `use_m1m2=True` and `m1m2_mem_size=LARGE` (see below)
-   - Instantiate model with custom config so M1/M2 are attached
+## The Deployment Protocol (ORDER MATTERS — the box sequence)
 
-2. OR: Create a custom model class that inherits from the default and adds M1/M2 post-hoc
+```bash
+# 1. TRAIN the gates on general pairs (NOT the served corpus)
+#    (convert MRPC/QQP/SNLI/... offline to pairs.jsonl; --self-test for
+#    a mechanics smoke first)
+python3 scripts/gpu/finetune_m1m2.py --pairs-file /home/ubuntu/pairs.jsonl \
+    --gates-out /home/ubuntu/RAGGA/disk/m1m2_gates.npz \
+    --m1m2-mem-size 1024 --max-steps 300
 
-**Key Files to Modify:**
-- `src/scripts/loader.py` — entry point
-- `src/scripts/palettized_modules.py` — `load_palettized_model()` function
-- Ensure `config.use_m1m2 = True` is set BEFORE model instantiation
+# 2. RE-INGEST with the trained gates (the system state + every chunk
+#    delta then live in the trained-gate regime) — fresh out-dir
+python3 scripts/gpu/run_ingestion.py \
+    --out-dir /home/ubuntu/RAGGA/disk/ingested_m1m2 \
+    --m1m2-gates /home/ubuntu/RAGGA/disk/m1m2_gates.npz \
+    --m1m2-mem-size 1024 --n-docs 100
 
-### 2. Expand M1/M2 Size
+# 3. INDEX (disk-side; the loader auto-includes the m1/m2 units; the
+#    codebook digests pin the ACTUAL M1/M2 unit dims)
+python3 scripts/gpu/run_index.py --disk-dir /home/ubuntu/RAGGA/disk/ingested_m1m2
 
-Current default: `m1m2_mem_size = 128`
+# 4. EVAL retrieval (mem auto-resolved from system_state.npz)
+python3 scripts/gpu/eval_retrieval.py --disk-dir /home/ubuntu/RAGGA/disk/ingested_m1m2
 
-**This is too small for retrieval.** The memory needs enough capacity to represent a general semantic space.
+# 5. QUERY (same gates; geometry drift fails loudly)
+python3 scripts/gpu/run_query.py --disk-dir /home/ubuntu/RAGGA/disk/ingested_m1m2 \
+    --m1m2-gates /home/ubuntu/RAGGA/disk/m1m2_gates.npz
 
-**Recommended sizes to try:**
-- 1024 (8x larger than current)
-- 4096 (32x larger)
-- 8192 or larger if memory allows
-
-The shape is `(num_heads=32, mem_size, head_dim=128)`, so:
-- mem_size=128 → 0.5M elements per M (M1 + M2 = 1M total)
-- mem_size=1024 → 4M elements per M (M1 + M2 = 8M total)
-- mem_size=4096 → 16M elements per M (M1 + M2 = 32M total)
-- mem_size=8192 → 32M elements per M (M1 + M2 = 64M total)
-
-Set via `config.m1m2_mem_size = 4096` when loading model.
-
-### 3. Fine-tune M1/M2 Gates Against BASELINE (NOT Corpus)
-
-**From m1m2.py:**
-> "Zero-init (PROPOSAL P3): the write gates start at 0.0 — M1/M2 start as no-ops and the untrained model's behavior is bit-unchanged"
-
-**What this means:**
-- `m1m2.write_gate` parameter is initialized to 0.0
-- This means M1/M2 don't accumulate any state during prefill
-- The gates must be trained to open and extract useful features
-
-**CRITICAL: Train against BASELINE, NOT specific corpus**
-
-We do NOT want to train M1/M2 against a specific corpus. That would make the system corpus-dependent. Instead:
-
-**Train M1/M2 to produce a general semantic similarity space using:**
-- Generic text pairs (paraphrase datasets like MRPC, QQP, PAWS)
-- Question-answer pairs from general QA datasets (SQuAD, Natural Questions)
-- Text entailment pairs (SNLI, MNLI)
-- Any dataset where semantically similar texts should produce similar representations
-
-**The goal:**
-- M1/M2 learns to extract "what this text is about" in a general way
-- Questions about topic X → M1/M2 state A
-- Documents about topic X → M1/M2 state A (similar)
-- No corpus-specific training needed
-- Works on any unseen corpus at inference time
-
-**Fine-tuning approach:**
-1. Freeze ALL model weights (no gradient to main model)
-2. Train ONLY the M1/M2 gates: `m1m2.write_gate` and any read parameters
-3. Use general-purpose semantic similarity datasets (NOT your target corpus)
-4. Objective: similar texts → similar M1/M2 states
-
-**Training objective (contrastive):**
-```python
-# Use general paraphrase/similarity datasets
-# Example: MRPC (Microsoft Research Paraphrase Corpus)
-# Sentence 1: "The company announced..."
-# Sentence 2: "The firm declared..." (paraphrase → positive pair)
-# Sentence 3: "The weather today..." (unrelated → negative pair)
-
-for batch in general_similarity_dataloader:
-    text1_ids, text2_ids, label = batch  # label=1 for paraphrase
-    
-    # Prefill text1
-    cache1 = TQCache(...)
-    model(text1_ids, past_key_values=cache1)
-    m1_1, m2_1 = cache1.read_m1(), cache1.read_m2()
-    
-    # Prefill text2
-    cache2 = TQCache(...)
-    model(text2_ids, past_key_values=cache2)
-    m1_2, m2_2 = cache2.read_m1(), cache2.read_m2()
-    
-    # Loss: push similar texts together, dissimilar apart
-    sim = cosine(m1_1, m1_2) + cosine(m2_1, m2_2)
-    loss = contrastive_loss(sim, label)
-    loss.backward()
-    optimizer.step()
+# the A/B ladders:
+#   --m1m2-mem-size 128|1024|4096|8192 (re-ingest per value; decode cost
+#     grows ~linearly with mem — 24 M1/M2 quantizations per token)
+#   --no-m1m2 (the W16-exact behavior, bit-identical)
+#   untrained gates (omit --m1m2-gates: zero-norm m1/m2 units, retrieval
+#     unchanged — isolates the gate-training effect)
 ```
 
-**Datasets to use (all general-purpose, NOT corpus-specific):**
-- MRPC (paraphrase)
-- QQP (Quora Question Pairs)
-- PAWS (Paraphrase Adversaries)
-- SNLI / MNLI (entailment)
-- STS-B (semantic textual similarity)
-- SQuAD (question-context pairs)
+## What the W17 Gates Pin (src/rag/tests/test_w17_loader.py, test_w17_finetune.py)
 
-**What NOT to do:**
-- ❌ Train on your target corpus documents
-- ❌ Create corpus-specific embeddings
-- ❌ Fine-tune for specific retrieval tasks
+1. vendored load == native load (every text weight bit-equal, both
+   directions) + zero-gate forward parity through TQCache;
+2. the wiring (attached/shared/ordered/P3 init) + flags-on-TEXT-config
+   (the composite-only placement must NOT wire);
+3. the loud verifiers (unwired model, mem_size drift, codes-vs-module
+   geometry at the first forward);
+4. the e2e flow: ingest → snapshot m1/m2 units → loader dims →
+   query vector → verbatim install restores m1/m2 codes bit-exact;
+5. the gates artifact roundtrip through the loader + geometry-mismatch
+   loud; mem auto-resolution from disk;
+6. the trainer: recorder sees every layer; replay == the cache's held
+   state within quant noise (and == the manual write chain exactly);
+   gradients reach ONLY the write gates; InfoNCE descends on the model
+   (before/after on the same pairs); train_gates smoke; freeze; the
+   artifact roundtrip.
 
-**What TO do:**
-- ✓ Train on general semantic similarity datasets
-- ✓ Learn a universal representation space
-- ✓ System works on ANY unseen corpus at inference time
+## Verification (CPU box, the committed state)
 
----
+```
+python3 -m pytest src/rag/tests -q          # 224 passed
+python3 -m pytest src/rag/tests/test_w17_loader.py src/rag/tests/test_w17_finetune.py -v
+```
 
 ## Files Reference
 
-### Core Model Files
-- `src/scripts/modeling.py` — Custom Qwen3_5TextModel with M1/M2 wiring (lines 1130-1158)
-- `src/scripts/loader.py` — Model loading entry point
-- `src/scripts/palettized_modules.py` — `load_palettized_model()` function (line 3264)
-- `src/rag/m1m2.py` — M1M2 class implementation
+| file | role |
+|---|---|
+| `src/scripts/palettized_modules.py` | `load_palettized_model` — the W17 fix: vendored class + text-config flags + `key_mapping` + `_verify_m1m2_attached` + gates load |
+| `src/scripts/loader.py` | `load_quant_model(..., use_m1m2, m1m2_mem_size, m1m2_gates_path)` |
+| `src/scripts/modeling.py` | the vendored Qwen3.5 (byte-faithful + M1/M2 wiring); `_init_weights` restores the P3 gates |
+| `src/rag/m1m2_finetune.py` | NEW — capture/replay/InfoNCE/freeze/train_gates/save_gates/load_gates |
+| `scripts/gpu/finetune_m1m2.py` | NEW — the §7 driver (pairs JSONL, self-test, val spread, gates artifact) |
+| `scripts/gpu/_bootstrap.py` | `load_model` threads the M1/M2 params (the post-load flag-set no-op removed) |
+| `src/rag/ingest.py` | `m1m2_mem_size_from_system` + `check_m1m2_geometry` (the loud drift guards) |
+| `src/rag/tq_cache.py` | `read_m1/read_m2` geometry validation (loud, actionable) |
+| `src/rag/index.py` | `build_index(unit_dims=...)` — the codebook digests pin the actual M1/M2 units |
+| GPU tools | run_ingestion/run_query/eval_retrieval/bisect/verify: `--m1m2-mem-size`/`--m1m2-gates`/`--no-m1m2`; query side auto-resolves from disk |
 
-### M1/M2 Integration Points
-- `modeling.py:727-749` — M1/M2 read/write in attention forward
-- `modeling.py:1135-1158` — M1M2 instantiation and wiring to layers
-- `modeling.py:1145-1150` — M1M2 constructor call
+## Expected Results After the Box Runs the Protocol
 
-### TQCache Integration
-- `src/rag/tq_cache.py:594-595` — M1/M2 codes storage
-- `src/rag/tq_cache.py:667-680` — `update_m1()` method
-- `src/rag/tq_cache.py:698-711` — `update_m2()` method
-- `src/rag/tq_cache.py:733-734` — `snapshot_codes()` includes m1/m2
+1. The gates artifact trains (loss descends; the held-out spread
+   cos(true) − cos(shifted) > 0 on general pairs);
+2. re-ingested snapshots carry nonzero m1/m2 units whose content differs
+   per chunk (the §4 vector's last two units become discriminative);
+3. eval_retrieval's hit@k improves over the S-only 50% baseline (the
+   centered frame now scores m1/m2 content, not just S);
+4. If retrieval improves but answers degrade: read_gate stays 1 (P3) —
+   the memories steer generation through the read; that is the spec's
+   design, but a read-gate A/B (--train-read-gate + an NLL aux in a
+   later wave) is the in-architecture lever.
 
-### Spec Documentation
-- `SPECIFICATION.md:26-27` — M1/M2 dimensions
-- `SPECIFICATION.md:33-35` — M1/M2 description (global, shared across layers)
-- `SPECIFICATION.md:N7` — Read/write operations
-- `SPECIFICATION.md:N28` — Fine-tune requirement
+## Design Notes (the W17 decisions)
 
----
-
-## Verification Steps
-
-After implementing M1/M2 activation:
-
-1. **Verify M1/M2 are attached:**
-```python
-model, _ = load_model()
-print(f"Model has m1m2: {hasattr(model.model, 'm1m2')}")
-for i, layer in enumerate(model.model.layers):
-    if hasattr(layer, 'linear_attn') and hasattr(layer.linear_attn, 'm1m2'):
-        print(f"Layer {i} has m1m2: True")
-```
-
-2. **Verify M1/M2 are captured during forward:**
-```python
-cache = TQCache(...)
-model(some_input, past_key_values=cache)
-print(f"M1 codes: {cache.m1_codes is not None}")
-print(f"M2 codes: {cache.m2_codes is not None}")
-```
-
-3. **Run ingestion and check snapshots:**
-```python
-snap = load_chunk('snapshots/chunk_00000.npz')
-print(f"M1: {snap.m1_codes is not None}, M2: {snap.m2_codes is not None}")
-```
-
----
-
-## Expected Results After Fine-tuning
-
-1. **M1/M2 gates open** → M1/M2 accumulate meaningful state during prefill
-2. **Similar texts → similar M1/M2** (learned from general datasets)
-3. **Works on ANY corpus** — not trained on specific documents
-4. **Retrieval using M1/M2 cosine** → high hit rate on unseen corpora
-
----
-
-## Current Working Directory
-
-```
-/home/ubuntu/RAGGA/
-├── src/
-│   ├── rag/              # RAG pipeline (TQCache, snapshot, index, query)
-│   ├── scripts/          # Model code (modeling.py, loader.py, m1m2.py)
-│   └── flute_extended/   # CUDA kernels
-├── scripts/gpu/          # GPU tools (run_ingestion.py, run_query.py, etc.)
-├── disk/ingested_w16/    # Current ingestion (M1/M2 NOT captured)
-└── HANDOVER.md
-```
-
----
-
-## Commands for Testing
-
-```bash
-# Run W16 tests (all should pass)
-python3 -m pytest src/rag/tests/test_w16_install.py -v
-
-# Check if M1/M2 are attached (currently returns False)
-python3 -c "
-import sys; sys.path.insert(0, 'src/rag'); sys.path.insert(0, 'src/scripts'); sys.path.insert(0, 'scripts/gpu')
-from _bootstrap import boot, load_model; boot()
-model, _ = load_model()
-print(f'M1/M2 attached: {hasattr(model.model, \"m1m2\")}')
-"
-
-# Run ingestion (will capture M1/M2 once loader is fixed)
-python3 scripts/gpu/run_ingestion.py --out-dir disk/ingested_m1m2 --n-docs 100
-
-# Run bisection
-python3 scripts/gpu/bisect_install.py --disk-dir disk/ingested_m1m2
-```
-
----
-
-## Summary for Coding Agent
-
-**GOAL:** Make RAGGA retrieval work by activating and training M1/M2 global memories.
-
-**TASKS:**
-1. Fix `loader.py` and `palettized_modules.py` to attach M1/M2 during model load
-2. Increase `m1m2_mem_size` parameter (try 1024, 4096, 8192)
-3. Write fine-tuning script that:
-   - Freezes main model
-   - Trains only M1/M2 gates
-   - Uses **general semantic similarity datasets** (MRPC, QQP, SNLI, etc.)
-   - **NOT trained on target corpus** — works on any unseen corpus
-4. Re-run ingestion with M1/M2 enabled
-5. Test retrieval using M1/M2 vectors
-
-**KEY INSIGHTS:**
-1. M1/M2 write gates start at 0.0 (closed). Training opens them.
-2. Train on GENERAL similarity datasets, NOT your specific corpus
-3. The model learns a universal semantic space
-4. NO corpus-specific training — system generalizes to any corpus
-
-**CORPUS-INDEPENDENT DESIGN:**
-- M1/M2 learns "what makes texts semantically similar" from general data
-- At inference: any question and its relevant document produce similar M1/M2
-- Works on enterprise docs, news, scientific papers, etc. — no retraining needed
+- **mem_size default 1024 in the tools** (the handover's first
+  recommendation; the loader default stays 128 = the spec §2.2
+  geometry). The quantizer resolves any mem (codebooks solved+committed
+  at d = 2^22/2^24/2^25); power-of-two mem keeps the unit pow2.
+- **The trainer trains on "zeros + deltas"** (the system reset point is
+  built at P3 zero gates) while deployment's states are
+  "system-at-trained-gates + deltas" — consistent because the W16
+  centered frame subtracts the system vector at scoring time.
+- **Capture memory scales with T** (k/v per layer per prefill), not
+  mem_size; `--max-tokens 256` + `--batch-pairs 8` keeps the rig inside
+  A10G headroom; `replay_states` checkpoints per call on CUDA when the
+  state exceeds 1M elements.
+- **decode cost**: every decoded token writes M1/M2 through 24 layers
+  (one quantization of the full memory each) — the cost grows ~linearly
+  with mem_size; 128 ≈ one extra S-layer per token, 1024 ≈ 8x that.
+- The 3 gates are the ONLY trained parameters (the spec §7/N28 "train
+  the M1/M2 read/write gates"); the LUT/linear-attn groups of
+  `finetune.py` remain the next-token N28 path (a later wave).

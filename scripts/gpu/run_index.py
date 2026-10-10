@@ -79,12 +79,20 @@ def main() -> int:
         print(f"    mean over {frame.n_mean_chunks} chunk deltas "
               f"(dims {frame.dims}); chunk layout {frame.chunk_protocol}")
 
+    # W17: the corpus's actual M1/M2 unit dims (mem_size experiments) —
+    # pinned into the side metadata's codebook digests
+    unit_dims = [int(c.d) for c in (loader.system.m1_codes,
+                                    loader.system.m2_codes)
+                 if c is not None]
+    unit_dims = sorted(set(unit_dims)) or None
+
     if len(chunks) >= FLAT_FLOOR:
         print("\n[3] Building the IVFADC index (build_index, the §5 path)...")
         stream = iter_centered_vectors(loader, frame) if frame is not None \
             else loader.iter_vectors()
         build_index(stream, path=index_path,
-                    extra_metadata={"vector_frame": args.frame})
+                    extra_metadata={"vector_frame": args.frame},
+                    unit_dims=unit_dims)
         print(f"    written to {index_path}")
     else:
         print(f"\n[3] {len(chunks)} < {FLAT_FLOOR} chunks — flat IndexFlatIP "

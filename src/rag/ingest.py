@@ -49,7 +49,7 @@ from tq_cache import TQCache, TQLinearAttentionLayer, resolve_quantizer
 __all__ = [
     "SystemState", "ChunkRecord", "prefill_system", "reseed_cache",
     "ingest_chunk", "IngestDriver", "MANIFEST_NAME", "SYSTEM_FILE",
-    "load_system_state",
+    "load_system_state", "m1m2_mem_size_from_system", "check_m1m2_geometry",
 ]
 
 MANIFEST_NAME = "ingest_manifest.json"
@@ -164,6 +164,50 @@ def load_system_state(disk_dir: str) -> SystemState:
         s_dtype=extra.get("s_dtype"), conv_dtype=extra.get("conv_dtype"),
         m1_shape=tuple(extra["m1_shape"]) if extra.get("m1_shape") else None,
         m2_shape=tuple(extra["m2_shape"]) if extra.get("m2_shape") else None)
+
+
+def m1m2_mem_size_from_system(system: SystemState) -> Optional[int]:
+    """W17: the corpus's M1/M2 slot count from the persisted reset point
+    (system_state.npz's m1_shape[1]) — None when the corpus was ingested
+    WITHOUT M1/M2 (the m1/m2 units absent).
+
+    The query-side model must load the SAME mem_size (the module's state
+    geometry vs the cache's codes — drift fails loudly at the first
+    forward); the GPU tools resolve it from disk so a query run can never
+    silently mismatch the ingested geometry."""
+    shape = getattr(system, "m1_shape", None)
+    if shape is not None and len(shape) == 3:
+        return int(shape[1])
+    return None
+
+
+def check_m1m2_geometry(model, system: SystemState,
+                        mem_size: Optional[int]) -> None:
+    """W17: loud cross-check of the loaded model's M1/M2 module against
+    the corpus geometry (the reset point's m1_shape) — an actionable
+    error BEFORE the first forward (the deep guard is the M1M2
+    write/read shape validation, which fires mid-prefill otherwise)."""
+    inner = getattr(model, "model", model)
+    module = getattr(inner, "m1m2", None)
+    have = system.m1_shape if system.m1_shape is not None else None
+    if module is None:
+        if have is not None:
+            raise ValueError(
+                "check_m1m2_geometry: the corpus was ingested WITH M1/M2 "
+                f"(m1 shape {tuple(have)}) but this model was loaded "
+                "without the wiring — load with use_m1m2=True")
+        return
+    want = tuple(module.state_shape()) if module is not None else None
+    if have is None:
+        if mem_size is not None and module.mem_size != int(mem_size):
+            pass  # no corpus pin; the explicit mem_size is the contract
+        return
+    if tuple(have) != tuple(want):
+        raise ValueError(
+            f"check_m1m2_geometry: the model's M1/M2 state {tuple(want)} "
+            f"!= the corpus reset point's {tuple(have)} — reload the "
+            f"model with --m1m2-mem-size {int(have[1])} (ingest and "
+            f"query MUST agree on the geometry)")
 
 
 def reseed_cache(cache: TQCache, system: SystemState) -> None:

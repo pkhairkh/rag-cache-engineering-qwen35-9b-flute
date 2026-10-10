@@ -227,10 +227,25 @@ def codebook_sha256(bits: int, d: int) -> str:
     return digest
 
 
-def _frame_codebook_sha256() -> Dict[str, str]:
-    """The production retrieval frame's codebook digests (side metadata)."""
-    return {f"b{b}_d{_FRAME_UNIT_D}": codebook_sha256(b, _FRAME_UNIT_D)
-            for b in _FRAME_BITS}
+def _frame_codebook_sha256(unit_dims: Optional[Iterable[int]] = None
+                           ) -> Dict[str, str]:
+    """The production retrieval frame's codebook digests (side metadata).
+
+    W17: `unit_dims` extends the pinned set beyond the canonical S/M1/M2
+    unit (2^19) — the ACTUAL unit dims of the corpus's M1/M2 codes when
+    the loader geometry is a mem_size experiment (d = 32*mem*128: 2^22
+    at mem 1024, ...). Each (bits, d) solves+cached deterministically
+    (codebooks.get_codebook); pass the dims you mean (an uncached pair
+    SOLVES a new codebook — the pin documents exactly what decoded the
+    corpus)."""
+    dims = [_FRAME_UNIT_D]
+    if unit_dims:
+        for d in unit_dims:
+            d = int(d)
+            if d > 0 and d not in dims:
+                dims.append(d)
+    return {f"b{b}_d{d}": codebook_sha256(b, d)
+            for d in dims for b in _FRAME_BITS}
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +780,8 @@ def _normalize_streamed(v, config: IndexConfig, pos: int) -> np.ndarray:
 
 
 def _index_metadata(config: IndexConfig, n_train: int, ntotal: int,
-                    extra_metadata: Optional[dict]) -> dict:
+                    extra_metadata: Optional[dict],
+                    unit_dims: Optional[Iterable[int]] = None) -> dict:
     if extra_metadata is not None and not isinstance(extra_metadata, dict):
         raise TypeError(
             f"build_index: extra_metadata must be a dict (JSON object), "
@@ -786,7 +802,7 @@ def _index_metadata(config: IndexConfig, n_train: int, ntotal: int,
         "vector_frame": "l2-normalized (cosine; norms not stored — the "
                         "rerank recomputes exact cos from raw vectors)",
         "seeds": {str(k): int(s) for k, s in SEEDS.items()},
-        "codebook_sha256": _frame_codebook_sha256(),
+        "codebook_sha256": _frame_codebook_sha256(unit_dims),
         "counts": {"train_vectors": int(n_train),
                    "indexed_vectors": int(ntotal)},
         "faiss_version": str(getattr(faiss, "__version__", "unknown")),
@@ -821,7 +837,8 @@ def _write_index_and_meta(index: faiss.IndexIVFPQ, path: str,
 def build_index(vectors_iter, config: IndexConfig = IndexConfig(),
                 train_sample: int = 4096, path: str | None = None,
                 extra_metadata: dict | None = None,
-                min_train_warn: int | None = None
+                min_train_warn: int | None = None,
+                unit_dims: Iterable[int] | None = None
                 ) -> faiss.IndexIVFPQ:
     """Build the §8 IVFADC index over a stream of raw §4 vectors.
 
@@ -829,6 +846,11 @@ def build_index(vectors_iter, config: IndexConfig = IndexConfig(),
     e.g. ChunkVectorLoader(disk_dir).iter_vectors(). Position i in the
     stream becomes faiss id i (the caller owns the id↔chunk mapping; the
     loader yields chunk-id order).
+
+    W17 unit_dims: the corpus's ACTUAL M1/M2 code unit dims (e.g.
+    [32*mem*128] at a mem_size experiment) — pinned into the side
+    metadata's codebook digests alongside the canonical 2^19 unit (the
+    callers with a loader pass [loader.system.m1_codes.d] when present).
 
     D5 streaming: the FIRST `train_sample` vectors are materialized as one
     (n, d) fp32 block for index.train (the only dense block); they are
@@ -914,7 +936,8 @@ def build_index(vectors_iter, config: IndexConfig = IndexConfig(),
     index.nprobe = int(config.nprobe)
 
     if path is not None:
-        meta = _index_metadata(config, n_train, index.ntotal, extra_metadata)
+        meta = _index_metadata(config, n_train, index.ntotal, extra_metadata,
+                               unit_dims=unit_dims)
         _write_index_and_meta(index, path, meta)
     return index
 

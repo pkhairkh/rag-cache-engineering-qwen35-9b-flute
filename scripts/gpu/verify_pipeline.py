@@ -99,7 +99,8 @@ def main() -> int:
         os.environ["FLUTE_NO_FLA"] = "1"
 
     from transformers import AutoTokenizer
-    from ingest import load_system_state, reseed_cache
+    from ingest import (check_m1m2_geometry, load_system_state,  # noqa: E402
+                        m1m2_mem_size_from_system, reseed_cache)
     from install import install_snapshot, sum_turboquant_codes
     from snapshot import load_chunk
     from tq_cache import TQCache
@@ -112,9 +113,13 @@ def main() -> int:
     print("=" * 60)
 
     print("\n[load] model + tokenizer + system state...")
-    model, _ = load_model(args.artifacts_dir, args.heads_dir, args.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     system = load_system_state(args.disk_dir)
+    mem_size = m1m2_mem_size_from_system(system)
+    model, _ = load_model(args.artifacts_dir, args.heads_dir,
+                          args.model_name,
+                          m1m2_mem_size=mem_size or 128)
+    check_m1m2_geometry(model, system, mem_size)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     snap = load_chunk(os.path.join(args.disk_dir, "snapshots",
                                    f"chunk_{args.chunk:05d}.npz"))
 
