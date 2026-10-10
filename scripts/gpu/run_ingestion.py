@@ -40,6 +40,14 @@ def main() -> int:
                     help="truncate each document to N tokens (0 = full text)")
     ap.add_argument("--system-prompt", default="You are a helpful AI assistant.")
     ap.add_argument("--bits", type=float, default=3.5)
+    ap.add_argument("--chunk-protocol", choices=("absolute", "delta-v1"),
+                    default="absolute",
+                    help="W16: 'absolute' (default) stores the cache's own "
+                         "end-of-chunk codes — the single-chunk install is "
+                         "VERBATIM (the W16 noise decomposition measured the "
+                         "delta path's 2 extra rounds at ~70% of the "
+                         "write-path distortion); 'delta-v1' keeps the D4 "
+                         "legacy layout (the A/B)")
     args = ap.parse_args()
 
     print("=" * 60)
@@ -86,7 +94,8 @@ def main() -> int:
         system_token_ids=system_ids,
         chunks=chunks,
         out_dir=args.out_dir,
-        bits=args.bits)
+        bits=args.bits,
+        chunk_protocol=args.chunk_protocol)
     stats = drv.run()
     print("\n" + "=" * 60)
     print(f"INGESTION COMPLETE: {stats}")

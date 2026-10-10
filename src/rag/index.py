@@ -44,6 +44,24 @@ round from the true state); this disk reconstruction differs by ONE EXTRA
 quant round on the delta (quant(dequant(abs) - dequant(sys)) vs abs) —
 the documented budget is rel-MSE < 0.10 (W5.3 measured ~0.011 per S
 segment; the W6.3 gate measures ~0.013 end-to-end at the stub scale).
+W16: protocol="absolute" chunks (the new default) carry the cache's own
+end codes — the loader dequantizes them DIRECTLY (one round, no
+reconstruction) and derives the delta vector on demand.
+
+THE W16 CENTERED RETRIEVAL FRAME (RetrievalFrame, this module): spec N17
+says "cos-sim measures content overlap = relevance" — but the ABSOLUTE
+vectors on both sides carry a large COMMON component (the system prompt's
+state + the model's generic-text response), which the box measured as a
+~0.70 cosine floor with a 0.016 top-3 spread (gold doc OUTSIDE the top-3
+— ranking degenerates to norm/length effects). The frame centers both
+sides: the query by the reset point's own vector + the corpus delta mean,
+the candidates by the same mean (see RetrievalFrame's docstring for the
+measured discrimination-gap improvement; scripts/w16_probe_retrieval.py
+reproduces the box's failure signature and the fix). The frame is
+OPTIONAL end-to-end: run_index.py writes retrieval_frame.npz beside the
+faiss index and builds the index over the CENTERED stream;
+answer_query/preselect/rerank pick it up automatically when the file
+exists (the absolute behavior stays bit-identical without it).
 
 Provenance (turboquant.py: "seeds persist in the index side-metadata"):
 build_index(path=...) writes <path>.meta.json with the config fields, the
@@ -88,6 +106,10 @@ from turboquant import SEEDS
 __all__ = [
     "IndexConfig",
     "ChunkVectorLoader",
+    "RetrievalFrame",
+    "build_retrieval_frame",
+    "save_retrieval_frame",
+    "load_retrieval_frame",
     "build_index",
     "load_index",
     "preselect",
@@ -262,11 +284,13 @@ class ChunkVectorLoader:
             raise ValueError(
                 f"ChunkVectorLoader: {man_path} is not a JSON object")
         self.manifest = manifest
-        if manifest.get("protocol") != "delta-v1":
+        if manifest.get("protocol") not in ("delta-v1",):
             raise ValueError(
                 f"ChunkVectorLoader: manifest protocol "
                 f"{manifest.get('protocol')!r} != 'delta-v1' — this loader "
-                f"reconstructs the D4 delta protocol only")
+                f"reconstructs the D4 delta protocol family only (the "
+                f"chunk snapshots' own 'protocol' field selects the layout: "
+                f"'delta-v1' deltas or 'absolute' end codes — both W16-legit)")
         man_bits = manifest.get("bits")
         if man_bits is not None and abs(float(man_bits) - self.bits) > 1e-9:
             raise ValueError(
@@ -311,24 +335,34 @@ class ChunkVectorLoader:
         """All ingested chunk ids, ascending (the iter_vectors order)."""
         return sorted(self._chunks)
 
-    def vector(self, chunk_id: int) -> np.ndarray:
-        """The chunk's absolute retrieval vector: fp32, shape (dims,).
+    def _system_pieces(self) -> List[torch.Tensor]:
+        """dequant(sys) per unit in §4 order (S ascending, M1, M2) — the
+        shared zero-point vector of the delta protocol."""
+        pieces = []
+        for L in sorted(self.system.s_codes):
+            sysc = self.system.s_codes[L]
+            pieces.append(resolve_quantizer(
+                "S", int(sysc.d), self.bits).dequant(sysc))
+        for name, sysc in (("M1", self.system.m1_codes),
+                           ("M2", self.system.m2_codes)):
+            if sysc is not None:
+                pieces.append(resolve_quantizer(
+                    name, int(sysc.d), self.bits).dequant(sysc))
+        return pieces
 
-        DOUBLE-ROUND reconstruction (module docstring): one extra quant
-        round on the delta vs the ingest-time record.cache_vector.
-        """
-        if isinstance(chunk_id, bool) or not isinstance(
-                chunk_id, (int, np.integer)):
-            raise TypeError(
-                f"ChunkVectorLoader.vector: chunk_id must be an int, got "
-                f"{type(chunk_id).__name__}: {chunk_id!r}")
-        cid = int(chunk_id)
-        if cid not in self._chunks:
-            known = self.chunk_ids()
+    def system_vector(self) -> np.ndarray:
+        """W16: the reset point's own §4 vector (dequantized system codes,
+        fp32, (dims,)) — the common component every ABSOLUTE vector in the
+        corpus carries (the retrieval frame subtracts it)."""
+        vec = torch.cat(self._system_pieces()).to(torch.float32).numpy()
+        if vec.shape != (self._dims,):
             raise ValueError(
-                f"ChunkVectorLoader.vector: chunk {cid} is not in the "
-                f"manifest — known ids: {known[:8]}"
-                f"{'...' if len(known) > 8 else ''} ({len(known)} total)")
+                f"ChunkVectorLoader.system_vector: reconstructed "
+                f"{vec.shape}, expected ({self._dims},) — §4 order length "
+                f"drift")
+        return vec
+
+    def _load_snap(self, chunk_id: int, cid: int):
         path = os.path.join(self.disk_dir, self._chunks[cid])
         if not os.path.isfile(path):
             raise ValueError(
@@ -336,12 +370,11 @@ class ChunkVectorLoader:
                 f"chunk {cid}) does not exist — the snapshot tree is "
                 f"incomplete; re-run the IngestDriver")
         snap = load_chunk(path)  # sha256-verified (snapshot.py, W5.1)
-        if snap.protocol != "delta-v1":
+        if snap.protocol not in ("delta-v1", "absolute"):
             raise ValueError(
-                f"ChunkVectorLoader.vector: chunk {cid} protocol "
-                f"{snap.protocol!r} != 'delta-v1' — this loader reads the "
-                f"D4 delta protocol only (the ABSOLUTE protocol is the "
-                f"system reset point, not a chunk)")
+                f"ChunkVectorLoader: chunk {cid} snapshot protocol "
+                f"{snap.protocol!r} not in ('delta-v1', 'absolute') — this "
+                f"loader reads the D4 delta-protocol family only")
         if snap.system_ref != self.system.reference():
             raise ValueError(
                 f"ChunkVectorLoader.vector: chunk {cid} system_ref "
@@ -357,22 +390,28 @@ class ChunkVectorLoader:
                 f"{sorted(chunk_layers)} != the reset point's "
                 f"{sorted(sys_layers)} — the delta protocol requires every "
                 f"S unit to be present")
-        pieces = []
+        return snap
+
+    def _unit_pairs(self, snap):
+        """(name, kind, sys_codes, chunk_codes) per §4 unit — the shared
+        validation for vector()/delta_vector()."""
+        pairs = []
         for L in sorted(self.system.s_codes):
             sysc = self.system.s_codes[L]
             delta = snap.s_codes[L]
             if int(delta.d) != int(sysc.d):
                 raise ValueError(
-                    f"ChunkVectorLoader.vector: chunk {cid} layer {L} delta "
-                    f"d={delta.d} != system d={sysc.d} — unit-dim drift")
-            q = resolve_quantizer("S", int(sysc.d), self.bits)
-            pieces.append(q.dequant(sysc) + q.dequant(delta))
+                    f"ChunkVectorLoader.vector: chunk {snap.chunk_id} layer "
+                    f"{L} codes d={delta.d} != system d={sysc.d} — unit-dim "
+                    f"drift")
+            pairs.append((f"L{L}", "S", sysc, delta))
         for name, sysc, delta in (
                 ("M1", self.system.m1_codes, snap.m1_codes),
                 ("M2", self.system.m2_codes, snap.m2_codes)):
             if (sysc is None) != (delta is None):
                 raise ValueError(
-                    f"ChunkVectorLoader.vector: chunk {cid} {name} codes "
+                    f"ChunkVectorLoader.vector: chunk {snap.chunk_id} "
+                    f"{name} codes "
                     f"{'missing' if delta is None else 'present'} while the "
                     f"reset point's are "
                     f"{'present' if sysc is not None else 'missing'} — the "
@@ -381,16 +420,83 @@ class ChunkVectorLoader:
                 continue
             if int(delta.d) != int(sysc.d):
                 raise ValueError(
-                    f"ChunkVectorLoader.vector: chunk {cid} {name} delta "
-                    f"d={delta.d} != system d={sysc.d} — unit-dim drift")
-            q = resolve_quantizer(name, int(sysc.d), self.bits)
-            pieces.append(q.dequant(sysc) + q.dequant(delta))
+                    f"ChunkVectorLoader.vector: chunk {snap.chunk_id} "
+                    f"{name} codes d={delta.d} != system d={sysc.d} — "
+                    f"unit-dim drift")
+            pairs.append((name, name, sysc, delta))
+        return pairs
+
+    def vector(self, chunk_id: int) -> np.ndarray:
+        """The chunk's absolute retrieval vector: fp32, shape (dims,).
+
+        protocol-aware (W16): 'delta-v1' snapshots reconstruct the
+        DOUBLE-ROUND absolute (dequant(sys) + dequant(delta), the legacy
+        contract); 'absolute' snapshots dequant the END CODES directly —
+        ONE round, strictly tighter than the double-round reconstruction.
+        """
+        if isinstance(chunk_id, bool) or not isinstance(
+                chunk_id, (int, np.integer)):
+            raise TypeError(
+                f"ChunkVectorLoader.vector: chunk_id must be an int, got "
+                f"{type(chunk_id).__name__}: {chunk_id!r}")
+        cid = int(chunk_id)
+        if cid not in self._chunks:
+            known = self.chunk_ids()
+            raise ValueError(
+                f"ChunkVectorLoader.vector: chunk {cid} is not in the "
+                f"manifest — known ids: {known[:8]}"
+                f"{'...' if len(known) > 8 else ''} ({len(known)} total)")
+        snap = self._load_snap(chunk_id, cid)
+        pairs = self._unit_pairs(snap)
+        pieces = []
+        for _name, kind, sysc, chunk_codes in pairs:
+            q = resolve_quantizer(kind, int(sysc.d), self.bits)
+            if snap.protocol == "absolute":
+                pieces.append(q.dequant(chunk_codes))
+            else:
+                pieces.append(q.dequant(sysc) + q.dequant(chunk_codes))
         vec = torch.cat(pieces).to(torch.float32).numpy()
         if vec.shape != (self._dims,):
             raise ValueError(
                 f"ChunkVectorLoader.vector: chunk {cid} reconstructed "
                 f"{vec.shape} vectors, expected ({self._dims},) — §4 order "
                 f"length drift (manifest {self.manifest.get('vector_dims')})")
+        return vec
+
+    def delta_vector(self, chunk_id: int) -> np.ndarray:
+        """W16: the chunk's DELTA vector (what the chunk's prefill ADDED on
+        top of the reset point), fp32, shape (dims,), §4 order.
+
+        protocol-aware: 'delta-v1' dequants the stored DELTA codes (the D4
+        layout); 'absolute' computes dequant(end codes) - dequant(sys) —
+        the same quantity, one dequant round on each side. This is the
+        CONTENT vector the centered retrieval frame scores (N17: "cos-sim
+        measures content overlap" — the system reset point is not
+        content)."""
+        if isinstance(chunk_id, bool) or not isinstance(
+                chunk_id, (int, np.integer)):
+            raise TypeError(
+                f"ChunkVectorLoader.delta_vector: chunk_id must be an int, "
+                f"got {type(chunk_id).__name__}: {chunk_id!r}")
+        cid = int(chunk_id)
+        if cid not in self._chunks:
+            raise ValueError(
+                f"ChunkVectorLoader.delta_vector: chunk {cid} is not in the "
+                f"manifest — known: {self.chunk_ids()[:8]}")
+        snap = self._load_snap(chunk_id, cid)
+        pairs = self._unit_pairs(snap)
+        pieces = []
+        for _name, kind, sysc, chunk_codes in pairs:
+            q = resolve_quantizer(kind, int(sysc.d), self.bits)
+            if snap.protocol == "absolute":
+                pieces.append(q.dequant(chunk_codes) - q.dequant(sysc))
+            else:
+                pieces.append(q.dequant(chunk_codes))
+        vec = torch.cat(pieces).to(torch.float32).numpy()
+        if vec.shape != (self._dims,):
+            raise ValueError(
+                f"ChunkVectorLoader.delta_vector: chunk {cid} reconstructed "
+                f"{vec.shape}, expected ({self._dims},) — §4 order drift")
         return vec
 
     def iter_vectors(self, chunk_ids: Optional[Iterable[int]] = None
@@ -408,6 +514,222 @@ class ChunkVectorLoader:
                     f"{'...' if len(self._chunks) > 8 else ''}")
         for cid in ids:
             yield self.vector(cid)
+
+    def iter_delta_vectors(self, chunk_ids: Optional[Iterable[int]] = None
+                           ) -> Iterator[np.ndarray]:
+        """W16: yield DELTA vectors in chunk-id order (the centered
+        retrieval frame's corpus stream)."""
+        if chunk_ids is None:
+            ids = self.chunk_ids()
+        else:
+            ids = [int(c) for c in chunk_ids]
+            unknown = [c for c in ids if c not in self._chunks]
+            if unknown:
+                raise ValueError(
+                    f"ChunkVectorLoader.iter_delta_vectors: unknown chunk "
+                    f"ids {unknown[:8]} — known: {self.chunk_ids()[:8]}")
+        for cid in ids:
+            yield self.delta_vector(cid)
+
+
+# ---------------------------------------------------- W16: the frame ------
+FRAME_META_KEYS = ("kind", "dims", "system_ref", "n_mean_chunks",
+                   "chunk_protocol", "created_utc")
+
+
+@dataclass
+class RetrievalFrame:
+    """W16 — the centered retrieval frame (spec N17 done right).
+
+    THE FAILURE IT FIXES (measured, scripts/w16_probe_retrieval.py): both
+    the query vector and every chunk vector are ABSOLUTE states (sys +
+    content), so plain cos-sim carries a large COMMON term — the system
+    prompt's state plus the model's generic-text response. On the box the
+    top-3 scores collapse to a ~0.70 floor with a 0.016 spread (top-3
+    [0.7232, 0.7072, 0.7071], gold doc outside) — the ranking degenerates
+    to norm/length effects. The centered frame scores CONTENT:
+
+        q_centered  = (q_abs - sys_vector) - mean_vector
+        c_centered  = (c_delta)             - mean_vector
+        score       = cos(q_centered, c_centered)
+
+    sys_vector  = the reset point's own §4 vector (the delta protocol's
+                  zero — protocol-principled, no corpus statistics)
+    mean_vector = the corpus mean of the chunk DELTAS (removes the residual
+                  generic-text direction all English prose shares)
+
+    Everything stays in the §4 cache-state space (N17: no embedder, no
+    chunk text, no hidden states) — this is a metric-level centering, and
+    the measured discrimination gap (best content-match minus best
+    non-match) grows ~3x over the absolute frame in the box-matching
+    regime.
+    """
+
+    sys_vector: np.ndarray
+    mean_vector: np.ndarray
+    dims: int
+    system_ref: str = ""
+    n_mean_chunks: int = 0
+    chunk_protocol: str = "delta-v1"
+
+    def __post_init__(self) -> None:
+        self.sys_vector = np.ascontiguousarray(
+            self.sys_vector, dtype=np.float32)
+        self.mean_vector = np.ascontiguousarray(
+            self.mean_vector, dtype=np.float32)
+        if self.sys_vector.shape != (self.dims,) \
+                or self.mean_vector.shape != (self.dims,):
+            raise ValueError(
+                f"RetrievalFrame: sys_vector {self.sys_vector.shape} / "
+                f"mean_vector {self.mean_vector.shape} != ({self.dims},)")
+        if not (np.isfinite(self.sys_vector).all()
+                and np.isfinite(self.mean_vector).all()):
+            raise ValueError(
+                "RetrievalFrame: non-finite frame vectors — refusing to "
+                "center retrieval through a broken frame")
+
+    # ------------------------------------------------------------ centering --
+    def center_query(self, qvec_abs: np.ndarray) -> np.ndarray:
+        """(q_abs - sys) - mean — the query's content vector."""
+        q = np.asarray(qvec_abs, dtype=np.float32)
+        if q.shape != (self.dims,):
+            raise ValueError(
+                f"RetrievalFrame.center_query: query {q.shape} != "
+                f"({self.dims},) — the §4 vector and the frame disagree")
+        return (q - self.sys_vector) - self.mean_vector
+
+    def center_delta(self, delta_vec: np.ndarray) -> np.ndarray:
+        """delta - mean — the chunk's content vector."""
+        d = np.asarray(delta_vec, dtype=np.float32)
+        if d.shape != (self.dims,):
+            raise ValueError(
+                f"RetrievalFrame.center_delta: delta {d.shape} != "
+                f"({self.dims},) — §4 order drift")
+        return d - self.mean_vector
+
+    def check_loader(self, loader: "ChunkVectorLoader") -> None:
+        """Loud frame-vs-corpus guards: dims and the reset-point reference
+        (a re-ingestion with a different system prompt must invalidate the
+        frame, not silently mis-center every query)."""
+        if int(self.dims) != int(loader.dims):
+            raise ValueError(
+                f"RetrievalFrame: dims {self.dims} != the corpus's "
+                f"{loader.dims} — frame/corpus drift")
+        ref = loader.system.reference()
+        if self.system_ref and ref and self.system_ref != ref:
+            raise ValueError(
+                f"RetrievalFrame: system_ref {self.system_ref!r} != the "
+                f"corpus's {ref!r} — the reset point changed after the "
+                f"frame was built; re-run run_index.py (the centering is "
+                f"meaningless against a foreign zero point)")
+
+
+def build_retrieval_frame(loader: "ChunkVectorLoader",
+                          max_chunks: Optional[int] = None
+                          ) -> RetrievalFrame:
+    """One pass over the corpus deltas → the RetrievalFrame (sys vector +
+    the mean of the chunk deltas). D5: one vector in memory at a time; the
+    mean is an fp32 accumulator. max_chunks caps the mean's sample (None =
+    the whole corpus — the estimator's noise shrinks as 1/sqrt(n))."""
+    sys_vector = loader.system_vector()
+    ids = loader.chunk_ids()
+    if max_chunks is not None:
+        ids = ids[:max_chunks]
+    if not ids:
+        raise ValueError(
+            "build_retrieval_frame: the corpus is empty — nothing to "
+            "estimate the mean from")
+    acc = np.zeros(loader.dims, dtype=np.float64)
+    protocols = set()
+    for cid in ids:
+        # per-snapshot protocol (the loader validates everything else)
+        path = os.path.join(loader.disk_dir, loader._chunks[cid])
+        snap = load_chunk(path)
+        protocols.add(snap.protocol)
+        acc += loader.delta_vector(cid)
+    if len(protocols) > 1:
+        raise ValueError(
+            f"build_retrieval_frame: mixed snapshot protocols "
+            f"{sorted(protocols)} — a centered frame needs one layout")
+    mean = (acc / len(ids)).astype(np.float32)
+    return RetrievalFrame(
+        sys_vector=sys_vector, mean_vector=mean, dims=int(loader.dims),
+        system_ref=loader.system.reference(), n_mean_chunks=len(ids),
+        chunk_protocol=next(iter(protocols)))
+
+
+FRAME_FILE = "retrieval_frame.npz"
+
+
+def save_retrieval_frame(loader: "ChunkVectorLoader", frame: RetrievalFrame,
+                         path: Optional[str] = None) -> str:
+    """Persist the frame beside the snapshots (atomic tmp+replace). The
+    npz carries the two fp32 vectors + a JSON meta (validated on load)."""
+    if path is None:
+        path = os.path.join(loader.disk_dir, FRAME_FILE)
+    path = os.fspath(path)
+    meta = {
+        "kind": "retrieval-frame-v1",
+        "dims": int(frame.dims),
+        "system_ref": str(frame.system_ref),
+        "n_mean_chunks": int(frame.n_mean_chunks),
+        "chunk_protocol": str(frame.chunk_protocol),
+        "created_utc": datetime.now(timezone.utc).isoformat(
+            timespec="seconds"),
+    }
+    tmp = path + ".tmp.npz"   # np.savez insists on the .npz suffix
+    np.savez(tmp,
+             sys_vector=frame.sys_vector,
+             mean_vector=frame.mean_vector,
+             meta=np.array(json.dumps(meta)))
+    os.replace(tmp, path)
+    return path
+
+
+def load_retrieval_frame(disk_dir: str,
+                         path: Optional[str] = None) -> RetrievalFrame:
+    """Load the frame written by save_retrieval_frame (loud on drift,
+    partial files, or a foreign format). `path` overrides the default
+    <disk_dir>/retrieval_frame.npz (tests)."""
+    path = path if path is not None else os.path.join(
+        os.fspath(disk_dir), FRAME_FILE)
+    if not os.path.isfile(path):
+        raise ValueError(
+            f"load_retrieval_frame: {path} not found — run_index.py "
+            f"writes it at index-build time")
+    with np.load(path, allow_pickle=False) as z:
+        missing = [k for k in ("sys_vector", "mean_vector", "meta")
+                   if k not in z.files]
+        if missing:
+            raise ValueError(
+                f"load_retrieval_frame: {path} is missing {missing} — a "
+                f"partial frame file; re-run run_index.py")
+        meta = json.loads(str(z["meta"]))
+        sys_vector = np.asarray(z["sys_vector"], dtype=np.float32)
+        mean_vector = np.asarray(z["mean_vector"], dtype=np.float32)
+    if not isinstance(meta, dict) or meta.get("kind") != "retrieval-frame-v1":
+        raise ValueError(
+            f"load_retrieval_frame: {path} meta kind "
+            f"{meta.get('kind')!r} != 'retrieval-frame-v1' — a foreign "
+            f"frame file; refusing to center through it")
+    dims = int(meta.get("dims", 0))
+    if dims <= 0:
+        raise ValueError(
+            f"load_retrieval_frame: {path} meta dims {meta.get('dims')!r}")
+    return RetrievalFrame(
+        sys_vector=sys_vector, mean_vector=mean_vector, dims=dims,
+        system_ref=str(meta.get("system_ref", "")),
+        n_mean_chunks=int(meta.get("n_mean_chunks", 0)),
+        chunk_protocol=str(meta.get("chunk_protocol", "delta-v1")))
+
+
+def iter_centered_vectors(loader: "ChunkVectorLoader", frame: RetrievalFrame
+                           ) -> Iterator[np.ndarray]:
+    """The build-side stream: centered content vectors in chunk-id order
+    (feed build_index — it L2-normalizes and validates per stream row)."""
+    frame.check_loader(loader)
+    for cid in loader.chunk_ids():
+        yield frame.center_delta(loader.delta_vector(cid))
 
 
 # ---------------------------------------------------------------------------
@@ -663,13 +985,18 @@ def _query_vector(query_vector, d: Optional[int], ctx: str) -> np.ndarray:
     return q
 
 
-def preselect(index, query_vector: np.ndarray, k: int = 100) -> np.ndarray:
+def preselect(index, query_vector: np.ndarray, k: int = 100,
+             frame: Optional[RetrievalFrame] = None) -> np.ndarray:
     """§6 step 3: IVFADC preselect → candidate chunk ids.
 
     The query is L2-normalized (the index's cosine frame) and searched
     with index.search; returns an int64 id array with faiss's -1 padding
     filtered. k defaults to spec §6's 100 (IndexConfig.preselect_k).
-    """
+
+    W16 `frame`: when given (and the index was BUILT on centered vectors —
+    run_index.py writes both together), the ABSOLUTE §4 query vector is
+    centered (sys + corpus-mean subtraction) before the search; None keeps
+    the legacy absolute behavior bit-identical."""
     k = _check_int(k, "k", ctx="preselect")
     d = getattr(index, "d", None)
     if d is None:
@@ -677,6 +1004,12 @@ def preselect(index, query_vector: np.ndarray, k: int = 100) -> np.ndarray:
             "preselect: `index` must be a faiss index (has .d/.search), "
             f"got {type(index).__name__}")
     q = _query_vector(query_vector, d, ctx="preselect")
+    if frame is not None:
+        q = np.ascontiguousarray(frame.center_query(q), dtype=np.float32)
+        if q.shape != (int(d),):
+            raise ValueError(
+                f"preselect: the centered query {q.shape} != index d={d} — "
+                f"the frame and the index disagree (rebuild together)")
     q_hat = (q / float(np.linalg.norm(q))).reshape(1, -1)
     _, labels = index.search(q_hat, k)
     ids = np.asarray(labels).reshape(-1)
@@ -685,17 +1018,19 @@ def preselect(index, query_vector: np.ndarray, k: int = 100) -> np.ndarray:
 
 
 def rerank(loader, query_vector: np.ndarray, candidate_ids,
-           k: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+           k: int = 3, frame: Optional[RetrievalFrame] = None
+           ) -> Tuple[np.ndarray, np.ndarray]:
     """§6 step 4: exact cos-sim rerank → (top ids, scores desc).
 
     D5 LAZY: dequantizes the candidates' full vectors ONE AT A TIME via
-    loader.vector(cid) — exactly the ids passed (each exactly once,
-    duplicates coalesced), nothing else. The scores are exact cosines of
-    the RAW vectors (query and candidates), independent of the index's
-    normalized frame. Ties keep candidate order (deterministic). A
-    zero-norm candidate scores 0.0 (a legitimate stored zero state —
-    cosine against it is 0 by convention, documented). Returns
-    min(k, #candidates) results.
+    loader.vector(cid) (frame=None, the legacy absolute metric) or
+    loader.delta_vector(cid) centered through `frame` (W16: the content
+    metric — the query vector stays the ABSOLUTE §4 vector either way;
+    the frame does the sys+mean subtraction on both sides) — exactly the
+    ids passed (each exactly once, duplicates coalesced), nothing else.
+    Ties keep candidate order (deterministic). A zero-norm candidate
+    scores 0.0 (a legitimate stored zero state — cosine against it is 0
+    by convention, documented). Returns min(k, #candidates) results.
     """
     k = _check_int(k, "k", ctx="rerank")
     if not hasattr(loader, "vector"):
@@ -705,7 +1040,15 @@ def rerank(loader, query_vector: np.ndarray, candidate_ids,
     if candidate_ids is None:
         raise TypeError("rerank: candidate_ids must be a sequence of ints")
     q = _query_vector(query_vector, None, ctx="rerank")
+    if frame is not None:
+        frame.check_loader(loader)
+        q = frame.center_query(q)
     qn = float(np.linalg.norm(q))
+    if qn == 0.0 and frame is not None:
+        raise ValueError(
+            "rerank: the CENTERED query is zero-norm (the query's state "
+            "equals the reset point + corpus mean — no content to match); "
+            "cosine is undefined")
     uniq: List[int] = []
     seen = set()
     for c in candidate_ids:
@@ -723,7 +1066,11 @@ def rerank(loader, query_vector: np.ndarray, candidate_ids,
             "step 3 feeds step 4)")
     scores = np.empty(len(uniq), dtype=np.float64)
     for i, cid in enumerate(uniq):
-        v = np.asarray(loader.vector(cid))
+        if frame is not None:
+            v = np.asarray(loader.delta_vector(cid))
+            v = frame.center_delta(v)
+        else:
+            v = np.asarray(loader.vector(cid))
         if v.ndim != 1 or v.shape[0] != q.shape[0]:
             raise ValueError(
                 f"rerank: candidate {cid} vector shape {v.shape} != the "

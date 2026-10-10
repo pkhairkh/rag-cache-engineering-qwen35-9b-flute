@@ -21,7 +21,7 @@ from _bootstrap import DEFAULTS, boot, load_model
 
 boot()
 
-from index import ChunkVectorLoader, rerank  # noqa: E402
+from index import ChunkVectorLoader, load_retrieval_frame, rerank  # noqa: E402
 from ingest import load_system_state, reseed_cache  # noqa: E402
 from query import answer_query, query_cache_vector  # noqa: E402
 from tq_cache import TQCache  # noqa: E402
@@ -42,6 +42,12 @@ def main() -> int:
     ap.add_argument("--bits", type=float, default=3.5)
     ap.add_argument("--qjl", action="store_true",
                     help="W15: the paper Alg.-2 A/B — TQCache(qjl=True)")
+    ap.add_argument("--retrieval-frame", choices=("auto", "centered",
+                                                    "absolute"),
+                    default="auto",
+                    help="W16: 'auto' uses the centered frame when "
+                         "retrieval_frame.npz exists (run_index.py writes "
+                         "it); 'absolute' forces the legacy metric")
     args = ap.parse_args()
 
     print("=" * 60)
@@ -57,7 +63,25 @@ def main() -> int:
     loader = ChunkVectorLoader(args.disk_dir, bits=args.bits)
     system = load_system_state(args.disk_dir)
     chunks = list(loader.chunk_ids())
-    print(f"    system {system.reference()}; {len(chunks)} chunks")
+    print(f"    system {system.reference()}; {len(chunks)} chunks; layout "
+          f"{loader.manifest.get('chunk_protocol', 'delta-v1')}")
+
+    # W16: the centered retrieval frame (auto-detected from the side
+    # file run_index.py writes; --retrieval-frame absolute = the A/B)
+    import os
+    frame = None
+    if args.retrieval_frame in ("auto", "centered") and os.path.exists(
+            f"{args.disk_dir.rstrip('/')}/retrieval_frame.npz"):
+        frame = load_retrieval_frame(args.disk_dir)
+        frame.check_loader(loader)
+        print(f"    [W16] centered retrieval frame ON "
+              f"(mean over {frame.n_mean_chunks} deltas)")
+    elif args.retrieval_frame == "centered":
+        raise SystemExit(
+            "--retrieval-frame centered but no retrieval_frame.npz — "
+            "run scripts/gpu/run_index.py first")
+    else:
+        print("    [W16] centered retrieval frame OFF (absolute metric)")
 
     if args.question:
         questions = [args.question]
@@ -79,7 +103,10 @@ def main() -> int:
           f"(direct rerank over {len(chunks)} chunks)...")
     for i, question in enumerate(questions):
         print(f"\n    Query {i + 1}: {question[:80]}...")
-        query_ids = tokenizer.encode(question, return_tensors="pt").cuda()
+        # add_special_tokens=False: matches the ingestion's chunk and
+        # system encoding (the query must live in the same token regime)
+        query_ids = torch.tensor(
+            tokenizer.encode(question, add_special_tokens=False)).cuda()
 
         cache = cache_factory()
         reseed_cache(cache, system)
@@ -87,7 +114,8 @@ def main() -> int:
             model(input_ids=query_ids, past_key_values=cache, use_cache=True)
         qvec = query_cache_vector(cache, system)
 
-        ids, scores = rerank(loader, qvec, np.array(chunks), k=args.top_k)
+        ids, scores = rerank(loader, qvec, np.array(chunks),
+                             k=args.top_k, frame=frame)
         print(f"    Top {args.top_k}: {[int(x) for x in ids]} "
               f"scores {[f'{s:.4f}' for s in scores]}")
 

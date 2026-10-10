@@ -48,7 +48,9 @@ Gates (the W5 definition of done):
       codes (via prefill or a plain forward) is loudly refused — the
       system point is the delta protocol's zero.
   9.  D5 codes-only disk: no 'vector' npz member, no vector field on the
-      loaded snapshot; s_codes on disk ARE the D4 deltas; conv codes are
+      loaded snapshot; s_codes on disk ARE the W16 ABSOLUTE end codes
+      (the default, zero extra rounds) and the legacy delta-v1 layout
+      still round-trips (chunk_protocol="delta-v1"); conv codes are
       ABSOLUTE (bit-equal the cache's post-prefill conv codes of an
       independent rerun, chunk-specific, not the system's).
   10. Manifest invariants: protocol "delta-v1"; bits; system_ref equals
@@ -588,6 +590,10 @@ def test_prefill_system_fresh_cache_contract():
 
 # ============================ 9. D5 codes-only disk + absolute conv ========
 def test_codes_only_disk_and_absolute_conv(tmp_path):
+    """W16: the DEFAULT driver stores the ABSOLUTE end codes (the noise
+    fix — the verbatim install); the delta codes remain available on the
+    record, and the legacy chunk_protocol="delta-v1" layout still
+    round-trips."""
     model = StubModel()
     sys_tok = _tokens(11, 6)
     chunks = [_tokens(101 + i, 5) for i in range(2)]
@@ -601,13 +607,15 @@ def test_codes_only_disk_and_absolute_conv(tmp_path):
             assert "vector" not in z.files          # D5: codes-only npz
         snap = load_chunk(path)
         assert not hasattr(snap, "vector")          # no vector field at all
+        assert snap.protocol == "absolute"          # W16: the default layout
 
-        # s_codes on disk ARE the D4 deltas (the record's delta codes)
+        # s_codes on disk ARE the cache's own end codes (ZERO extra rounds
+        # — the record's abs codes, bit-identical)
         rec = drv.records[cid]
         for L in LINEARS:
-            assert np.array_equal(snap.s_codes[L].idx_lo, rec.delta_s[L].idx_lo)
-            assert np.array_equal(snap.s_codes[L].idx_hi, rec.delta_s[L].idx_hi)
-            assert float(snap.s_codes[L].norm) == float(rec.delta_s[L].norm)
+            assert np.array_equal(snap.s_codes[L].idx_lo, rec.abs_s[L].idx_lo)
+            assert np.array_equal(snap.s_codes[L].idx_hi, rec.abs_s[L].idx_hi)
+            assert float(snap.s_codes[L].norm) == float(rec.abs_s[L].norm)
 
         # conv codes are ABSOLUTE: bit-equal the cache's post-prefill conv
         # codes of an independent fresh-cache reseed + forward rerun
@@ -634,6 +642,22 @@ def test_codes_only_disk_and_absolute_conv(tmp_path):
         assert not np.array_equal(snap0.conv_codes[L].idx_lo,
                                   snap1.conv_codes[L].idx_lo)
 
+    # ---- the LEGACY layout still round-trips (chunk_protocol=delta-v1) ----
+    legacy = tmp_path / "legacy"
+    drv1 = _run_driver(model, sys_tok, chunks, legacy,
+                       chunk_protocol="delta-v1")
+    drv1.run()
+    for cid in (0, 1):
+        snap = load_chunk(snapshot_path(str(legacy), cid))
+        assert snap.protocol == "delta-v1"
+        rec = drv1.records[cid]
+        for L in LINEARS:
+            assert np.array_equal(snap.s_codes[L].idx_lo,
+                                  rec.delta_s[L].idx_lo)
+            assert np.array_equal(snap.s_codes[L].idx_hi,
+                                  rec.delta_s[L].idx_hi)
+            assert float(snap.s_codes[L].norm) == float(rec.delta_s[L].norm)
+
 
 # =========================================== 10. manifest invariants ========
 def test_manifest_invariants(tmp_path):
@@ -647,6 +671,7 @@ def test_manifest_invariants(tmp_path):
 
     man = json.load(open(os.path.join(out, MANIFEST_NAME)))
     assert man["protocol"] == "delta-v1"
+    assert man["chunk_protocol"] == "absolute"    # W16: the storage layout
     assert man["bits"] == BITS
     assert isinstance(man["system_ref"], str) and man["system_ref"]
     assert man["system_ref"] == system.reference()
@@ -663,7 +688,9 @@ def test_manifest_invariants(tmp_path):
         s = load_chunk(p)
         assert s.chunk_id == int(cid)
         assert s.system_ref == man["system_ref"]
-        assert s.protocol == man["protocol"]
+        # W16: the manifest's chunk_protocol pins the snapshot layout (the
+        # family-level 'protocol' field stays the D4 'delta-v1' label)
+        assert s.protocol == man["chunk_protocol"]
         assert s.extra == {"n_tokens": 5}
 
 

@@ -222,7 +222,17 @@ def prefill_system(model, system_token_ids: torch.Tensor, cache: TQCache,
 # ------------------------------------------------------------- per chunk ----
 @dataclass
 class ChunkRecord:
-    """One ingested chunk: the D4 delta codes + the transient vector."""
+    """One ingested chunk: the D4 delta codes + the W16 ABSOLUTE codes.
+
+    W16: `abs_s`/`abs_m1`/`abs_m2` are the cache's OWN end-of-chunk codes
+    (references — captured with ZERO extra quantization rounds). Storing
+    them (protocol="absolute") removes the delta-capture and install
+    requant rounds — the W16 noise decomposition measured those two rounds
+    at 70% of the write-path distortion (capture+install 0.0699 of the
+    0.0994 total at the rig; scripts/w16_probe_noise.py). The DELTAS are
+    still computed and remain the retrieval-frame representation (the
+    centered retrieval frame scores dequant(abs) - dequant(sys)).
+    """
     chunk_idx: int
     n_tokens: int
     delta_s: Dict[int, TQCodes]
@@ -230,12 +240,31 @@ class ChunkRecord:
     delta_m1: Optional[TQCodes]
     delta_m2: Optional[TQCodes]
     cache_vector: np.ndarray                 # fp32, §4 order — transient (D5)
+    abs_s: Dict[int, TQCodes] = field(default_factory=dict)
+    abs_m1: Optional[TQCodes] = None
+    abs_m2: Optional[TQCodes] = None
 
-    def to_snapshot(self, system: SystemState) -> ChunkSnapshot:
+    def to_snapshot(self, system: SystemState,
+                    protocol: str = "delta-v1") -> ChunkSnapshot:
+        """protocol "delta-v1" (legacy): the D4 delta codes — the install
+        runs the dequant-sum-requant chain (2 extra rounds). protocol
+        "absolute" (W16 default): the cache's own end codes — the
+        single-chunk install is VERBATIM (bit-exact, 0 rounds); the deltas
+        are recoverable at read time as dequant(abs) - dequant(sys)."""
+        if protocol == "absolute":
+            s_codes = self.abs_s
+            m1, m2 = self.abs_m1, self.abs_m2
+        elif protocol == "delta-v1":
+            s_codes = self.delta_s
+            m1, m2 = self.delta_m1, self.delta_m2
+        else:
+            raise ValueError(
+                f"ChunkRecord.to_snapshot: protocol {protocol!r} not in "
+                f"('delta-v1', 'absolute')")
         return ChunkSnapshot(
-            chunk_id=self.chunk_idx, protocol="delta-v1",
-            s_codes=self.delta_s, conv_codes=self.conv_codes,
-            m1_codes=self.delta_m1, m2_codes=self.delta_m2,
+            chunk_id=self.chunk_idx, protocol=protocol,
+            s_codes=s_codes, conv_codes=self.conv_codes,
+            m1_codes=m1, m2_codes=m2,
             system_ref=system.reference(),
             extra={"n_tokens": self.n_tokens})
 
@@ -292,7 +321,10 @@ def ingest_chunk(model, chunk_token_ids: torch.Tensor, cache: TQCache,
         delta_s=delta_s,
         conv_codes={L: c for L, c in codes["conv"].items() if c is not None},
         delta_m1=delta_m1, delta_m2=delta_m2,
-        cache_vector=cache_vector)
+        cache_vector=cache_vector,
+        # W16: the cache's own end codes — ZERO extra quantization rounds
+        abs_s=dict(codes["s"]),
+        abs_m1=codes["m1"], abs_m2=codes["m2"])
 
 
 # ------------------------------------------------------------- driver -------
@@ -312,7 +344,8 @@ class IngestDriver:
                  chunks: Sequence, out_dir: str,
                  cache_factory: Optional[Callable[[], TQCache]] = None,
                  bits: float = 3.5, system_ref: str = "",
-                 resume: bool = True, return_records: bool = False):
+                 resume: bool = True, return_records: bool = False,
+                 chunk_protocol: str = "absolute"):
         self.model = model
         self.system_token_ids = system_token_ids
         self.chunks = self._normalize(chunks)
@@ -322,6 +355,15 @@ class IngestDriver:
         self.system_ref = system_ref
         self.resume = resume
         self.return_records = return_records
+        # W16: "absolute" (default) — the chunk snapshots carry the cache's
+        # own end codes (the verbatim install, 0 extra rounds; the W16
+        # noise decomposition: the delta path's 2 rounds own ~70% of the
+        # write-path distortion). "delta-v1" keeps the D4 legacy layout.
+        if chunk_protocol not in ("absolute", "delta-v1"):
+            raise ValueError(
+                f"IngestDriver: chunk_protocol {chunk_protocol!r} not in "
+                f"('absolute', 'delta-v1')")
+        self.chunk_protocol = chunk_protocol
         self.records: List[ChunkRecord] = []
 
     # ------------------------------------------------------------ plumbing -
@@ -348,9 +390,21 @@ class IngestDriver:
         path = self._manifest_path()
         if self.resume and os.path.exists(path):
             with open(path) as f:
-                return json.load(f)
+                man = json.load(f)
+            # W16: a resumed run must keep writing the SAME chunk protocol
+            # (a mixed corpus would force per-snapshot dispatch at install
+            # and strand the manifest's meaning)
+            old = man.get("chunk_protocol")
+            if old is not None and old != self.chunk_protocol:
+                raise ValueError(
+                    f"IngestDriver resume: the manifest's chunk_protocol "
+                    f"{old!r} != this run's {self.chunk_protocol!r} — a "
+                    f"re-protocol re-ingest needs a fresh out_dir or "
+                    f"chunk_protocol={old!r}")
+            return man
         return {"protocol": "delta-v1", "bits": self.bits,
-                "system_ref": None, "done": {}, "vector_dims": None}
+                "system_ref": None, "done": {}, "vector_dims": None,
+                "chunk_protocol": self.chunk_protocol}
 
     def _save_manifest(self, man: dict) -> None:
         os.makedirs(self.out_dir, exist_ok=True)
@@ -401,10 +455,11 @@ class IngestDriver:
             cache = self.cache_factory()
             record = ingest_chunk(self.model, token_ids, cache, system)
             record.chunk_idx = idx
-            snap = record.to_snapshot(system)
+            snap = record.to_snapshot(system, protocol=self.chunk_protocol)
             path = snap_mod.save_chunk(self.out_dir, snap)
             man["done"][str(idx)] = os.path.relpath(path, self.out_dir)
             man["vector_dims"] = int(record.cache_vector.shape[0])
+            man["chunk_protocol"] = self.chunk_protocol
             self._save_manifest(man)
             stats["ingested"] += 1
             if self.return_records:

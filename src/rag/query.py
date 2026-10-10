@@ -37,9 +37,15 @@ import _paths  # noqa: F401
 import snapshot as snap_mod
 from ingest import SystemState, load_system_state, reseed_cache
 from install import install_snapshot
-from tq_cache import TQCache, resolve_quantizer
+from tq_cache import TQCache, TQLinearAttentionLayer, resolve_quantizer
 
 __all__ = ["QueryResult", "answer_query", "query_cache_vector"]
+
+
+# W16: the retrieval frame's side file (index.py writes it at index-build
+# time — sys-centering + corpus-mean centering, the "content overlap"
+# metric). Present -> answer_query retrieves in the centered frame.
+FRAME_FILE = "retrieval_frame.npz"
 
 
 @dataclass
@@ -76,6 +82,28 @@ def query_cache_vector(cache: TQCache, system: SystemState) -> np.ndarray:
             pieces.append(resolve_quantizer(
                 kind.upper(), c.d, system.bits).dequant(c))
     return torch.cat(pieces).to(torch.float32).numpy()
+
+
+def _reset_full_attention(cache) -> None:
+    """W16: drop the full-attention KV + the M1/M2 write positions so the
+    ANSWER prefill (step 7) starts the non-linear state fresh (spec §2.4/
+    §6-7: "the full-attn layers run fresh").
+
+    THE BUG THIS FIXES: steps [2] and [7] prefill the query on the SAME
+    cache — the full-attn layers APPEND, so without this reset the answer
+    prefill sees the query TWICE in the KV (query, query, ...) and every
+    decoded token attends to the duplicated question. The true-doc control
+    (the W14/W15 gold standard, conf 0.895) always ran full-attn fresh —
+    the production flow must match it. The linear TQ layers are untouched
+    (they hold the installed codes); the M1/M2 token counters restart at
+    zero (the answer prefill re-reads the query from position 0)."""
+    from transformers.cache_utils import DynamicLayer
+    for layer in getattr(cache, "layers", []):
+        if isinstance(layer, DynamicLayer) \
+                and not isinstance(layer, TQLinearAttentionLayer):
+            layer.reset()
+        elif isinstance(layer, TQLinearAttentionLayer):
+            layer._m1m2_tokens = 0
 
 
 def answer_query(
@@ -120,8 +148,18 @@ def answer_query(
     if retrieved_ids is None:
         import index as index_mod
         t0 = time.perf_counter()
-        candidates = index_mod.preselect(index, qvec, k=preselect_k)
-        ids, scores = index_mod.rerank(loader, qvec, candidates, k=rerank_k)
+        # W16: the centered retrieval frame (sys + corpus-mean centering)
+        # when the index build persisted one; the ABSOLUTE §4 frame
+        # otherwise (the legacy behavior, bit-identical)
+        disk_dir = getattr(loader, "disk_dir", None)
+        frame = None
+        if disk_dir is not None and os.path.exists(
+                os.path.join(disk_dir, FRAME_FILE)):
+            frame = index_mod.load_retrieval_frame(disk_dir)
+        candidates = index_mod.preselect(index, qvec, k=preselect_k,
+                                         frame=frame)
+        ids, scores = index_mod.rerank(loader, qvec, candidates,
+                                       k=rerank_k, frame=frame)
         t["preselect_rerank"] = time.perf_counter() - t0
         res.retrieved_ids = [int(i) for i in ids]
         res.cos_scores = [float(s) for s in scores]
@@ -148,6 +186,11 @@ def answer_query(
     t0 = time.perf_counter()
     res.install_report = install_snapshot(cache, system, snaps)
     t["install"] = time.perf_counter() - t0
+
+    # W16: the full-attn layers run FRESH for the answer prefill (spec
+    # §2.4/§6-7) — see _reset_full_attention. Must run AFTER the install
+    # (which only touches the linear TQ layers) and BEFORE step [7].
+    _reset_full_attention(cache)
 
     # [7] answer: prefill the query over the installed cache
     t0 = time.perf_counter()

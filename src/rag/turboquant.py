@@ -518,8 +518,17 @@ class TurboQuant:
         form is identical by linearity); γ = ‖r‖; qjl =
         sign(FHT(r/γ, seed+7777)) — a (d,) int8 ±1 vector. A zero residual
         (γ == 0: the degenerate zero-norm unit, or an exact reconstruction)
-        stores zeros and γ = 0 — the compensation term is then exactly 0."""
+        stores zeros and γ = 0 — the compensation term is then exactly 0.
+
+        W16 DEVICE FIX: _dequant_mse returns a CPU tensor (its codebook
+        path is numpy/torch-CPU) while x32 can be CUDA — the GPU box's
+        --qjl A/B crashed exactly here ("Expected all tensors to be on
+        the same device"). The reconstruction is moved onto x32's device
+        BEFORE the residual subtraction (CPU behavior unchanged —
+        same-device is a no-op)."""
         x_mse = self._dequant_mse(codes, dtype=torch.float32)
+        if x_mse.device != x32.device:
+            x_mse = x_mse.to(x32.device)
         resid = x32 - x_mse
         gamma = float(resid.norm().item())
         if gamma > 0.0:

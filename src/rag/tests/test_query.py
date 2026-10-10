@@ -302,7 +302,8 @@ def test_no_code_plus_code_api():
 def test_conv_last_chunk_rule(corpus):
     """install over [A, B, C]: conv codes ARE C's (bit identity, never a
     sum, and NOT A's); a layer missing from C falls back to B's; the
-    report records 'sum+last-conv' per layer."""
+    report records 'sum-abs+last-conv' per layer (W16: the corpus carries
+    absolute snapshots, so the S install runs the absolute sum path)."""
     snaps = [_snap(corpus, cid) for cid in SNAP_IDS]
     cache = _make_cache()
     report = install_snapshot(cache, corpus.system, snaps)
@@ -314,8 +315,8 @@ def test_conv_last_chunk_rule(corpus):
         assert _codes_equal(conv, snaps[-1].conv_codes[L])
         # not the FIRST chunk's (last-chunk-wins, not first)
         assert not _codes_equal(conv, snaps[0].conv_codes[L])
-        assert report[L]["mode"] == "sum+last-conv"
-        assert report[L]["n_deltas"] == len(SNAP_IDS)
+        assert report[L]["mode"] == "sum-abs+last-conv"
+        assert report[L]["n_chunks"] == len(SNAP_IDS)
     # distinct conv codes across chunks -> the identity assert is
     # non-vacuous
     assert not _codes_equal(snaps[0].conv_codes[0], snaps[1].conv_codes[0])
@@ -333,7 +334,7 @@ def test_conv_last_chunk_rule(corpus):
                                snaps[:-1] + [trimmed])
     assert _codes_equal(cache2.layers[0].conv_codes, trimmed.conv_codes[0])
     assert _codes_equal(cache2.layers[2].conv_codes, snaps[1].conv_codes[2])
-    assert report2[2]["mode"] == "sum+last-conv"
+    assert report2[2]["mode"] == "sum-abs+last-conv"
 
 
 # ================================= 4. frame guards ===========================
@@ -368,28 +369,30 @@ def test_install_frame_guards(corpus):
 
 # ================================= 5. M1/M2 (+ S) install budget =============
 def test_install_m1m2_sum_budget(corpus):
-    """install_snapshot over 3 corpus snapshots: S (both layers), M1 AND
-    M2 all reconstruct dequant(sys) + Σ dequant(deltas) within ONE
-    quant-round budget rel-MSE < 0.06 (measured 0.003-0.025); the disk
-    convenience path is bit-identical to the in-memory path."""
+    """install_snapshot over 3 ABSOLUTE snapshots (W16 default): S (both
+    layers), M1 AND M2 all reconstruct the D4 algebra's absolute form
+    Σ dequant(abs_i) − (n−1)·dequant(sys) within ONE quant-round budget
+    rel-MSE < 0.06 (measured 0.003-0.025); the disk convenience path is
+    bit-identical to the in-memory path."""
     snaps = [_snap(corpus, cid) for cid in SNAP_IDS]
     cache = _make_cache()
     report = install_snapshot(cache, corpus.system, snaps)
 
+    n = len(snaps)
     for L in LINEARS:
         q = resolve_quantizer("S", S_D, BITS)
-        expect = q.dequant(corpus.system.s_codes[L]) \
-            + sum(q.dequant(s.s_codes[L]) for s in snaps)
+        expect = sum(q.dequant(s.s_codes[L]) for s in snaps) \
+            - (n - 1) * q.dequant(corpus.system.s_codes[L])
         got = q.dequant(cache.layers[L].s_codes)
         assert _rel_mse(got, expect) < SINGLE_ROUND_GATE
     for kind, attr in (("M1", "m1_codes"), ("M2", "m2_codes")):
         q = resolve_quantizer(kind, M_D, BITS)
         sys_c = getattr(corpus.system, attr)
-        expect = q.dequant(sys_c) \
-            + sum(q.dequant(getattr(s, attr)) for s in snaps)
+        expect = sum(q.dequant(getattr(s, attr)) for s in snaps) \
+            - (n - 1) * q.dequant(sys_c)
         got = q.dequant(getattr(cache, attr))
         assert _rel_mse(got, expect) < SINGLE_ROUND_GATE
-        assert report[kind] == {"mode": "sum", "n_deltas": len(SNAP_IDS)}
+        assert report[kind] == {"mode": "sum-abs", "n_chunks": n}
         assert getattr(cache, attr) is not None
 
     # the disk path over the same ids: bit-identical codes per unit
@@ -479,11 +482,12 @@ def test_e2e_query_flow(corpus):
     assert all(isinstance(t, float) and t > 0.0
                for t in res.timings.values())
 
-    # install report: both S layers + both memories, 3 deltas each
+    # install report: both S layers + both memories, 3 chunks each (the
+    # W16 absolute-sum path)
     assert set(map(str, res.install_report)) == {"0", "2", "M1", "M2"}
     for L in LINEARS:
-        assert res.install_report[L]["mode"] == "sum+last-conv"
-        assert res.install_report[L]["n_deltas"] == 3
+        assert res.install_report[L]["mode"] == "sum-abs+last-conv"
+        assert res.install_report[L]["n_chunks"] == 3
 
     # (iv-a) the greedy decode: 2 tokens, first = the answer argmax = 2
     # (three topic-2 deltas installed -> the matched filter fires on t=2)
@@ -539,7 +543,9 @@ def test_oracle_mode(corpus):
                for v in res.timings.values())
     assert set(map(str, res.install_report)) == {"0", "2", "M1", "M2"}
     for key in ("M1", "M2"):
-        assert res.install_report[key]["n_deltas"] == 1
+        # W16: a single absolute chunk installs VERBATIM (0 requant rounds)
+        assert res.install_report[key]["mode"] == "verbatim"
+        assert res.install_report[key]["n_chunks"] == 1
     assert res.new_token_ids == []                    # max_new_tokens=0
 
 

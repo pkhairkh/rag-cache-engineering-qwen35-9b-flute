@@ -35,6 +35,15 @@ W15 REVISION — the checks the matrix still lacked:
     control materializes (the W14 matrix compared reads against the
     codes' own reference dequant, never against the truth). Printed
     per-variant for S and conv with the W15 budgets.
+  * PROTO-GAP (W16): the delta-protocol decomposition's missing term —
+    a RAW-reseeded cache (the raw system state loaded verbatim, NO
+    quantization) + the chunk prefill with EMPTY full-attn KV vs the
+    continuous [sys+doc] raw truth. The CPU rig (all-linear) measures
+    0.0000 here; the box's ingestion runs chunks with fresh full-attn
+    while the truth is continuous — this row is where that difference
+    shows up. Combined with the W16 noise decomposition
+    (scripts/w16_probe_noise.py: reseed-drift 0.030, capture+install
+    0.070 at the rig), the box's TRUE-dist now decomposes fully.
   * --qjl (NEW): the paper Alg.-2 A/B — TQCache(qjl=True) plumbs the
     residual-sketch compensation through the whole flow (ingest-free:
     the bisect quantizes live).
@@ -142,6 +151,14 @@ def main() -> int:
     from snapshot import load_chunk
     from tq_cache import TQCache, resolve_quantizer
 
+    def load_manifest_protocol(disk_dir):
+        import json as _json
+        try:
+            with open(os.path.join(disk_dir, "ingest_manifest.json")) as f:
+                return _json.load(f).get("chunk_protocol", "delta-v1")
+        except OSError:
+            return "?"
+
     print("=" * 60)
     print("RAGGA INSTALL BISECTION (scripts/gpu/bisect_install.py)")
     print(f"{'FLUTE_NO_FLA=1 (torch decode) ' if args.fla_off else ''}")
@@ -152,10 +169,13 @@ def main() -> int:
     system = load_system_state(args.disk_dir)
     snap = load_chunk(os.path.join(args.disk_dir, "snapshots",
                                    f"chunk_{args.chunk:05d}.npz"))
+    print(f"    chunk layout: {snap.protocol} "
+          f"(manifest: {load_manifest_protocol(args.disk_dir)})")
     device = next(model.parameters()).device
     q_s = resolve_quantizer("S", system.s_codes[0].d, args.bits,
                             qjl=args.qjl)
     delta0 = snap.s_codes.get(0)
+    absolute_snap = snap.protocol == "absolute"
 
     def fresh_cache():
         return TQCache(config=model.config, bits=args.bits, online=True,
@@ -207,14 +227,20 @@ def main() -> int:
 
     # --------------------------------------------------- the checks ----
     def s_read_check(cache, variant):
-        """Layer-0 S state the model reads vs the CORRECT reference:
-        the system codes for reseed/conv-only (bit-clean), the exact sum
-        for s-only/full (the single-requant budget)."""
+        """Layer-0 S state the model reads vs the CORRECT per-variant,
+        per-layout reference: absolute snapshots install the chunk's OWN
+        end codes (the read must match their dequant bit-close — the
+        verbatim install); delta-v1 snapshots keep the sys+delta sum
+        reference (the single-requant budget)."""
         expected = q.dequant(system.s_codes[0])
         threshold = 1e-4
         if variant in ("s-only", "full") and delta0 is not None:
-            expected = expected + q.dequant(delta0)
-            threshold = 0.06
+            if absolute_snap:
+                expected = q.dequant(delta0)     # the verbatim install
+                threshold = 1e-4
+            else:
+                expected = expected + q.dequant(delta0)
+                threshold = 0.06
         got = cache.layers[0].recurrent_states[0].reshape(-1).float().cpu()
         rel = float(((got - expected) ** 2).sum()
                     / (expected ** 2).sum().clamp_min(1e-30))
@@ -271,6 +297,8 @@ def main() -> int:
     # --------------------------------------------- the true-doc flow ----
     raw_truth = {}   # layer -> {"s": tensor, "conv": tensor} (the W15
                      # TRUE-dist reference: the raw [system+doc] end state)
+    raw_sys = {}     # layer -> raw system states (the W16 PROTO-GAP row)
+    proto_gap = None # the W16 protocol-gap measurement (see docstring)
 
     def true_doc_flow():
         """The raw semantic control: [system + chunk] prefilled on a RAW
@@ -278,7 +306,9 @@ def main() -> int:
         W15: also snapshots the raw linear-layer end states — the WRITE-
         PATH truth the new TRUE-dist row compares the installed codes
         against (the read checks only ever compare against the codes'
-        OWN reference dequant)."""
+        OWN reference dequant). W16: also measures the PROTO-GAP row (the
+        docstring at the top of this file)."""
+        nonlocal proto_gap
         path = args.corpus
         if not os.path.exists(path):
             print(f"    [true-doc SKIPPED — corpus not found: {path}]")
@@ -300,6 +330,17 @@ def main() -> int:
         doc_ids = tokenizer.encode(doc, add_special_tokens=False)
         with torch.no_grad():
             cache = DynamicCache(config=model.config)
+            model(input_ids=torch.tensor([sys_ids], dtype=torch.long,
+                                         device=device),
+                  past_key_values=cache)
+            for L in (0, 12):
+                lin = cache.layers[L]
+                if isinstance(lin, LinearAttentionCacheLayerMixin):
+                    raw_sys[L] = {
+                        "s": lin.recurrent_states[0].reshape(-1)
+                                .float().cpu().clone(),
+                        "conv": lin.conv_states[0].reshape(-1)
+                                  .float().cpu().clone()}
             model(input_ids=torch.tensor([sys_ids + doc_ids],
                                          dtype=torch.long,
                                          device=device),
@@ -314,6 +355,47 @@ def main() -> int:
                                 .float().cpu().clone(),
                         "conv": lin.conv_states[0].reshape(-1)
                                   .float().cpu().clone()}
+
+            # W16 PROTO-GAP: the delta protocol's own target state — the
+            # RAW system state loaded VERBATIM into a fresh raw cache
+            # (zero quantization), full-attn dropped (the ingestion's
+            # fresh-KV contract), then the doc prefill. Comparing this
+            # against raw_truth isolates the protocol's structural gap
+            # (the CPU rig's all-linear stack measures 0.0000 here — a
+            # nonzero value on the box is the full-attn-empty term).
+            cacheB = DynamicCache(config=model.config)
+            model(input_ids=torch.zeros(1, 1, dtype=torch.long,
+                                        device=device),
+                  past_key_values=cacheB)      # lazy-init the layers
+            for L in (0, 12):
+                lin = cacheB.layers[L]
+                if isinstance(lin, LinearAttentionCacheLayerMixin):
+                    lin.recurrent_states[0].copy_(
+                        raw_sys[L]["s"].reshape(
+                            lin.recurrent_states[0].shape).to(device))
+                    lin.conv_states[0].copy_(
+                        raw_sys[L]["conv"].reshape(
+                            lin.conv_states[0].shape).to(device))
+            for layer in cacheB.layers:
+                if isinstance(layer, DynamicLayer) \
+                        and not isinstance(layer, LinearAttentionCacheLayerMixin):
+                    layer.reset()              # drop the warmup token's KV
+            model(input_ids=torch.tensor([doc_ids], dtype=torch.long,
+                                         device=device),
+                  past_key_values=cacheB)
+            gap = 0.0
+            for L in (0, 12):
+                lin = cacheB.layers[L]
+                if isinstance(lin, LinearAttentionCacheLayerMixin):
+                    got = lin.recurrent_states[0].reshape(-1).float().cpu()
+                    gap = max(gap, float(
+                        ((got - raw_truth[L]["s"]) ** 2).sum()
+                        / (raw_truth[L]["s"] ** 2).sum().clamp_min(1e-30)))
+            proto_gap = gap
+            print(f"    proto-gap (raw-reseed + doc vs continuous): "
+                  f"{gap:.4f}  (the rig measures 0.0000; a nonzero value "
+                  f"here is the full-attn-empty ingestion term)")
+
             # drop the full-attn KV: G5's geometry (fresh full-attn; the
             # linear state carries the doc). DynamicLayer.reset() drops
             # keys/values; the linear layers are untouched.
@@ -409,7 +491,9 @@ def main() -> int:
     print("\n" + "=" * 60)
     print(f"BISECTION MATRIX{' (FLA OFF)' if args.fla_off else ''}"
           f"{' (QJL ON)' if args.qjl else ''}"
-          f"{' (LEGACY HALF SPLIT)' if args.split_half else ''}")
+          f"{' (LEGACY HALF SPLIT)' if args.split_half else ''}"
+          f" {'[' + snap.protocol + ']' if True else ''}")
+    print(f"proto-gap: {proto_gap if proto_gap is None else f'{proto_gap:.4f}'}")
     print(f"{'variant':<12} {'S-read':<8} {'conv':<8} {'TRUE':<6} "
           f"{'gen':<8} {'conf':>6} {'rep':>5}")
     for v, (a, b, t, c, conf, rep) in results.items():
