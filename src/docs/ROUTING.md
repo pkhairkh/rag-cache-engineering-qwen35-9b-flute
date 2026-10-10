@@ -1,10 +1,14 @@
 # Decode routing
 
-How a module picks its kernel at M = 1. The policy lives in
-`scripts/palettized_modules.py` (`_gemv_decode`, `_gemv_fht_decode`,
-the merge wrappers); the probe (`scripts/probe_decode_routing.py`)
-prints the decision, and the reason every alternative was refused, for
-every module — this doc is the map to that output.
+Purpose: how a module picks its kernel at M = 1 — the route chain, the environment switches, and how to read the probe table.
+Authority: authoritative for the routing policy (implemented in `src/scripts/palettized_modules.py`); subordinate to `SPECIFICATION.md` for RAG semantics.
+Status: synced from the main project @ ab78893, scoped to this repo Wv2-8 — the route chain and the decode-side switches are carried here; the probe that prints the census is main project, not part of this repo.
+
+The policy lives in `src/scripts/palettized_modules.py` (`_gemv_decode`,
+`_gemv_fht_decode`, the merge wrappers); the probe (main project:
+`scripts/probe_decode_routing.py`) prints the decision, and the reason
+every alternative was refused, for every module — this doc is the map
+to that output.
 
 ## 1. The route chain
 
@@ -38,22 +42,25 @@ to attribute a measurement (A/B without a rebuild):
 | `FLUTE_NO_SPLITK=1` | split-K GEMV (routes 3) | the plain streamer / two-launch path — attributes the split-K effect |
 | `FLUTE_NO_WIDE_PREF=1` | wide modules on the plain streamer | wide modules forced onto split-K — the wide-preference A/B |
 | `FLUTE_GS32_BK=64` | BK=32 tiles for gs=32 | deep K-tiles (`<64,128,64,32>`) where `K % 64 == 0` — the prefill A/B |
-| `FLUTE_LAUNCH_DEBUG_SIMPLE=1` | production kernels | the differential twin — debugging only |
+| `FLUTE_LAUNCH_DEBUG_SIMPLE=1` | production kernels | the differential twin — debugging only (main project — not part of this repo) |
 | `FLUTE_MERGE_DEBUG=1` | quiet | per-group merge decision prints |
 
-Modeling/training side (same convention):
+Modeling/training side (same convention; switches read by this repo's
+carried code unless marked main project):
 
 | switch | effect |
 |---|---|
 | `FLUTE_NO_FLA=1` (or `FLUTE_FLA=0`) | restores the reference linear-attention path (the `flute_sm86` kernel A/B) |
-| `FLUTE_ATTN_IMPL` | the ONLY override of the full-attention implementation choice (default `flute_sm86`) |
-| `FLUTE_FUSED_BWD=0` | the fused backward escape hatch (falls to reference backwards) |
-| `FLUTE_WCACHE_GIB` | process-wide dequant W cache cap for the CPU fallback path (default 6 GiB) |
+| `FLUTE_ATTN_IMPL` | the ONLY override of the full-attention implementation choice (default `flute_sm86`; main project — not part of this repo) |
+| `FLUTE_FUSED_BWD=0` | the fused backward escape hatch (falls to reference backwards; main project — not part of this repo) |
+| `FLUTE_WCACHE_GIB` | process-wide dequant W cache cap for the CPU fallback path (default 6 GiB; main project — not part of this repo) |
 
 Build-time switches (`FLUTE_CUDA_ARCHES`, `FLUTE_CUTLASS_HOME`,
-`FLUTE_DENSE_STREAMK`, `FLUTE_TRAIN_PTXAS_V`): [BUILD.md](BUILD.md).
+`FLUTE_DENSE_STREAMK` live in `src/flute_extended/setup.py` here;
+`FLUTE_TRAIN_PTXAS_V` is main project — not part of this repo):
+[BUILD.md](BUILD.md).
 
-## 3. Reading the probe table
+## 3. Reading the probe table (the probe itself is main project — not part of this repo; the census results are restated in [PERFORMANCE.md](PERFORMANCE.md) §2)
 
 ```
 module                       shape       gs   pair        route          grid      MB        us    GB/s

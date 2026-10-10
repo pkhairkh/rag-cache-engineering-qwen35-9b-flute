@@ -1,10 +1,24 @@
 # Evaluation
 
-The measurement tools: the routing/bandwidth probe, the greedy
-equivalence eval, and the PPL protocol — what each one reports and how
-to read it.
+Purpose: the measurement tools — the routing/bandwidth probe, the greedy equivalence eval, the PPL protocol, and this repo's RAG phase-gate harness — what each one reports and how to read it.
+Authority: authoritative for measurement protocol; subordinate to `SPECIFICATION.md` for RAG semantics.
+Status: synced from the main project @ ab78893, scoped to this repo Wv2-8 — the probe/verdict/PPL plane is main project (§0); the carried measurement surfaces here are `src/flute_extended/benchmark_kernel.py` and `src/rag/evals.py` (the RAG phase gates).
 
-## 1. `scripts/probe_decode_routing.py` — the routing + bandwidth census
+## 0. Scoping: what is measured where
+
+| surface | in this repo? | what it is |
+|---|---|---|
+| `src/rag/evals.py` | YES | the RAG phase-gate harness (`roundtrip`/`streaming`/`margin`/`recall`/`e2e`/`ledger`; CPU boxes run `<cmd> --self-test`, the four real-data commands are GPU-box only) |
+| `src/flute_extended/benchmark_kernel.py` | YES | kernel-level prefill sweeps (TFLOPS, cosine-gated) + `--decode-sweep` (M = 1..128) + `--energy` + `--graphs` |
+| routing/bandwidth census | main project: `scripts/probe_decode_routing.py` — not part of this repo | §1 |
+| end-to-end verdict | main project: `scripts/eval_greedy_match.py` — not part of this repo | §2 |
+| standalone PPL | main project: `scripts/eval_ppl.py` — not part of this repo | §3 |
+| supporting kit | main project: `scripts/measure_decode.sh`, `scripts/measure_energy.py`, `scripts/doctor.py`, `scripts/verify_gemv.py`, `scripts/check_gpu_contract.py` — not part of this repo | §4 |
+
+The main project's eval stack produced the reference verdict numbers
+below; the commands that reproduce them live there.
+
+## 1. `scripts/probe_decode_routing.py` — the routing + bandwidth census (main project — not part of this repo)
 
 Loads the palettized model exactly as the eval does (same loader
 flags), then per `PalettizedLinear` module:
@@ -29,7 +43,7 @@ Reading the table: [ROUTING.md](ROUTING.md) §3. The acceptance number
 is the aggregate effective GB/s (gate: ≥ 300; current state:
 [PERFORMANCE.md](PERFORMANCE.md) §3).
 
-## 2. `scripts/eval_greedy_match.py` — the end-to-end verdict
+## 2. `scripts/eval_greedy_match.py` — the end-to-end verdict (main project — not part of this repo)
 
 Greedy-decodes 32 built-in deterministic prompts (96 new tokens each)
 with the dense FP16 model and the palettized model — both with KV-cache
@@ -45,15 +59,6 @@ greedy decoding (never a fixed 1-token forward), both decode-backend
   (145 windows × 2048 tokens), with an OOM ladder that halves the
   batch until a window fits;
 - **VRAM** — per-phase peak (alloc / reserved).
-
-Typical invocation:
-
-```bash
-python scripts/eval_greedy_match.py \
-    --artifacts-dir /home/ubuntu/qwen3_5_9B_palettized \
-    --heads-dir /home/ubuntu/qwen3_5_9B_palettized_heads \
-    --residual
-```
 
 Extra flags: `--n-prompts`, `--max-new-tokens`, `--ppl-batch`,
 `--ppl-max-windows`, `--no-ppl`, `--no-awq-compensation`,
@@ -73,7 +78,7 @@ handle it), and allocator `expandable_segments` warnings when the VRAM
 headroom runs out mid-ladder (the ladder recovers by halving the
 batch).
 
-## 3. `scripts/eval_ppl.py` — the standalone PPL protocol
+## 3. `scripts/eval_ppl.py` — the standalone PPL protocol (main project — not part of this repo)
 
 WikiText-2 perplexity, 145 windows × 2048 tokens, batch-1 unless told
 otherwise, FP32 log-softmax accumulation. Used standalone when only
@@ -83,12 +88,12 @@ quality (not speed) is needed.
 
 | Script | What it measures |
 |---|---|
-| `flute_extended/benchmark_kernel.py` | kernel-level prefill sweeps (TFLOPS, cosine-gated) + `--decode-sweep` (M = 1..128) + `--energy` (pynvml J/token) + `--graphs` |
-| `scripts/measure_decode.sh` | the box measurement kit: dmon clock telemetry, clock locking, nsys capture, the FHT A/B, the narrow/wide/deep-K ncu follow-ups |
-| `scripts/measure_energy.py` | dense-vs-palettized energy/performance harness |
-| `scripts/doctor.py` | the session-settling pass: import states, path table, numerics triple-check, attention parity — run it FIRST on a new box session |
-| `scripts/verify_gemv.py` | box-side numerics gate: the deployed split-K GEMV vs the fp32 reference, every deployed residual rank × split regime |
-| `scripts/check_gpu_contract.py` | the mechanical ban list (which modules may touch CUDA where) |
+| `src/flute_extended/benchmark_kernel.py` | kernel-level prefill sweeps (TFLOPS, cosine-gated) + `--decode-sweep` (M = 1..128) + `--energy` (pynvml J/token) + `--graphs` |
+| `scripts/measure_decode.sh` | the box measurement kit: dmon clock telemetry, clock locking, nsys capture, the FHT A/B, the narrow/wide/deep-K ncu follow-ups (main project — not part of this repo) |
+| `scripts/measure_energy.py` | dense-vs-palettized energy/performance harness (main project — not part of this repo) |
+| `scripts/doctor.py` | the session-settling pass: import states, path table, numerics triple-check, attention parity — run it FIRST on a new box session (main project — not part of this repo) |
+| `scripts/verify_gemv.py` | box-side numerics gate: the deployed split-K GEMV vs the fp32 reference, every deployed residual rank × split regime (main project — not part of this repo) |
+| `scripts/check_gpu_contract.py` | the mechanical ban list (which modules may touch CUDA where) (main project — not part of this repo) |
 
 ## 5. Interpreting results
 
@@ -107,3 +112,8 @@ quality (not speed) is needed.
   arithmetic-wise (graph GEMM + non-GEMM residual = 1/tok/s); if they
   do not, the measurement is broken somewhere — check clocks and
   graph mode first.
+
+The same reading discipline applies to this repo's `src/rag/evals.py`
+gates: the CPU `--self-test` verifies the MEASUREMENT (harness plumbing,
+shape checks, ledger keys), never the model quality — the real-data
+modes are the GPU-box gates.

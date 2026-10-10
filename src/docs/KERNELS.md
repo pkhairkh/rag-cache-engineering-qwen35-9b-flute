@@ -1,10 +1,15 @@
 # CUDA kernels
 
-The kernel family of `flute_extended` (inference) and
-`flute_train_kernels` (training). All kernels compute
-`C[M, N] = A[M, K] @ W[N, K]^T` against LUT-palettized weights
-(`docs/QUANTIZATION.md`) — W never exists as FP16. Entry points are
-bound in `src/bindings.cpp`, declared in `include/flute/entrypoints.h`.
+Purpose: the kernel family of `src/flute_extended` — entry points, regimes, design points, and the shared device primitives.
+Authority: authoritative for the kernel contracts; subordinate to `SPECIFICATION.md` for RAG semantics.
+Status: synced from the main project @ ab78893, scoped to this repo Wv2-8 — the inference family is carried here in full; the training-kernel package (`flute_train_kernels/`, §6) is main project, not part of this repo.
+
+The kernel family of `src/flute_extended` (inference; the training
+package `flute_train_kernels` is main project — not part of this repo).
+All kernels compute `C[M, N] = A[M, K] @ W[N, K]^T` against LUT-palettized
+weights (`src/docs/QUANTIZATION.md`) — W never exists as FP16. Entry
+points are bound in `src/flute_extended/src/bindings.cpp`, declared in
+`src/flute_extended/include/flute/entrypoints.h`.
 
 | regime | entry point | source | when |
 |---|---|---|---|
@@ -19,8 +24,8 @@ bound in `src/bindings.cpp`, declared in `include/flute/entrypoints.h`.
 | dense baseline | `qgemm_cutlass_dense` | `kernel_cutlass_dense.cu` | benchmarking (needs CUTLASS) |
 
 Which route a module actually takes at M = 1 is decided by the routing
-layer (`scripts/palettized_modules.py`) — that policy and its switches
-live in [ROUTING.md](ROUTING.md).
+layer (`src/scripts/palettized_modules.py`) — that policy and its
+switches live in [ROUTING.md](ROUTING.md).
 
 ## 1. The streaming family (prefill, M ≥ 16)
 
@@ -29,7 +34,7 @@ double-buffered tensor-core pipeline over tiles (BM, BN, BK, GS) — A
 staged by `cp.async` with tile i+1's copy issued before tile i's MMA;
 dequant is a paired-LUT lookup per packed byte straight into the MMA
 register file (no shared-memory W tile). Details, tile table, and the
-register budget: `flute_extended/README.md` and [BUILD.md](BUILD.md) §4.
+register budget: `src/flute_extended/README.md` and [BUILD.md](BUILD.md) §4.
 
 The sub-4-bit instantiations
 (`flute_kernel_streaming_sub4<Cfg, B>` legacy layout,
@@ -40,7 +45,8 @@ same pipeline to b ∈ {1,2,3}; the 4-bit binaries are unchanged.
 
 ## 2. The plain GEMV streamer (M = 1, wide modules)
 
-`flute_kernel_gemv_dual` (`kernel_gemv.cu`): one launch per module, a
+`flute_kernel_gemv_dual` (`src/flute_extended/src/kernel_gemv.cu`):
+one launch per module, a
 plain warp-per-row streamer whose only job is to move the weight stream
 once at as close to DRAM speed as the shape allows. The routing layer
 prefers it for **wide** modules (≥ 160 output tiles — `lm_head` with its
@@ -51,9 +57,9 @@ rotation inside the launch.
 
 ## 3. The split-K GEMV (M = 1, the workhorse)
 
-`flute_kernel_gemv_splitk` (`kernel_gemv_splitk.cu`) — the default
-decode kernel for the 248 layer modules. Design points, in the order
-they matter:
+`flute_kernel_gemv_splitk` (`src/flute_extended/src/kernel_gemv_splitk.cu`)
+— the default decode kernel for the 248 layer modules. Design points,
+in the order they matter:
 
 - **Split-K grid**: `grid = (N/128, SPLIT)` with `SPLIT` chosen at
   launch so `(N/128)·SPLIT ≥ 160` (two waves of the 80 SMs; powers of
@@ -133,7 +139,8 @@ stays.
 
 ## 5. The FHT kernels
 
-`kernel_fht.cu` + `include/flute/fht.cuh` + `flute_extended/fht.py`:
+`src/flute_extended/src/kernel_fht.cu` +
+`src/flute_extended/include/flute/fht.cuh` + `src/flute_extended/fht.py`:
 the Hadamard boundary fold
 `x_rot = x @ T` with `T = blockdiag_b(H_b · diag(s_b) / sqrt(b))`
 computed as an O(K log K) butterfly instead of an O(K²) explicit
@@ -160,7 +167,7 @@ power-of-two segment, and the adjoint (H symmetric, H@H = b·I) is
   tests compare against the explicit `x @ T` ground truth
   (`fht.build_rotation_matrix`).
 
-## 6. The training kernels (`flute_train_kernels/`)
+## 6. The training kernels (`flute_train_kernels/`, main project — not part of this repo)
 
 The backward side for QLoRA-style training on palettized weights.
 Every entry takes `(bitwidth, indices_layout)` — the 4-bit path is the
@@ -170,20 +177,21 @@ agreement gate as the inference package).
 
 | entry | source | computes |
 |---|---|---|
-| `fused_backward_gemm` | `kernel_backward_gemm.cu` | `grad_X[M, K] = grad_Y[M, N] @ W[N, K]` with on-the-fly dequant (tensor cores) |
-| `backward_simple_twin` | `kernel_backward_gemm.cu` | the differential twin |
-| `lut_grad_scatter` | `kernel_lut_grad.cu` | `dL/dLUT[g, c] = Σ_{n∈g} Σ_{k: idx[n,k]=c} dL/dW[n, k]` — the scatter from `dL/dW = grad_Y^T X` into the codebook |
-| `lut_grad_scatter_twin` | `kernel_lut_grad.cu` | the differential twin |
+| `fused_backward_gemm` | `kernel_backward_gemm.cu` (main project) | `grad_X[M, K] = grad_Y[M, N] @ W[N, K]` with on-the-fly dequant (tensor cores) |
+| `backward_simple_twin` | `kernel_backward_gemm.cu` (main project) | the differential twin |
+| `lut_grad_scatter` | `kernel_lut_grad.cu` (main project) | `dL/dLUT[g, c] = Σ_{n∈g} Σ_{k: idx[n,k]=c} dL/dW[n, k]` — the scatter from `dL/dW = grad_Y^T X` into the codebook |
+| `lut_grad_scatter_twin` | `kernel_lut_grad.cu` (main project) | the differential twin |
 
-Python surface: `scripts/qlora_gemm.py` wraps these as
+Python surface (main project: `scripts/qlora_gemm.py`) wraps these as
 `FusedQLoRAGEMMTrainLUT` (single-stream) and
 `FusedQLoRAGEMMTrainLUTTwoStreams` (two-stream autograd path — two
 single-stream backwards, the frozen-stream-2 drop fixed) with the
 pure-torch references (`train_lut_reference_*`) as ground truth. The
-CPU gate suite: `tests/test_lut_gradients.py`, `tests/test_two_stream_training.py`,
-`tests/test_dual_stream.py`.
+CPU gate suite (main project: `tests/test_lut_gradients.py`,
+`tests/test_two_stream_training.py`, `tests/test_dual_stream.py`) is
+not part of this repo.
 
-## 7. Shared device primitives (`include/flute/gemv.cuh`)
+## 7. Shared device primitives (`src/flute_extended/include/flute/gemv.cuh`)
 
 Everything the GEMV families share lives here once:
 
@@ -200,5 +208,5 @@ Everything the GEMV families share lives here once:
 - `gemv_fht_prologue` — the shared FHT boundary-fold prologue (fp32
   staging + butterfly + per-segment signs/AWQ into the smem x row).
 
-The split-K workspace lives in `src/gemv_host.cpp`
+The split-K workspace lives in `src/flute_extended/src/gemv_host.cpp`
 (`gemv_pick_split(tiles, G)` is the launch-side SPLIT policy of §3).

@@ -1,10 +1,12 @@
 # Performance
 
-The measured decode state of the deployed model on the A10G, the time
-budget it implies, and the ranked list of what is still on the table.
+Purpose: the measured decode state of the deployed model on the A10G, the time budget it implies, and the ranked list of what is still on the table.
+Authority: authoritative for the measured bands (the reference calibration of the carried kernel family); subordinate to `SPECIFICATION.md` for RAG semantics.
+Status: synced from the main project @ ab78893, scoped to this repo Wv2-8 — all numbers verbatim from the 2026-10-09 main-project box run (probe + greedy eval); the runs are main project, the kernels they measured are carried here.
 Every number below comes from the 2026-10-09 box run (probe + greedy
-eval on the current tree); the commands that reproduce them are in
-[RUNBOOK.md](RUNBOOK.md).
+eval on the current tree); the commands that reproduce them:
+[RUNBOOK.md](RUNBOOK.md) §6 (the runs are main project — this repo
+carries the kernels and the routing layer they measured).
 
 ## 1. The headline numbers
 
@@ -102,7 +104,7 @@ Correctness rows with cosine < 0.999 are invalid and must not be
 reported. The ncu success gates (tensor-pipe ≥ 70%, bank conflicts
 ≤ 1%, ≤ 255 regs + zero spills, occupancy ≥ 50%) and the ptxas audit
 are hard prerequisites: [BUILD.md](BUILD.md) §4,
-`flute_extended/tools/ncu_profile.sh`.
+`src/flute_extended/tools/ncu_profile.sh`.
 
 ## 7. Known cost items (open, ranked)
 
@@ -133,7 +135,7 @@ are hard prerequisites: [BUILD.md](BUILD.md) §4,
 
 ## 8. Measurement discipline
 
-- Lock clocks (`flute_extended/tools/lock_clocks.sh`) for A/B; a
+- Lock clocks (`src/flute_extended/tools/lock_clocks.sh`) for A/B; a
   fresh cool GPU briefly shows boost numbers ~10% high.
 - Default probe/bench mode flushes L2 between timed iterations
   (serving-realistic); `--no-flush-l2` is the optimistic bound.

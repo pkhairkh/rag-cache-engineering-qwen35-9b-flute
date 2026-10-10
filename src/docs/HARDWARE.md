@@ -1,6 +1,8 @@
 # Hardware — the A10G deployment target
 
-The facts every performance claim in this repo is calibrated against.
+Purpose: the facts every performance claim in this repo is calibrated against.
+Authority: authoritative for hardware facts; subordinate to `SPECIFICATION.md` for RAG semantics.
+Status: synced from the main project @ ab78893, scoped to this repo Wv2-8 (all values verbatim — the A10G is the deployment target of the carried kernels).
 Target: one AWS g5.xlarge — the **NVIDIA A10G as deployed in EC2 G5**
 (24 GB, single-slot, 300 W), NOT the 150 W A10 PCIe card.
 
@@ -21,7 +23,7 @@ Target: one AWS g5.xlarge — the **NVIDIA A10G as deployed in EC2 G5**
 
 Peak-efficiency percentages in the docs use **62.5 TFLOPS** (FP32-acc
 sustained). Sustained clock droop under memory load is real; lock
-clocks for A/B comparisons (`flute_extended/tools/lock_clocks.sh`).
+clocks for A/B comparisons (`src/flute_extended/tools/lock_clocks.sh`).
 
 ## 2. The memory-wall arithmetic
 
@@ -69,7 +71,7 @@ The constraints the kernels are built against:
 
 The full worked occupancy arithmetic and the ptxas audit commands:
 [BUILD.md](BUILD.md) §4; the design patterns applied from the CUTLASS
-docs: `flute_extended/docs/CUTLASS_PATTERNS.txt`.
+docs: `src/flute_extended/docs/CUTLASS_PATTERNS.txt`.
 
 ## 4. Other GPUs
 

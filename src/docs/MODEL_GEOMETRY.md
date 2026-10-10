@@ -1,11 +1,13 @@
 # Model geometry — Qwen3.5-9B
 
-The dimensions of the deployment target, pinned against the live
-checkpoint config. The config is committed verbatim at
-[docs/qwen3_5_9b_config.json](qwen3_5_9b_config.json):
+Purpose: the dimensions of the deployment target, pinned against the live checkpoint config.
+Authority: authoritative for the geometry; subordinate to `SPECIFICATION.md` for RAG semantics.
+Status: synced from the main project @ ab78893, scoped to this repo Wv2-8 (all values verbatim; the config is carried here).
+The config is committed verbatim at
+[src/docs/qwen3_5_9b_config.json](qwen3_5_9b_config.json):
 
 ```
-d0883072e01861ed0b2d47be3c16c36a8e81c224c7ffaa310c6558fb3f932b05  docs/qwen3_5_9b_config.json
+d0883072e01861ed0b2d47be3c16c36a8e81c224c7ffaa310c6558fb3f932b05  src/docs/qwen3_5_9b_config.json
 ```
 
 Re-verify any time: `curl -s https://huggingface.co/Qwen/Qwen3.5-9B/raw/main/config.json | sha256sum`.
@@ -78,7 +80,8 @@ embedding; no second artifact set is written for it).
 ## 3. The head arithmetic
 
 `lm_head` and `embed_tokens` are the widest tensors in the model and get
-the dedicated head pass (`--palettize-heads`):
+the dedicated head pass (main project: the palettizer's
+`--palettize-heads` / `--only-heads` modes):
 
 | item | value |
 |---|---|
@@ -89,18 +92,19 @@ the dedicated head pass (`--palettize-heads`):
 | full W-read at 600 GB/s | FP16 3.39 ms → hybrid 1.72 ms |
 
 The head pass runs decoupled from the body (`--palettize-heads` /
-`--only-heads` modes) because its 1940-tile geometry needs a different
-memory plan than the 32-layer body sweep; a head-only run reproduces the
-full run's head artifacts byte-identically, so the two passes compose
-without a combined rerun.
+`--only-heads` modes, main project) because its 1940-tile geometry needs
+a different memory plan than the 32-layer body sweep; a head-only run
+reproduces the full run's head artifacts byte-identically, so the two
+passes compose without a combined rerun.
 
 ## 4. Notes for code that consumes this table
 
 - The probe table's per-module `MB` column (code-stream bytes) follows
   directly from these shapes: e.g. `gate_proj` at idx4 = 12288·4096·4/8 B
   ≈ 24 MiB of indices + LUT.
-- Model-scale arithmetic in tests (`tests/test_lut_gradients.py` and
-  friends) derives from this file, never from hardcoded copies.
+- Model-scale arithmetic in tests (main project: `tests/test_lut_gradients.py`
+  and friends; here: the `src/rag/tests/` geometry assertions) derives
+  from this file, never from hardcoded copies.
 - Q+gate packing means the full-attention `q_proj` output is 8192 rows:
   16 heads × 256 dim for Q, plus the same again for the gate values.
   Splitting it for kernel dispatch respects the 2048-row Q / K / V

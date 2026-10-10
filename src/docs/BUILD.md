@@ -1,9 +1,10 @@
 # Build and bring-up
 
-Building the two CUDA extensions, verifying the build is the one that
-runs, and the correctness ladder to walk on first contact with new
-hardware. Target: NVIDIA A10G (SM_86), CUDA 12.0+, PyTorch 2.x, C++20
-host compiler. The same steps work on any SM_80+ GPU with adjusted clock
+Purpose: building the CUDA extension, verifying the build is the one that runs, and the correctness ladder to walk on first contact with new hardware.
+Authority: authoritative for the kernel build; subordinate to `SPECIFICATION.md` for RAG semantics.
+Status: synced from the main project @ ab78893, scoped to this repo Wv2-8 (one extension here — `src/flute_extended`; the training-kernel extension is main project, not part of this repo).
+Target: NVIDIA A10G (SM_86), CUDA 12.0+, PyTorch 2.x, C++20 host
+compiler. The same steps work on any SM_80+ GPU with adjusted clock
 and peak expectations.
 
 ## 1. Prerequisites
@@ -28,11 +29,12 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, \
 ## 2. Build
 
 ```bash
-cd flute_extended
+cd src/flute_extended
 python setup.py build_ext --inplace     # extension .so lands in-tree
-cd ../flute_train_kernels
-python setup.py build_ext --inplace
 ```
+
+The training-kernel extension (`flute_train_kernels/`) is main project,
+not part of this repo — there is nothing else to build here.
 
 What the build does, and the knobs:
 
@@ -68,8 +70,10 @@ python setup.py build_ext --inplace
 `build_ext --inplace` updates the `.so` in the **source tree only**. If
 `flute_extended` was installed non-editably, `import flute_extended`
 resolves to the site-packages copy — which stays stale after a rebuild.
-The palettizer probes the kernel's GS support at startup and aborts
-before the model load, naming the loaded module's path, so a stale copy
+The main project's palettizer probes the kernel's GS support at startup
+and aborts before the model load, naming the loaded module's path (main
+project — not part of this repo); here the same symptom surfaces through
+the loader's kernel-availability checks. A stale copy
 is loud but the symptom looks like a kernel bug. After rebuilding:
 
 ```bash
@@ -90,6 +94,7 @@ The streaming kernel targets ~130-210 registers per thread against the
 every performance expectation:
 
 ```bash
+cd src/flute_extended
 nvcc -std=c++20 -O3 --use_fast_math --expt-relaxed-constexpr \
      -gencode=arch=compute_86,code=sm_86 \
      -Iinclude -I$(python -c "import torch; print(torch.utils.cpp_extension.include_paths()[0])") \
@@ -111,7 +116,7 @@ Each step isolates a failure class before the next one runs:
 
 ```bash
 # 5.1 scalar-staging twin (validates PTX fragment mapping + mma)
-python test_flute.py --backend debug_simple
+cd src/flute_extended && python test_flute.py --backend debug_simple
 
 # 5.2 production kernel vs reference (multi-backend suite)
 python test_flute.py
@@ -134,7 +139,8 @@ staging from dispatch bugs; only the deep-tile A/B fails → the
 
 For the decode GEMV family the box-side gate is
 `scripts/verify_gemv.py` (the deployed kernel vs the fp32 reference on
-every deployed residual rank and split regime).
+every deployed residual rank and split regime; main project — not part
+of this repo).
 
 ## 6. Troubleshooting
 
@@ -148,4 +154,4 @@ every deployed residual rank and split regime).
 | Performance 2-3x below the bands | re-run the ptxas audit (§4); spills are the usual cause |
 | Bank-conflict gate fails in ncu | compare the swizzle functions in `mma.cuh` against the store-side indexing in the kernel's dequant/staging paths |
 | Build takes tens of minutes | `ninja` missing (install it) or `MAX_JOBS` unset — see §2 |
-| Palettizer aborts with a "stale kernel" GS verdict | the loaded `_C` is not the rebuilt one — see §3 |
+| Palettizer aborts with a "stale kernel" GS verdict | the loaded `_C` is not the rebuilt one — see §3 (the palettizer itself is main project, not part of this repo) |

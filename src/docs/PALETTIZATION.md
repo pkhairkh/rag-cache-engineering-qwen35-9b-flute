@@ -1,10 +1,13 @@
 # Palettization pipeline
 
-From a dense checkpoint to a loadable artifact directory: calibration
-capture, per-tensor recipe selection, codebook optimization, residual
-extraction, and the artifact writer. The engine is
-`scripts/palettize_qwen3_5_9b.py`; its inputs come from
-`scripts/calibrate_real_text.py` (driven by `scripts/capture.py`).
+Purpose: from a dense checkpoint to a loadable artifact directory — calibration capture, per-tensor recipe selection, codebook optimization, residual extraction, and the artifact writer.
+Authority: authoritative for the artifact formats and recipe vocabulary (the contract `src/scripts/palettized_modules.py` consumes); subordinate to `SPECIFICATION.md` for RAG semantics.
+Status: synced from the main project @ ab78893, scoped to this repo Wv2-8 — the producer (engine + calibration capture) is main project, not part of this repo; this repo receives the artifact directories pre-built and loads them via `src/scripts/loader.py::load_quant_model`. The full producer workflow lives in the main project repo.
+
+The engine is `scripts/palettize_qwen3_5_9b.py` (main project — not
+part of this repo); its inputs come from
+`scripts/calibrate_real_text.py` (driven by `scripts/capture.py`;
+main project).
 
 ## 1. Calibration
 
@@ -106,7 +109,7 @@ Additional run modes: `--target-weights` (a named subset),
 recovery), `--persist-grams` (reuse a Gram store across runs),
 `--rotate` (the AWQ/rotation fold), `--seed`.
 
-## 7. Full CLI reference (`scripts/palettize_qwen3_5_9b.py`)
+## 7. Full CLI reference (`scripts/palettize_qwen3_5_9b.py`, main project — not part of this repo)
 
 | flag | default | meaning |
 |---|---|---|
@@ -127,9 +130,9 @@ recovery), `--persist-grams` (reuse a Gram store across runs),
 
 ## 8. Quality gates in-repo
 
-- CPU differential: the toy ladder (`tests/test_toy_*.py`) and
-  `tests/test_auto_compression.py` pin the resolver's decisions on fixed
-  spectra;
+- CPU differential: the toy ladder and the auto-resolver suites (main
+  project: `tests/test_toy_*.py`, `tests/test_auto_compression.py`) pin
+  the resolver's decisions on fixed spectra;
 - The per-tensor cosine/nMSE numbers land in `metadata.json`
   (`auto_decision` ledger) and are re-read by the eval stack;
 - The greedy-equivalence + PPL end-to-end verdicts:

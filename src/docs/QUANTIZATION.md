@@ -1,11 +1,15 @@
 # Quantization format
 
-The storage contract between the palettizer and the kernels: what sits in
-an artifact directory, what every byte means, and what a dequantization
-costs at runtime. The packers (`flute_extended/idxN.py`,
-`flute_extended/idx4.py`) are the normative implementation; the tests
-enforce every clause (CPU: `tests/test_dequant_reference.py` and friends;
-GPU: `flute_extended/test_flute.py`, `test_qwen_weights.py`).
+Purpose: the storage contract between the palettizer and the kernels — what sits in an artifact directory, what every byte means, and what a dequantization costs at runtime.
+Authority: authoritative for the byte-level format (the contract this repo's loader and kernels consume); subordinate to `SPECIFICATION.md` for RAG semantics.
+Status: synced from the main project @ ab78893, scoped to this repo Wv2-8 — the packer carried here is `src/flute_extended/flute_extended/idxN.py`; the 4-bit twin packer and the CPU test suite are main project.
+
+The packers are the normative implementation — here
+`src/flute_extended/flute_extended/idxN.py` (the 4-bit twin
+`flute_extended/idx4.py` is main project, not part of this repo); the
+gates enforce every clause (GPU: `src/flute_extended/test_flute.py`,
+`src/flute_extended/test_qwen_weights.py`; CPU: main project —
+`tests/test_dequant_reference.py` and friends).
 
 ## 1. Artifact set of one palettized tensor
 
@@ -92,7 +96,9 @@ cores consume (the FLUTE paired-LUT trick, arXiv 2407.10960 §3.1-3.2):
   `k = g*64 + kt*16 + 2*(lane&3) + 8*s2` (and k+1).
 - At `b = 4` this reduces exactly to the classic idx4 layout (one byte
   per pair); `idxN.pack_idxn(idx, 4)` is byte-identical to
-  `idx4.pack_idx4(idx)` (asserted by the tests).
+  `idx4.pack_idx4(idx)` (the idx4 twin is main project — not part of
+  this repo; `idxN.self_test()` asserts the identity when the twin is
+  co-located).
 
 The **k-pair** is the unit that matters: two consecutive values
 (`idx[n,k]`, `idx[n,k+1]`) dequantize into one `mma.m16n8k16`
