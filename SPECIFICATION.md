@@ -5,7 +5,7 @@ Authority: top of the doc chain SPECIFICATION.md > PROPOSAL.md > TASKS.md; desig
 Status: v1 semantics preserved (format rewritten Wv2-6.1); implemented under `src/rag/` — 161 tests green; §9–§10 are A10G targets to measure on the GPU box.
 
 ## 1. The model
-- **N1.** Load Qwen3.5-9B (FLUTE idxN W4+r32) via `src/scripts/loader.py::load_quant_model`.
+- **N1.** Load Qwen3.5-9B (FLUTE idxN hybrid palettization) via `src/scripts/loader.py::load_quant_model`.
 - **N2.** Run 32 layers: 24 linear-attention (`Qwen3_5GatedDeltaNet`) + 8 full-attention (`Qwen3_5Attention`) (`src/scripts/modeling.py`); config source `src/docs/qwen3_5_9b_config.json`.
 - **N3.** Capture S at 9 hooks (`src/rag/hooks.py::hook_map`) — hook 0 after layer 0, hooks 1–8 after the full-attention layers 3, 7, …, 31; the 9 hooks capture all 24 per-layer S tensors: 1 + 2 + 7×3 = 24.
 
@@ -109,7 +109,7 @@ summed_codes = TurboQuant.quant( Σ_i TurboQuant.dequant(codes_i) )
 - **N25.** Implementations: `src/rag/install.py::sum_turboquant_codes / install_snapshot / install_from_disk`; `src/rag/query.py::answer_query` (the full §6 flow, preselect_k=100, rerank_k=3).
 
 ## 7. Pretraining (fine-tune)
-- **N26.** Train by next-token prediction on the OfficeQA corpus via the W10 LUT path, on the W4+r32 model loaded by `src/scripts/loader.py::load_quant_model`.
+- **N26.** Train by next-token prediction on the OfficeQA corpus via the LUT path, on the idxN hybrid model loaded by `src/scripts/loader.py::load_quant_model`.
 - **N27.** Use a lean training loop written as part of the RAG build on the GPU box — the parent project's QLoRA/distillation trainer is NOT part of this repo. Straight-through LUTs via `PalettizedLinear.make_trainable()` on the reference path (`forward="reference"`).
 - **N28.** Train the 24 per-layer linear-attention params (so S is discriminative) + the M1/M2 read/write gates (so the global caches carry info) + the LUTs (W10); ~500 steps on A10G. The real model is already trained by Qwen — this is a fine-tune.
 - **N29.** Serve the fine-tuned LUTs as full LUT artifacts (`pretrained_luts/`, §11) — not as QLoRA adapters. Implementations: `src/rag/finetune.py::train / build_trainables / freeze_all_luts`; `src/rag/lut_export.py::export_luts / import_luts`.
@@ -133,7 +133,7 @@ index.train(cache_vectors_fp32); index.add(cache_vectors_fp32)
 ## 10. VRAM (A10G, 24 GiB)
 | component | size |
 |---|---|
-| Model weights (W4+r32) | 5.85 GiB |
+| Model weights (idxN hybrid) | 6.35 GiB |
 | System prompt cache (TQ codes) | ~6 MiB |
 | Query cache (TQ codes, during query) | ~6 MiB |
 | Installed retrieved codes (3 chunks) | ~18 MiB |
@@ -163,12 +163,12 @@ disk/
 ## 13. The repo files used
 | path | symbol | role |
 |---|---|---|
-| `src/scripts/loader.py` | `load_quant_model(...)` | loads the W4+r32 LUT model |
+| `src/scripts/loader.py` | `load_quant_model(...)` | loads the idxN hybrid LUT model |
 | `src/scripts/modeling.py` | `Qwen3_5GatedDeltaNet` | the linear-attn layer (produces S) |
 | `src/scripts/modeling.py` | `cache_params.layers[L].recurrent_states[0]` / `.conv_states[0]` | access S / conv_state (intercepted for TQ) |
 | `src/scripts/modeling.py` | `_fla_resolve()` | the fla wiring for decode |
-| `src/scripts/palettized_modules.py` | `PalettizedLinear.forward(x)` | the W4 forward kernel |
+| `src/scripts/palettized_modules.py` | `PalettizedLinear.forward(x)` | the idxN LUT forward |
 | `src/flute_extended/src/kernel_fht.cu` | `fht_forward_kernel` | the FHT (TurboQuant's rotation) |
 | `transformers` | `DynamicCache(config=model.config)` | the cache object (TQ-intercepted) |
 | `src/rag/` | `turboquant`, `codebooks`, `tq_cache`, `m1m2`, `hooks`, `ingest`, `snapshot`, `install`, `query`, `finetune`, `lut_export`, `index`, `evals` (+ `codebooks/`, `tests/`) | the §1–§8 implementation; per-section clauses above name each entry point; 161 tests under `src/rag/tests/` |
-| `src/flute_extended/src/` | `kernel_gemv*.cu`, `kernel_streaming.cu`, `kernel_fht.cu`, `kernel_debug_simple.cu`, `kernel_cutlass_dense.cu` + `include/flute/` headers | the W4 inference CUDA kernels |
+| `src/flute_extended/src/` | `kernel_gemv*.cu`, `kernel_streaming.cu`, `kernel_fht.cu`, `kernel_debug_simple.cu`, `kernel_cutlass_dense.cu` + `include/flute/` headers | the idxN inference CUDA kernels |

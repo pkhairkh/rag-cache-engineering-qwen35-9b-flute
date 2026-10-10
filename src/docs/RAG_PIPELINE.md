@@ -48,7 +48,7 @@ Suite: `python3 -m pytest src/rag/tests -q` → 161 tests, CPU-only.
 | `disk/snapshots/system_state.npz` | the persisted system-prompt reset point (absolute codes) | ~6 MiB |
 | `disk/snapshots/chunk_XXXXX.npz` | 24 S codes + 24 conv codes + M1 + M2 codes (DELTA for S/M1/M2 vs the system state; ABSOLUTE for conv) | ~6 MiB each |
 | `disk/snapshots/ingest_manifest.json` | the restart manifest (completed chunk ids) | — |
-| `disk/pretrained_luts/` (+ `manifest.json`) | the fine-tuned LUT artifacts | ~5.85 GiB |
+| `disk/pretrained_luts/` (+ `manifest.json`) | the fine-tuned LUT artifacts | ~6.35 GiB |
 
 The retrieval vector (dims 24 × 524,288 + 2 × 524,288 = 13,631,488) is
 dequantized from the codes on demand for index building and rerank —

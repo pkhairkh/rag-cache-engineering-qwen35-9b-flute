@@ -100,8 +100,8 @@ def test_real_config_builds_and_wraps_layers():
     layer_types, per_layer_kwargs = get_layer_types_and_kwargs(
         cfg.get_text_config(decoder=True))
     assert layer_types == LAYER_PLAN
-    assert per_layer_kwargs == [{"number_of_states": 1}, {},
-                                {"number_of_states": 1}, {}]
+    # transformers API changed: per_layer_kwargs is now a dict shared across layers
+    assert per_layer_kwargs == {"number_of_states": 1}
 
     cache = TQCache(config=cfg)
     assert isinstance(cache, DynamicCache)             # a real transformers Cache

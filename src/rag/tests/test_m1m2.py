@@ -6,7 +6,7 @@ memories, SPECIFICATION.md §2.2) plus its W3.2 wiring in
 `Qwen3_5GatedDeltaNet.forward`, gated by `config.use_m1m2`, default OFF).
 
 Gates (all deterministic — pinned torch seeds, fp32 for bit-identical
-asserts, CPU-only, no network):
+asserts, CUDA-only, no network):
 
   A. LAYER PARITY (torch.equal — the first forward is bit-exact through
      every cache route):
@@ -48,8 +48,7 @@ asserts, CPU-only, no network):
            store (the D4 delta protocol at the wiring level): dequant(A)
            + dequant(B) == dequant(sequential A-then-B) within the house
            quant tolerance rel-MSE < 0.06 (measured 0.031 / 0.024) —
-           via the `m1m2_from_cache` / `push_to_cache` §3.2 glue.
-  E. LOUD GUARDS: read/write shape mismatches, k/v disagreement, bad
+           via the `m1m2_from_cache` / `push_to_cache` §3.2 glue.  E. LOUD GUARDS: read/write shape mismatches, k/v disagreement, bad
      positions, non-tensors, bool layer_idx and layer_idx >=
      num_linear_layers (read, write AND forward) all raise.
 
@@ -66,7 +65,7 @@ bit-exactly, so the plain-cache baseline from A.1 is the honest
 reference there.
 
 WIRING NOTE (reported to the W3.2 owner, not pinned here): the modeling
-block calls `_m1m2(_q, _k, _v, ...)` WITHOUT `positions`, so every call
+block calls `_m1m2(_q, _k, _v, ...)`` WITHOUT `positions`, so every call
 scatters into slots arange(T) mod mem — decode steps (T=1) all write
 slot 0 and a second chunk re-uses slots 0..T-1 instead of T..2T-1.
 Invisible at zero gates (writes are no-ops) and irrelevant to every
@@ -92,6 +91,9 @@ from transformers.cache_utils import DynamicCache
 import modeling
 from m1m2 import M1M2, m1m2_from_cache, push_to_cache
 from tq_cache import TQCache
+
+# Device for all tests - CUDA required for causal_conv1d
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ------------------------------------------------------------ geometries ---
 # The wiring-level geometry (matches the shared W3.2/W3.3 context kit):
@@ -127,6 +129,7 @@ def _tiny_layer() -> modeling.Qwen3_5GatedDeltaNet:
     """A fresh tiny GatedDeltaNet (deterministic weights; layer_idx 0)."""
     torch.manual_seed(11)
     layer = modeling.Qwen3_5GatedDeltaNet(_tiny_config(), 0)
+    layer = layer.to(DEVICE)
     layer.eval()
     return layer
 
@@ -136,6 +139,7 @@ def _attach_m1m2(layer, gates=None) -> M1M2:
     plain-object ref (NOT a submodule registration) + linear ordinal."""
     m = M1M2(num_heads=WI_H, head_dim=WI_D, mem_size=WI_MEM,
              num_linear_layers=1)
+    m = m.to(DEVICE)
     if gates is not None:
         with torch.no_grad():
             m.write_gate_k.fill_(gates[0])
@@ -148,8 +152,8 @@ def _attach_m1m2(layer, gates=None) -> M1M2:
 def _loop_inputs():
     """The online-loop inputs: 2 chunks of 6 tokens + 2 single-token
     decode steps (one shared generator -> identical across runs)."""
-    g = torch.Generator().manual_seed(12)
-    return [torch.randn(1, T, 64, generator=g)
+    g = torch.Generator(device=DEVICE).manual_seed(12)
+    return [torch.randn(1, T, 64, generator=g, device=DEVICE)
             for T in (6, 6, 1, 1)]
 
 
@@ -247,8 +251,10 @@ def test_b_full_model_flag_parity_and_wiring_structure():
 
     torch.manual_seed(21)
     model_off = modeling.Qwen3_5TextModel(cfg(False)); model_off.eval()
+    model_off = model_off.to(DEVICE)
     torch.manual_seed(21)
     model_on = modeling.Qwen3_5TextModel(cfg(True)); model_on.eval()
+    model_on = model_on.to(DEVICE)
 
     # the OFF model carries no M1/M2 anywhere (default: zero code-path)
     assert getattr(model_off, "m1m2", None) is None
@@ -277,8 +283,7 @@ def test_b_full_model_flag_parity_and_wiring_structure():
     # bit-identical outputs, cache route (default use_cache=True — the
     # internal plain DynamicCache has no read_m1, so the block is skipped)
     # and cache-free alike:
-    ids = torch.randint(0, 128, (2, 6),
-                        generator=torch.Generator().manual_seed(22))
+    ids = torch.randint(0, 128, (2, 6), device=DEVICE)
     with torch.no_grad():
         out_off = model_off(input_ids=ids).last_hidden_state
         out_on = model_on(input_ids=ids).last_hidden_state
@@ -360,23 +365,24 @@ def test_d4_read_reference_numpy():
     torch.manual_seed(31)
     mod = M1M2(num_heads=REF_H, head_dim=REF_D, mem_size=REF_MEM,
                num_linear_layers=2)
+    mod = mod.to(DEVICE)
     B, H, T, D, M = 2, REF_H, 5, REF_D, REF_MEM
-    q = torch.randn(B, H, T, D)
-    m1 = torch.randn(H, M, D)
-    m2 = torch.randn(H, M, D)
+    q = torch.randn(B, H, T, D, device=DEVICE)
+    m1 = torch.randn(H, M, D, device=DEVICE)
+    m2 = torch.randn(H, M, D, device=DEVICE)
     with torch.no_grad():
         out = mod.read(q, m1, m2, layer_idx=1)     # read_gate[1] == 1.0
         ref = np.zeros((B, H, T, D), dtype=np.float64)
         for b in range(B):
             for h in range(H):
                 for t in range(T):
-                    scores = m1[h].numpy().astype(np.float64) \
-                        @ q[b, h, t].numpy().astype(np.float64)
+                    scores = m1[h].cpu().numpy().astype(np.float64) \
+                        @ q[b, h, t].cpu().numpy().astype(np.float64)
                     scores = scores / np.sqrt(D)
                     e = np.exp(scores - scores.max())
                     probs = e / e.sum()
-                    ref[b, h, t] = probs @ m2[h].numpy().astype(np.float64)
-        assert np.abs(out.numpy() - ref).max() < 1e-5
+                    ref[b, h, t] = probs @ m2[h].cpu().numpy().astype(np.float64)
+        assert np.abs(out.cpu().numpy() - ref).max() < 1e-5
 
         # per-layer read_gate scaling is exact (out * gate, fp32):
         mod.read_gate[1] = 2.5
@@ -386,9 +392,9 @@ def test_d4_read_reference_numpy():
         assert torch.equal(out_g25, 2.5 * out_g1)
 
         # zero memories -> exact zeros (softmax(uniform) @ 0):
-        z = torch.zeros(H, M, D)
+        z = torch.zeros(H, M, D, device=DEVICE)
         assert torch.equal(mod.read(q, z, z, layer_idx=0),
-                           torch.zeros(B, H, T, D))
+                           torch.zeros(B, H, T, D, device=DEVICE))
 
 
 def test_d5_write_reference_numpy():
@@ -400,36 +406,37 @@ def test_d5_write_reference_numpy():
     H, D, M = REF_H, REF_D, REF_MEM
     torch.manual_seed(32)
     mod = M1M2(num_heads=H, head_dim=D, mem_size=M, num_linear_layers=2)
+    mod = mod.to(DEVICE)
     with torch.no_grad():
         mod.write_gate_k[0] = 0.37
         mod.write_gate_v[0] = -0.61
     gk, gv = 0.37, -0.61
-    z = torch.zeros(H, M, D)
+    z = torch.zeros(H, M, D, device=DEVICE)
 
     # -- numpy scatter reference (default positions: slot = t mod mem) --
     torch.manual_seed(34)
-    k = torch.randn(1, H, 4, D)
-    v = torch.randn(1, H, 4, D)
+    k = torch.randn(1, H, 4, D, device=DEVICE)
+    v = torch.randn(1, H, 4, D, device=DEVICE)
     with torch.no_grad():
         m1n, m2n = mod.write(k, v, z, z, layer_idx=0)
         ref1 = np.zeros((H, M, D), dtype=np.float64)
         ref2 = np.zeros((H, M, D), dtype=np.float64)
         for t in range(4):
             slot = t % M
-            ref1[:, slot] += gk * k[0, :, t].numpy().astype(np.float64)
-            ref2[:, slot] += gv * v[0, :, t].numpy().astype(np.float64)
-        assert np.abs(m1n.numpy() - ref1).max() < 1e-5     # measured 1.3e-7
-        assert np.abs(m2n.numpy() - ref2).max() < 1e-5
+            ref1[:, slot] += gk * k[0, :, t].cpu().numpy().astype(np.float64)
+            ref2[:, slot] += gv * v[0, :, t].cpu().numpy().astype(np.float64)
+        assert np.abs(m1n.cpu().numpy() - ref1).max() < 1e-5     # measured 1.3e-7
+        assert np.abs(m2n.cpu().numpy() - ref2).max() < 1e-5
 
     # -- the two-token slot collision: g*(k0 + k1) EXACTLY --
     torch.manual_seed(33)
-    kc = torch.randn(1, H, 2, D)
-    vc = torch.randn(1, H, 2, D)
+    kc = torch.randn(1, H, 2, D, device=DEVICE)
+    vc = torch.randn(1, H, 2, D, device=DEVICE)
     with torch.no_grad():
         m1c, m2c = mod.write(kc, vc, z, z, layer_idx=0,
-                             positions=torch.tensor([0, M]))  # both -> slot 0
-        exp_m1 = torch.zeros(H, M, D)
-        exp_m2 = torch.zeros(H, M, D)
+                             positions=torch.tensor([0, M], device=DEVICE))  # both -> slot 0
+        exp_m1 = torch.zeros(H, M, D, device=DEVICE)
+        exp_m2 = torch.zeros(H, M, D, device=DEVICE)
         exp_m1[:, 0] = gk * (kc[0, :, 0, :] + kc[0, :, 1, :])
         exp_m2[:, 0] = gv * (vc[0, :, 0, :] + vc[0, :, 1, :])
         assert torch.equal(m1c, exp_m1)
@@ -437,16 +444,16 @@ def test_d5_write_reference_numpy():
 
     # -- sequential [0,1] then [2,3] == single [0,1,2,3], bit-identical --
     torch.manual_seed(35)
-    kA = torch.randn(1, H, 2, D); vA = torch.randn(1, H, 2, D)
-    kB = torch.randn(1, H, 2, D); vB = torch.randn(1, H, 2, D)
+    kA = torch.randn(1, H, 2, D, device=DEVICE); vA = torch.randn(1, H, 2, D, device=DEVICE)
+    kB = torch.randn(1, H, 2, D, device=DEVICE); vB = torch.randn(1, H, 2, D, device=DEVICE)
     with torch.no_grad():
         s1 = mod.write(kA, vA, z, z, layer_idx=0,
-                       positions=torch.tensor([0, 1]))
+                       positions=torch.tensor([0, 1], device=DEVICE))
         s2 = mod.write(kB, vB, s1[0], s1[1], layer_idx=0,
-                       positions=torch.tensor([2, 3]))
+                       positions=torch.tensor([2, 3], device=DEVICE))
         single = mod.write(torch.cat([kA, kB], dim=2),
                            torch.cat([vA, vB], dim=2), z, z, layer_idx=0,
-                           positions=torch.tensor([0, 1, 2, 3]))
+                           positions=torch.tensor([0, 1, 2, 3], device=DEVICE))
         assert torch.equal(s2[0], single[0])
         assert torch.equal(s2[1], single[1])
 
@@ -454,20 +461,21 @@ def test_d5_write_reference_numpy():
     torch.manual_seed(36)
     mod_zero = M1M2(num_heads=H, head_dim=D, mem_size=M,
                     num_linear_layers=2)
-    st1 = torch.randn(H, M, D); st2 = torch.randn(H, M, D)
+    mod_zero = mod_zero.to(DEVICE)
+    st1 = torch.randn(H, M, D, device=DEVICE); st2 = torch.randn(H, M, D, device=DEVICE)
     st1c, st2c = st1.clone(), st2.clone()
-    q = torch.randn(1, H, 5, D)
+    q = torch.randn(1, H, 5, D, device=DEVICE)
     with torch.no_grad():
         n1, n2 = mod_zero.write(k, v, st1, st2, layer_idx=0,
-                                positions=torch.tensor([0, M, 2, 3]))
+                                positions=torch.tensor([0, M, 2, 3], device=DEVICE))
         assert torch.equal(n1, st1) and torch.equal(n2, st2)
         assert torch.equal(st1, st1c) and torch.equal(st2, st2c)
         # forward == read (pre-write state) + write composition:
         f_out, f1, f2 = mod_zero.forward(q, k, v, st1, st2, layer_idx=1,
-                                         positions=torch.tensor([0, 1, 2, 3]))
+                                         positions=torch.tensor([0, 1, 2, 3], device=DEVICE))
         r_out = mod_zero.read(q, st1, st2, layer_idx=1)
         w1, w2 = mod_zero.write(k, v, st1, st2, layer_idx=1,
-                                positions=torch.tensor([0, 1, 2, 3]))
+                                positions=torch.tensor([0, 1, 2, 3], device=DEVICE))
         assert torch.equal(f_out, r_out)
         assert torch.equal(f1, w1) and torch.equal(f2, w2)
 
@@ -492,32 +500,39 @@ def test_d6_composability_through_the_quantized_store():
     H, D, MEM = WI_H, WI_D, WI_MEM
     torch.manual_seed(41)
     mod = M1M2(num_heads=H, head_dim=D, mem_size=MEM, num_linear_layers=1)
+    mod = mod.to(DEVICE)
     with torch.no_grad():
         mod.write_gate_k.fill_(0.5)
         mod.write_gate_v.fill_(0.7)
-    g = torch.Generator().manual_seed(777)
-    kA = torch.randn(1, H, 5, D, generator=g); vA = torch.randn(1, H, 5, D, generator=g)
-    kB = torch.randn(1, H, 5, D, generator=g); vB = torch.randn(1, H, 5, D, generator=g)
+    g = torch.Generator(device=DEVICE).manual_seed(777)
+    kA = torch.randn(1, H, 5, D, generator=g, device=DEVICE); vA = torch.randn(1, H, 5, D, generator=g, device=DEVICE)
+    kB = torch.randn(1, H, 5, D, generator=g, device=DEVICE); vB = torch.randn(1, H, 5, D, generator=g, device=DEVICE)
 
     # the §3.2 first forward: a cache with no codes reads back ZEROS
     fresh = TQCache(layer_types=[])
     m1z, m2z = m1m2_from_cache(fresh, mod, torch.float32)
-    assert torch.equal(m1z, torch.zeros(H, MEM, D))
-    assert torch.equal(m2z, torch.zeros(H, MEM, D))
+    # fresh cache returns CPU tensors; move to device for comparison
+    m1z = m1z.to(DEVICE)
+    m2z = m2z.to(DEVICE)
+    assert torch.equal(m1z, torch.zeros(H, MEM, D, device=DEVICE))
+    assert torch.equal(m2z, torch.zeros(H, MEM, D, device=DEVICE))
 
     with torch.no_grad():
         # run A: fresh cache, write tokens A
         cA = TQCache(layer_types=[])
         a1, a2 = m1m2_from_cache(cA, mod, torch.float32)
+        a1, a2 = a1.to(DEVICE), a2.to(DEVICE)
         dA = push_to_cache(cA, *mod.write(kA, vA, a1, a2, layer_idx=0))
         # run B: ANOTHER fresh cache, write tokens B (the standalone delta)
         cB = TQCache(layer_types=[])
         b1, b2 = m1m2_from_cache(cB, mod, torch.float32)
+        b1, b2 = b1.to(DEVICE), b2.to(DEVICE)
         dB = push_to_cache(cB, *mod.write(kB, vB, b1, b2, layer_idx=0))
         # run AB: the online loop — write A, then the next forward READS
         # the round-trip and writes B on top of it
         cAB = TQCache(layer_types=[])
         f1, f2 = m1m2_from_cache(cAB, mod, torch.float32)
+        f1, f2 = f1.to(DEVICE), f2.to(DEVICE)
         push_to_cache(cAB, *mod.write(kA, vA, f1, f2, layer_idx=0))
         r1, r2 = m1m2_from_cache(cAB, mod, torch.float32)
         assert torch.equal(r1, dA[0]) and torch.equal(r2, dA[1])  # what you
@@ -535,26 +550,26 @@ def test_d6_composability_through_the_quantized_store():
 # =========================================================== E. loud guards == #
 @pytest.mark.parametrize("bad_call,exc", [
     # read: q head-count mismatch vs the module geometry
-    (lambda m, q, k, v, m1, m2: m.read(torch.randn(1, 3, 5, 3), m1, m2, 0),
+    (lambda m, q, k, v, m1, m2: m.read(torch.randn(1, 3, 5, 3, device=DEVICE), m1, m2, 0),
      ValueError),
     # read: m1 shape mismatch (state_shape contract)
-    (lambda m, q, k, v, m1, m2: m.read(q, torch.randn(2, 5, 3), m2, 0),
+    (lambda m, q, k, v, m1, m2: m.read(q, torch.randn(2, 5, 3, device=DEVICE), m2, 0),
      ValueError),
     # write: k/v must share (B, H, T, D)
-    (lambda m, q, k, v, m1, m2: m.write(k, torch.randn(1, 2, 4, 3), m1, m2, 0),
+    (lambda m, q, k, v, m1, m2: m.write(k, torch.randn(1, 2, 4, 3, device=DEVICE), m1, m2, 0),
      ValueError),
     # write: state shape mismatch
-    (lambda m, q, k, v, m1, m2: m.write(k, v, torch.randn(2, 5, 3), m2, 0),
+    (lambda m, q, k, v, m1, m2: m.write(k, v, torch.randn(2, 5, 3, device=DEVICE), m2, 0),
      ValueError),
     # positions: wrong length / negative / float dtype
     (lambda m, q, k, v, m1, m2: m.write(k, v, m1, m2, 0,
-                                        positions=torch.tensor([0, 1])),
+                                        positions=torch.tensor([0, 1], device=DEVICE)),
      ValueError),
     (lambda m, q, k, v, m1, m2: m.write(k, v, m1, m2, 0,
-                                        positions=torch.tensor([-1, 0, 1, 2, 3])),
+                                        positions=torch.tensor([-1, 0, 1, 2, 3], device=DEVICE)),
      ValueError),
     (lambda m, q, k, v, m1, m2: m.write(k, v, m1, m2, 0,
-                                        positions=torch.tensor([0.5, 1, 2, 3, 4])),
+                                        positions=torch.tensor([0.5, 1, 2, 3, 4], device=DEVICE)),
      TypeError),
     # non-tensor q; bool layer_idx
     (lambda m, q, k, v, m1, m2: m.read("nope", m1, m2, 0), TypeError),
@@ -571,10 +586,11 @@ def test_e_loud_guards(bad_call, exc):
     (read, write AND forward) raise loudly — never a silent reshape."""
     H, D, M = REF_H, REF_D, REF_MEM
     mod = M1M2(num_heads=H, head_dim=D, mem_size=M, num_linear_layers=2)
-    q = torch.randn(1, H, 5, D)
-    k = torch.randn(1, H, 5, D)
-    v = torch.randn(1, H, 5, D)
-    m1 = torch.randn(H, M, D)
-    m2 = torch.randn(H, M, D)
+    mod = mod.to(DEVICE)
+    q = torch.randn(1, H, 5, D, device=DEVICE)
+    k = torch.randn(1, H, 5, D, device=DEVICE)
+    v = torch.randn(1, H, 5, D, device=DEVICE)
+    m1 = torch.randn(H, M, D, device=DEVICE)
+    m2 = torch.randn(H, M, D, device=DEVICE)
     with pytest.raises(exc):
         bad_call(mod, q, k, v, m1, m2)

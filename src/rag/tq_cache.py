@@ -126,6 +126,9 @@ class _StateView(dict):
                     return None
                 t = layer._tq_conv.dequant(codes, dtype=layer._conv_dtype)
                 t = t.reshape(layer._conv_shape)
+                # move to tracked device
+                if layer._device is not None and t.device != layer._device:
+                    t = t.to(layer._device)
                 layer._handed_conv = t
                 return t
             layer.reads["s"] += 1
@@ -133,7 +136,11 @@ class _StateView(dict):
             if codes is None:
                 return None
             t = layer._tq_s.dequant(codes, dtype=layer._s_dtype)
-            return t.reshape(layer._s_shape)
+            t = t.reshape(layer._s_shape)
+            # move to tracked device
+            if layer._device is not None and t.device != layer._device:
+                t = t.to(layer._device)
+            return t
         # offline mode: plain passthrough (None before the first write —
         # the mixin's dicts are lazily filled, read-before-write is legal)
         return dict.get(self, state_idx)
@@ -170,6 +177,8 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         self._conv_shape: Optional[torch.Size] = None
         self._conv_dtype: torch.dtype = torch.float16
         self._handed_conv: Optional[torch.Tensor] = None
+        # track device for correct dequant placement
+        self._device: Optional[torch.device] = None
         self.reads = {"conv": 0, "s": 0}
         self.writes = {"conv": 0, "s": 0}
         self._m1m2_tokens = 0  # tokens seen at this layer (M1/M2 write positions)
@@ -192,6 +201,8 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         self._tq_s = resolve_quantizer("S", n, self.bits)
         self._s_shape = tuple(tensor.shape)
         self._s_dtype = tensor.dtype
+        if self._device is None:
+            self._device = tensor.device
         self.is_recurrent_states_initialized[state_idx] = True
 
     def _init_conv(self, conv_states: torch.Tensor, state_idx: int,
@@ -204,6 +215,7 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         self._tq_conv = resolve_quantizer("conv", n, self.bits)
         self._conv_shape = tuple(window_shape)
         self._conv_dtype = conv_states.dtype
+        self._device = conv_states.device
         self.conv_kernel_size[state_idx] = kernel
         self.is_conv_states_initialized[state_idx] = True
         return kernel
@@ -263,9 +275,15 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
             old = self._tq_conv.dequant(self._conv_codes,
                                         dtype=self._conv_dtype)
             old = old.reshape(self._conv_shape)
+            # ensure device consistency with new input
+            if old.device != conv_states.device:
+                old = old.to(conv_states.device)
             full = torch.cat([old, conv_states], dim=-1)
         window = full[..., -kernel:]
         self._conv_codes = self._tq_conv.quant(window.reshape(-1))
+        # ensure device consistency with input
+        if full.device != conv_states.device:
+            full = full.to(conv_states.device)
         return full
 
     def update_recurrent_state(self, recurrent_states: torch.Tensor,
@@ -281,7 +299,11 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         self.writes["s"] += 1
         self._s_codes = self._tq_s.quant(recurrent_states.reshape(-1))
         out = self._tq_s.dequant(self._s_codes, dtype=self._s_dtype)
-        return out.reshape(self._s_shape)
+        out = out.reshape(self._s_shape)
+        # ensure device consistency with input
+        if out.device != recurrent_states.device:
+            out = out.to(recurrent_states.device)
+        return out
 
     # ------------------------------------------------- P7 graph hooks ---
     # W9.2 `graph_safe` (P7): the CUDA-graph capture hook points. They are
@@ -424,6 +446,8 @@ class TQCache(DynamicCache):
         self._tq_m2: Optional[TurboQuant] = None
         self._m1_shape = None
         self._m2_shape = None
+        # track device for M1/M2 dequant
+        self._m_device: Optional[torch.device] = None
         if config is not None:
             super().__init__(config=config)
             self._wrap_linear_layers()
@@ -483,6 +507,9 @@ class TQCache(DynamicCache):
         tqm = resolve_quantizer(which, tensor.numel(), self._tq_bits)
         setattr(self, f"_tq_{which.lower()}", tqm)
         setattr(self, f"_{which.lower()}_shape", tuple(tensor.shape))
+        # track device for read path
+        if self._m_device is None:
+            self._m_device = tensor.device
 
     def update_m1(self, tensor: torch.Tensor) -> torch.Tensor:
         """Quantize-on-write for the global key-memory (spec §2.2/§5)."""
@@ -491,12 +518,18 @@ class TQCache(DynamicCache):
             self._resolve_m("M1", tensor)
         self._m1_codes = self._tq_m1.quant(tensor.reshape(-1))
         out = self._tq_m1.dequant(self._m1_codes, dtype=tensor.dtype)
-        return out.reshape(tuple(tensor.shape))
+        out = out.reshape(tuple(tensor.shape))
+        if out.device != tensor.device:
+            out = out.to(tensor.device)
+        return out
 
     def read_m1(self, dtype: torch.dtype = torch.float16) -> Optional[torch.Tensor]:
         if self._m1_codes is None:
             return None
-        return self._tq_m1.dequant(self._m1_codes, dtype=dtype).reshape(self._m1_shape)
+        t = self._tq_m1.dequant(self._m1_codes, dtype=dtype).reshape(self._m1_shape)
+        if self._m_device is not None and t.device != self._m_device:
+            t = t.to(self._m_device)
+        return t
 
     @property
     def m1_codes(self) -> Optional[TQCodes]:
@@ -516,12 +549,18 @@ class TQCache(DynamicCache):
             self._resolve_m("M2", tensor)
         self._m2_codes = self._tq_m2.quant(tensor.reshape(-1))
         out = self._tq_m2.dequant(self._m2_codes, dtype=tensor.dtype)
-        return out.reshape(tuple(tensor.shape))
+        out = out.reshape(tuple(tensor.shape))
+        if out.device != tensor.device:
+            out = out.to(tensor.device)
+        return out
 
     def read_m2(self, dtype: torch.dtype = torch.float16) -> Optional[torch.Tensor]:
         if self._m2_codes is None:
             return None
-        return self._tq_m2.dequant(self._m2_codes, dtype=dtype).reshape(self._m2_shape)
+        t = self._tq_m2.dequant(self._m2_codes, dtype=dtype).reshape(self._m2_shape)
+        if self._m_device is not None and t.device != self._m_device:
+            t = t.to(self._m_device)
+        return t
 
     @property
     def m2_codes(self) -> Optional[TQCodes]:

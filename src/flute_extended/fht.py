@@ -321,7 +321,7 @@ def kernel_available(x: Optional[torch.Tensor] = None) -> bool:
 
 def _resolve_backend(backend: FhtBackend, x: torch.Tensor) -> str:
     if backend not in ("auto", "kernel", "reference", "matmul"):
-        raise ValueError(f"fht: unknown backend {backend!r} (expected 'auto', 'kernel', "
+        raise ValueError(f"fht: unknown backend {backend!r} (expected 'auto', "
             f"'reference' or 'matmul')")
     if backend in ("reference", "matmul"):
         return backend
@@ -333,7 +333,7 @@ def _resolve_backend(backend: FhtBackend, x: torch.Tensor) -> str:
                 "`cd flute_extended && python setup.py build_ext --inplace`, "
                 "or use backend='auto'/'reference'. Never a silent fallback.")
         return "kernel"
-    # auto
+    # auto: use kernel for CUDA tensors
     if x.is_cuda and _load_kernel() is not None:
         return "kernel"
     return "reference"

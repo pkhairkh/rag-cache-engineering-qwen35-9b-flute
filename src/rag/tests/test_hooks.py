@@ -536,6 +536,8 @@ def test_refire_latest_wins():
 def test_real_model_integration():
     import modeling  # the vendored Qwen3.5 (src/scripts, conftest-anchored)
 
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     plan = [LIN, FULL, LIN, FULL]
     cfg = Qwen3_5TextConfig(
         hidden_size=64, num_hidden_layers=4, layer_types=plan,
@@ -543,7 +545,7 @@ def test_real_model_integration():
         linear_key_head_dim=16, linear_value_head_dim=16,
         linear_conv_kernel_dim=4, use_m1m2=True, m1m2_mem_size=8)
     torch.manual_seed(21)
-    m = modeling.Qwen3_5TextModel(cfg).eval()
+    m = modeling.Qwen3_5TextModel(cfg).eval().to(DEVICE)
 
     cache = TQCache(config=cfg)
     hooks = CaptureHooks(plan)
@@ -551,7 +553,8 @@ def test_real_model_integration():
     hooks.bind(cache)
 
     ids = torch.randint(0, 128, (1, 6),
-                        generator=torch.Generator().manual_seed(22))
+                        generator=torch.Generator(device=DEVICE).manual_seed(22),
+                        device=DEVICE)
     with torch.no_grad():
         out = m(input_ids=ids, past_key_values=cache, use_cache=True)
     assert tuple(out.last_hidden_state.shape) == (1, 6, 64)

@@ -353,7 +353,7 @@ class TurboQuant:
         else:
             r = (x32 / norm).reshape(1, self.d)
             y = fht.fht_apply(r, self._signs).reshape(self.d)      # y = r @ T
-            y_np = y.numpy()
+            y_np = y.cpu().numpy() if y.is_cuda else y.numpy()
             lo, hi = y_np[: self.n_lo], y_np[self.n_lo:]
             idx_lo = np.searchsorted(self._cb_lo.boundaries, lo).astype(np.uint8)
             idx_hi = np.searchsorted(self._cb_hi.boundaries, hi).astype(np.uint8)
