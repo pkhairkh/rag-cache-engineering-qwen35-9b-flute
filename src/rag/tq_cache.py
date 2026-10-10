@@ -83,49 +83,48 @@ _ONLINE_ERR = (
 
 
 def _next_pow2(n: int) -> int:
-    """Smallest power of two >= n (n >= 1) — the conv padding target."""
+    """Smallest power of two >= n (n >= 1) — legacy helper (the W10
+    zero-pad-to-pow2 conv policy; superseded by `_conv_quant_dim`)."""
     if n < 1:
         raise ValueError(f"_next_pow2: n must be >= 1, got {n}")
     return 1 << (n - 1).bit_length()
 
 
-def _conv_d_canon(n: int) -> int:
-    """Canonical conv unit d for TurboQuant quantization.
-    
-    Returns a dimension where:
-    1. It's a power of two (TurboQuant's FHT requirement)
-    2. Each FHT segment fits in GPU shared memory (max segment <= 16384)
-    
-    For n <= 16384: pad to next power of 2.
-    For n > 16384: pad to 16384 * k where k keeps max segment <= 16384.
-    Since FHT segments as descending powers of 2, 32768 would become
-    a single 32768 segment (128KB smem - too big). We cap at 24576
-    when possible, which segments as 16384 + 8192 (max 16384 = 64KB OK).
+_MAX_KERNEL_SEGMENT = 16384
+
+
+def _conv_quant_dim(numel: int) -> int:
+    """The conv unit's quantizer dimension: the FULL flat window rounded up
+    to a multiple of 32 (the FHT kernel's thread geometry).
+
+    No truncation, no power-of-two padding: the segmented FHT transforms the
+    window block-diagonally (fht.segments — descending powers of two), and
+    Qwen3.5's 24,576-element window segments as 16,384 + 8,192 — every
+    segment fits the 64 KiB kernel tile, so the whole window rides ONE code
+    unit in the kind's shared D3 frame (seed 202). Rounding up to 32
+    zero-pads at most 31 coordinates (energy-free: the stored norm is the
+    real window's). Windows whose FIRST segment exceeds 16,384 (numel >=
+    32,768) still quantize correctly — the FHT then runs the torch reference
+    on-device instead of the CUDA kernel (fht._kernel_eligible).
     """
-    if n <= 16384:
-        return _next_pow2(n)
-    # For conv sizes > 16384: pad to nearest size that segments nicely
-    # 24576 -> 16384 + 8192 (OK, no padding needed if already 24576)
-    # But TurboQuant requires power of 2, so we can't use 24576 directly.
-    # Solution: the FHT kernel supports non-power-of-two via reference,
-    # but we NEED kernel path. So pad to 16384 for the quantizer, and
-    # handle the dimension mismatch in the padding logic.
-    # 
-    # Actually simpler: pad to next power of 2, and fix the FHT kernel
-    # For non-canonical sizes, return n rounded to multiple of 32 (FHT kernel
-    # requirement for thread geometry).
-    return ((n + 31) // 32) * 32
+    if numel < 1:
+        raise ValueError(f"_conv_quant_dim: numel must be >= 1, got {numel}")
+    return ((numel + 31) // 32) * 32
 
 
 def resolve_quantizer(kind: str, numel: int, bits: float = 3.5) -> TurboQuant:
     """The quantizer for a kind at a given flattened size.
 
     Production sizes hit the canonical kinds (shared rotation per kind,
-    D3). Other sizes get a custom-d quantizer that KEEPS the kind's seed.
-    
-    FHT kernel supports non-power-of-two via segmentation, so we accept
-    any positive integer numel (though it should be a multiple of 32
-    for the kernel's thread geometry).
+    D3). Other sizes get a custom-d quantizer that KEEPS the kind's seed —
+    same frame contract (PROPOSAL D3), different unit length.
+
+    The segmented FHT (fht.segments) makes the old power-of-two
+    requirement obsolete: any d is quantizable (the reference butterfly
+    handles every segmentable d; the CUDA kernel auto-engages for d it
+    can tile — fht._kernel_eligible: multiple of 32, every segment
+    <= 16,384). The CALLING layer picks the d (the conv policy rounds
+    the window up to a multiple of 32; S/M1/M2 use their canonical d).
     """
     if numel < 1:
         raise ValueError(f"resolve_quantizer({kind}): numel must be >= 1, got {numel}")
@@ -216,8 +215,7 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         self._conv_shape: Optional[torch.Size] = None
         self._conv_dtype: torch.dtype = torch.float16
         self._conv_numel: Optional[int] = None   # real window size (pre-pad)
-        self._conv_numel_orig: Optional[int] = None  # original size before truncation
-        self._conv_d: Optional[int] = None       # quantizer unit size (pow2)
+        self._conv_d: Optional[int] = None       # quantizer unit size (>= numel)
         self._handed_conv: Optional[torch.Tensor] = None
         # track device for correct dequant placement
         self._device: Optional[torch.device] = None
@@ -230,41 +228,38 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
 
     # ------------------------------------------------------------ helpers -
     def _pad_conv_flat(self, t: torch.Tensor) -> torch.Tensor:
-        """The (numel,) flat conv window, truncated/capped to the quantizer
-        dimension for large windows (> 16384 elements where FHT kernel limits
-        apply). For windows <= 16384, zero-pads to the (d,) quantizer unit."""
+        """The (numel,) flat conv window, zero-padded UP to the (d,) quantizer
+        unit — a no-op for multiple-of-32 geometries (`_conv_d ==
+        _conv_numel`; Qwen3.5's 24,576 window). NEVER truncates: a window
+        longer than the unit is geometry drift (raise, never silently drop
+        channels). Padding adds no energy: the stored norm (and the
+        relative-MSE budget on the REAL coordinates) is unchanged."""
         flat = t.reshape(-1)
-        # For large windows, truncate to first d elements
-        if self._conv_d is not None and flat.numel() > self._conv_d:
-            flat = flat[:self._conv_d]
-        else:
-            # Pad to d if needed
-            target = self._conv_d if self._conv_d is not None else flat.numel()
-            pad = target - flat.numel()
-            if pad > 0:
-                flat = torch.nn.functional.pad(flat, (0, pad))
+        target = self._conv_d if self._conv_d is not None else flat.numel()
+        if flat.numel() > target:
+            raise ValueError(
+                f"conv window numel {flat.numel()} exceeds the layer's "
+                f"quantizer unit d={target} — geometry drift (the unit is "
+                f"sized by _conv_quant_dim at init; it never truncates)")
+        pad = target - flat.numel()
+        if pad > 0:
+            flat = torch.nn.functional.pad(flat, (0, pad))
         return flat
 
     def _dequant_conv(self, dtype: torch.dtype) -> torch.Tensor:
-        """Codes -> the shaped window: dequant the (d,) unit, pad back to
-        _conv_numel_orig if we truncated, reshape to `_conv_shape`."""
+        """Codes -> the shaped window: dequant the (d,) unit, STRIP the <= 31
+        round-up pad, reshape to `_conv_shape`. Caller owns device placement;
+        the tracked device (when known) is applied for the read path."""
         t = self._tq_conv.dequant(self._conv_codes, dtype=dtype)
-        # Move to tracked device
         if self._device is not None and t.device != self._device:
             t = t.to(self._device)
-        # If we truncated during quant, pad back to original numel.
-        # _conv_numel_orig may not be set if codes were installed via setter,
-        # so fall back to the shape-based product.
-        orig_numel = getattr(self, '_conv_numel_orig', None)
-        if orig_numel is None and self._conv_shape is not None:
-            orig_numel = 1
-            for s in self._conv_shape:
-                orig_numel *= s
-        target_numel = orig_numel or t.numel()
-        if t.numel() < target_numel:
-            t = torch.nn.functional.pad(t, (0, target_numel - t.numel()))
-        elif t.numel() > target_numel:
-            t = t[:target_numel]
+        n = self._conv_numel if self._conv_numel is not None else t.numel()
+        if t.numel() > n:
+            t = t[:n]
+        elif t.numel() < n:
+            # a codes-installed flat unit short of the learned window: pad
+            # (the setter keeps numel == d; this only fires on mixed flows)
+            t = torch.nn.functional.pad(t, (0, n - t.numel()))
         return t.reshape(self._conv_shape)
 
     def _sync_conv(self) -> None:
@@ -292,32 +287,17 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         n = 1
         for s in window_shape:
             n *= s
-        # FHT kernel limitation: max segment size is 16384 (64KB shared mem).
-        # For K >= 32768, the kernel's descending pow2 decomposition gives
-        # a first segment >= 32768, which exceeds the device limit.
-        # 
-        # Solution: for large windows, split into sub-windows of size <= 16384.
-        # Each sub-window gets its own quantizer, codes stored in a list.
-        # For now, we cap at dimensions where max segment <= 16384.
-        # 
-        # 32768 is exactly 2^15, so first segment is 32768 (too large).
-        # We need to split: two 16384 chunks, each quantized separately.
-        # 
-        # Simpler approach: just truncate to 16384 elements for now.
-        # The conv state window won't lose much information (last kernel tokens).
-        if n > 16384:
-            # Split approach: store multiple quantizers
-            # For now, we just quantize the first 16384 elements
-            # This loses some precision but keeps the system running
-            d = 16384
-            # TODO: implement multi-chunk quantization for better accuracy
-        else:
-            d = ((n + 31) // 32) * 32
-            if d & (d - 1) == 0 and d > 16384:  # power of 2 and > 16384
-                d += 32  # force non-pow2, will segment properly
+        # The full-window policy (SPECIFICATION N16.1): d = the flat window
+        # rounded up to a multiple of 32 — NO truncation (the GPU session's
+        # 16,384 cap silently zeroed 8,192 of the 24,576 coordinates at every
+        # read — the ingestion deltas and every installed conv window were
+        # built on a one-third-blinded conv state), NO power-of-two padding
+        # (the W10 policy's 32,768 unit has a single 32,768-segment FHT the
+        # CUDA kernel cannot tile: 128 KiB > the ~99 KiB consumer opt-in;
+        # 24,576 segments as 16,384 + 8,192 — every tile fits 64 KiB).
+        d = _conv_quant_dim(n)
         self._tq_conv = resolve_quantizer("conv", d, self.bits)
         self._conv_shape = tuple(window_shape)
-        self._conv_numel_orig = n  # Original size before truncation
         self._conv_numel = n
         self._conv_d = d
         self._conv_dtype = conv_states.dtype
@@ -450,10 +430,17 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
                 if self._s_shape is None:
                     self._s_shape = (codes.d,)  # flat until a real shape is known
                 self._s_dtype = torch.float16
-                # Set device to CUDA if available, since the model runs on CUDA
-                if self._device is None and torch.cuda.is_available():
-                    self._device = torch.device('cuda')
+                # placement default for code-installed layers that never ran
+                # a forward: the ACTIVE CUDA context (a loaded model implies
+                # an initialized context; a CPU-only box implies none)
+                if self._device is None and torch.cuda.is_initialized():
+                    self._device = torch.device("cuda")
                 self.is_recurrent_states_initialized[0] = True
+            elif self._tq_s is not None and codes.d != self._tq_s.d:
+                raise ValueError(
+                    f"s_codes setter: codes.d={codes.d} != the layer's "
+                    f"quantizer unit d={self._tq_s.d} (geometry/frame "
+                    f"drift — the codes and the layer must share the S frame)")
             self.has_previous_state[0] = True
 
     @property
@@ -468,20 +455,24 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
                 self._tq_conv = resolve_quantizer("conv", codes.d, self.bits)
                 if self._conv_shape is None:
                     self._conv_shape = (codes.d,)  # flat until a real shape is known
-                # Always set these - the quantizer d is what matters
+                # flat (d,) unit: numel == d until a forward/reseed teaches
+                # the real window shape (same relation by construction —
+                # _conv_quant_dim never truncates)
                 self._conv_numel = codes.d
                 self._conv_d = codes.d
                 self._conv_dtype = torch.float16
-                # Set device to CUDA if available, since the model runs on CUDA
-                if self._device is None and torch.cuda.is_available():
-                    self._device = torch.device('cuda')
+                # placement default for code-installed layers that never ran
+                # a forward: the ACTIVE CUDA context (see s_codes setter)
+                if self._device is None and torch.cuda.is_initialized():
+                    self._device = torch.device("cuda")
                 self.is_conv_states_initialized[0] = True
             elif self._conv_d is not None and codes.d != self._conv_d:
                 raise ValueError(
                     f"conv_codes setter: codes.d={codes.d} != the layer's "
                     f"quantizer unit d={self._conv_d} (geometry/frame "
-                    f"drift — the codes and the layer must share the "
-                    f"padded conv frame)")
+                    f"drift — the codes and the layer must share the conv "
+                    f"frame; snapshots built before the full-window policy "
+                    f"(pre-W11, d=16,384-truncated) must be RE-INGESTED)")
             # kernel size from the window shape when known (reseeded layers
             # skip lazy init — conv_kernel_size must not stay None)
             if self._conv_shape is not None and len(self._conv_shape) >= 1 \

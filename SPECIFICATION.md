@@ -2,7 +2,7 @@
 
 Purpose: cache-engineered RAG on Qwen3.5-9B — the LUT model's cache IS the retrieval vector; NO separate embedder, NO chunk text on disk, NO re-prefill; TurboQuant online at 3.5 bits (quality-neutral).
 Authority: top of the doc chain SPECIFICATION.md > PROPOSAL.md > TASKS.md; design decisions D1–D5 live in PROPOSAL.md, execution waves in TASKS.md.
-Status: v1 semantics preserved (format rewritten Wv2-6.1); implemented under `src/rag/` — 169 tests green; §9–§10 are A10G targets to measure on the GPU box.
+Status: v1 semantics preserved (format rewritten Wv2-6.1); implemented under `src/rag/` — 175 tests green; §9–§10 are A10G targets to measure on the GPU box.
 
 ## 1. The model
 - **N1.** Load Qwen3.5-9B (FLUTE idxN hybrid palettization) via `src/scripts/loader.py::load_quant_model`.
@@ -51,13 +51,13 @@ Status: v1 semantics preserved (format rewritten Wv2-6.1); implemented under `sr
 - **N14.** The cache states (S, M1, M2, conv_state) are ALWAYS TurboQuant codes — during the model's forward pass, on disk, at installation.
 - **N15.** WRITE (state update in the forward pass): the delta rule produces fp16 S → `TurboQuant.quant` → codes stored in the cache; the cache NEVER holds fp16. READ (state consumption in the next forward step): `TurboQuant.dequant` → fp16 for the delta rule → re-quantized on write.
 - **N16.** The cache API intercepts reads (`cache.layers[L].recurrent_states[0]` → dequantize) and writes (`cache.update_recurrent_state(state, L)` → quantize); the model's forward doesn't know it uses quantized caches. Implementation: `src/rag/tq_cache.py::TQCache` (a `DynamicCache` subclass) + `src/rag/turboquant.py::TurboQuant`.
-- **N16.1.** Conv windows with a non-power-of-two flattened size (the Qwen3.5 in_proj Q+V geometry: 1×6144×4 = 24,576) are zero-padded to the next power of two before the FHT — 24,576 → 32,768 = the canonical conv d, so the D3 rotation (seed 202) stays shared across geometries; dequant strips the pad. Padding adds no energy: the stored norm is unchanged and the rel-MSE budget on the real 24,576 coordinates holds (measured 0.016 vs 0.022 for the unpadded random unit). Power-of-two geometries keep the exact pre-padding behavior (pad = 0).
+- **N16.1.** Conv windows with a non-power-of-two flattened size (the Qwen3.5 in_proj Q+V geometry: 1×6144×4 = 24,576) are quantized as the FULL window in ONE code unit at d = the flat size rounded up to a multiple of 32 — 24,576 stays 24,576 (round-up pad = 0). The segmented FHT (descending power-of-two blocks: 24,576 = 16,384 + 8,192) transforms the unit block-diagonally; every segment fits the CUDA kernel's 64 KiB shared-memory tile, and the unit rides the conv kind's D3 rotation (seed 202, custom-d instance). NO truncation (the W10-GPU session's 16,384 cap zeroed the last 8,192 coordinates of every read — the ingestion deltas and installed windows were built on a one-third-blinded conv state) and NO zero-pad to 32,768 (the W10 policy's single 32,768-segment FHT needs 128 KiB shared memory — beyond the ~99 KiB consumer-device opt-in; K ≥ 32,768 runs the torch reference on-device instead, `fht._kernel_eligible`). Power-of-two/multiple-of-32 geometries are bit-identical no-ops (pad = 0).
 
 ### 3.3 Compression
 | object | fp16 | TurboQuant 3.5-bit | ratio |
 |---|---|---|---|
 | S (24 layers) | 24 MiB | 5.4 MiB | 4.6× |
-| conv_state (24 layers, 24,576 elts → padded per N16.1) | 1.125 MiB | 0.34 MiB | 3.3× |
+| conv_state (24 layers, 24,576 elts → full-window unit per N16.1) | 1.125 MiB | 0.25 MiB | 4.6× |
 | M1 (global) | 1.0 MiB | 0.22 MiB | 4.6× |
 | M2 (global) | 1.0 MiB | 0.22 MiB | 4.6× |
 | per chunk | 27.1 MiB | ~6.0 MiB | 4.4× |
@@ -83,7 +83,7 @@ Per-chunk disk (TurboQuant codes only):
 | component | size |
 |---|---|
 | 24 × S codes (3.5-bit, 524,288 dims each) | 5.4 MiB |
-| 24 × conv_state codes (3.5-bit, 32,768 dims each) | 0.34 MiB |
+| 24 × conv_state codes (3.5-bit, 24,576 dims each) | 0.25 MiB |
 | M1 codes (3.5-bit, 524,288 dims) | 0.22 MiB |
 | M2 codes (3.5-bit, 524,288 dims) | 0.22 MiB |
 | total per chunk | ~6.0 MiB |
@@ -171,5 +171,5 @@ disk/
 | `src/scripts/palettized_modules.py` | `PalettizedLinear.forward(x)` | the idxN LUT forward |
 | `src/flute_extended/src/kernel_fht.cu` | `fht_forward_kernel` | the FHT (TurboQuant's rotation) |
 | `transformers` | `DynamicCache(config=model.config)` | the cache object (TQ-intercepted) |
-| `src/rag/` | `turboquant`, `codebooks`, `tq_cache`, `m1m2`, `hooks`, `ingest`, `snapshot`, `install`, `query`, `finetune`, `lut_export`, `index`, `evals` (+ `codebooks/`, `tests/`) | the §1–§8 implementation; per-section clauses above name each entry point; 169 tests under `src/rag/tests/` |
+| `src/rag/` | `turboquant`, `codebooks`, `tq_cache`, `m1m2`, `hooks`, `ingest`, `snapshot`, `install`, `query`, `finetune`, `lut_export`, `index`, `evals` (+ `codebooks/`, `tests/`) | the §1–§8 implementation; per-section clauses above name each entry point; 175 tests under `src/rag/tests/` |
 | `src/flute_extended/src/` | `kernel_gemv*.cu`, `kernel_streaming.cu`, `kernel_fht.cu`, `kernel_debug_simple.cu`, `kernel_cutlass_dense.cu` + `include/flute/` headers | the idxN inference CUDA kernels |

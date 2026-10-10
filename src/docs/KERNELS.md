@@ -166,6 +166,16 @@ power-of-two segment, and the adjoint (H symmetric, H@H = b·I) is
 - Round-trip exactness: `fht_adjoint(fht(x)) == x` bit-exact; the unit
   tests compare against the explicit `x @ T` ground truth
   (`fht.build_rotation_matrix`).
+- Dispatch eligibility (W11, `fht._kernel_eligible`): the CUDA kernel
+  auto-engages only for K it can tile — a multiple of 32, within
+  [32, 65,504], and every descending-power-of-two segment ≤ 16,384
+  coordinates (one 64 KiB shared-memory tile, the opt-in budget every
+  sm_70+ device honors; the launcher queries the device attribute and
+  raises loudly if a larger tile is ever requested). Larger first
+  segments — K = 32,768 (one 128 KiB block, over the ~99 KiB consumer
+  opt-in) or the RAG plane's S units at K = 524,288 — run the pure-torch
+  reference butterfly ON DEVICE instead (correct, moderately fast; the
+  RAG conv unit K = 24,576 = 16,384 + 8,192 stays kernel-eligible).
 
 ## 6. The training kernels (`flute_train_kernels/`, main project — not part of this repo)
 

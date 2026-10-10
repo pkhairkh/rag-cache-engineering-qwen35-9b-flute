@@ -10,12 +10,12 @@ Status: written Wv2-8 for THIS repo (the one page with no main-project counterpa
 |---|---|---|
 | `turboquant.py` | the TurboQuant quantizer core: FHT rotation + per-coordinate Lloyd-Max, 3.5-bit codes | `test_turboquant.py` |
 | `codebooks.py` (+ `codebooks/`) | the precomputed Lloyd-Max codebooks, bits × dims (1024/32768/524288) | `test_codebooks.py` |
-| `tq_cache.py` | `TQCache` (a `DynamicCache` subclass): quantize-on-write, dequantize-on-read | `test_tq_cache.py`, `test_tq_cache_live.py` |
+| `tq_cache.py` | `TQCache` (a `DynamicCache` subclass): quantize-on-write, dequantize-on-read; owns the conv full-window geometry policy (N16.1: d = flat size rounded to 32) | `test_tq_cache.py`, `test_tq_cache_live.py` |
 | `m1m2.py` | the two global memories M1/M2 and their read/write wiring | `test_m1m2.py` |
 | `hooks.py` | the 9-hook capture harness (hook 0 after layer 0, 1–8 after layers 3,7,…,31) | `test_hooks.py` |
 | `ingest.py` | the delta-protocol ingestion + the restartable `IngestDriver` | `test_ingest.py` |
 | `snapshot.py` | the codes-only per-chunk npz codec + sha256 integrity | `test_ingest.py` |
-| `install.py` | the §6 install math: `sum_turboquant_codes`, `install_from_disk` | `test_query.py` |
+| `install.py` | the §6 install math: `sum_turboquant_codes`, `install_from_disk` | `test_query.py`, `test_install_real_math.py` (W11: install-vs-ground-truth at real GDN fidelity) |
 | `query.py` | the §6 eight-step query flow: `answer_query` | `test_query.py` |
 | `finetune.py` | the §7 lean fine-tune loop (straight-through LUTs, ~500 steps A10G) | `test_finetune.py` |
 | `lut_export.py` | the fine-tuned LUT artifact codec (`pretrained_luts/`) | `test_finetune.py` |
@@ -25,18 +25,27 @@ Status: written Wv2-8 for THIS repo (the one page with no main-project counterpa
 Housekeeping, not in the 13: `__init__.py`, `_paths.py` (the sys.path
 anchor — no dedicated test file).
 
-Suite: `python3 -m pytest src/rag/tests -q` → 169 tests, CPU-only.
+Suite: `python3 -m pytest src/rag/tests -q` → 175 tests (12 files), CPU-only.
+
+GPU-box operational tools live under `scripts/gpu/` (W11): `run_ingestion.py`,
+`run_index.py`, `run_query.py` (the pipeline stages, argparse over the box
+defaults), `verify_pipeline.py` (the G1–G6 generation ladder with
+confidence/repetition metrics) and `bisect_install.py` (install-content ×
+kernel-route bisection: S-read drift check, conv-tail energy check, FLA
+on/off A/B) — see HANDOVER.md for the post-W11 procedure (re-ingest
+required: pre-W11 snapshots carry 16,384-truncated conv codes).
 
 ## 2. Run matrix
 
 | box | runs |
 |---|---|
-| CPU | `python3 -m pytest src/rag/tests -q` (169 tests; `-m "not slow"` skips full-scale) |
+| CPU | `python3 -m pytest src/rag/tests -q` (175 tests; `-m "not slow"` skips full-scale) |
 | CPU | `python3 src/rag/evals.py <roundtrip\|streaming\|margin\|recall\|e2e\|ledger> --self-test` (artifacts under `evals_out/`) |
 | GPU | kernel build + the ladder gates: `src/docs/BUILD.md` §2/§5 (`test_flute.py`, `test_qwen_weights.py`) |
 | GPU | model load: `load_quant_model(artifacts_dir, model_name, device, forward="kernel")` (`forward="reference"` = the CPU-legal route) |
-| GPU | ingestion: `IngestDriver(model, system_token_ids, chunks, out_dir)` → `disk/snapshots/` |
-| GPU | index + query: `build_index(vectors_iter, IndexConfig())` → `answer_query(model, query_token_ids, system, index, loader)` |
+| GPU | ingestion: `python3 scripts/gpu/run_ingestion.py` (argparse; the driver API stays `IngestDriver(model, system_token_ids, chunks, out_dir)`) → `disk/snapshots/` |
+| GPU | index + query: `python3 scripts/gpu/run_index.py` + `python3 scripts/gpu/run_query.py` (the APIs stay `build_index(vectors_iter, IndexConfig())` → `answer_query(model, query_token_ids, system, index, loader)`) |
+| GPU | generation verification / bisection: `python3 scripts/gpu/verify_pipeline.py` (G1–G6) · `python3 scripts/gpu/bisect_install.py` (`--fla-off` = `FLUTE_NO_FLA=1`) |
 | GPU | the evals real-data gates: the four commands `streaming`, `margin`, `recall`, `e2e` (they refuse loudly without a GPU / without real data; `roundtrip`/`ledger` degrade to the self-test stub when no model/disk dir is given) |
 | GPU | fine-tune: `src/rag/finetune.py::train` (~500 steps, A10G) |
 

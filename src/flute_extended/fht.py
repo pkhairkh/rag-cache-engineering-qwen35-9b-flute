@@ -339,16 +339,39 @@ def _resolve_backend(backend: FhtBackend, x: torch.Tensor) -> str:
     return "reference"
 
 
+# The CUDA kernel's shared-memory budget: one FHT segment is a shared-memory
+# tile of b fp32 values; 16,384 coords = 64 KiB, the largest tile every CUDA
+# device of interest can opt into (48 KiB default + opt-in up to >= 64 KiB
+# on sm_70+). Larger FIRST segments (K >= 32,768 decomposes to a single
+# >= 32,768 block = 128 KiB) do not fit the opt-in budget on consumer
+# devices (99 KiB); those K fall back to the torch reference ON CUDA (the
+# butterfly runs on the device — correct, moderately fast).
+_MAX_KERNEL_SEGMENT = 16384
+
+
+def _kernel_eligible(K: int) -> bool:
+    """The CUDA kernel's dispatch contract (auto mode): K is a multiple of
+    32 (thread geometry), within [32, 65504] (the segment table), and every
+    descending-power-of-two segment of K fits the 64 KiB shared-memory tile.
+    Examples: 24,576 = (16,384 + 8,192) -> eligible; 12,288 = (8,192 +
+    4,096) -> eligible; 32,768 = (32,768) -> NOT eligible (reference on
+    CUDA); 524,288 -> NOT eligible (reference on CUDA)."""
+    if K < 32 or K % 32 != 0 or K > (1 << 16) - 32:
+        return False
+    return all(b <= _MAX_KERNEL_SEGMENT for _, b in segments(K))
+
+
 def _raw_kernel_apply(x2d: torch.Tensor, signs: torch.Tensor,
                       transpose: bool) -> torch.Tensor:
     """2-D contiguous dispatch to the extension (forward or adjoint)."""
     C = _load_kernel()
     assert C is not None
     K = int(x2d.shape[1])
-    if K < 32 or K % 32 != 0 or K > (1 << 16) - 32:
-        # the kernel's segment table + thread geometry contract; fall to
-        # the reference rather than refusing (auto mode only reaches
-        # here for exotic K; "kernel" mode is validated above)
+    if not _kernel_eligible(K):
+        # the kernel's segment table + thread geometry + shared-memory tile
+        # contract; fall to the reference rather than refusing (auto mode
+        # only reaches here for K the kernel cannot tile; "kernel" mode is
+        # validated above)
         return (fht_reference_adjoint if transpose else fht_reference)(x2d, signs)
     signs_f = signs if (signs.is_cuda and signs.dtype == torch.float32
                         and signs.is_contiguous()) else \

@@ -154,34 +154,52 @@ def answer_query(
     # [8] decode
     if max_new_tokens > 0:
         t0 = time.perf_counter()
-        eos_id = getattr(getattr(model, 'config', None), 'eos_token_id', None)
         if decode_fn is not None:
             res.new_token_ids = list(decode_fn(
                 model, cache, logits, max_new_tokens))
         else:
             res.new_token_ids = _greedy_decode(
-                model, cache, logits, max_new_tokens, eos_token_id=eos_id)
+                model, cache, logits, max_new_tokens,
+                eos_token_id=_eos_token_id(model))
         t["decode"] = time.perf_counter() - t0
 
     res.timings = t
     return res
 
 
-def _greedy_decode(model, cache, logits, max_new_tokens: int, eos_token_id: Optional[int] = None) -> List[int]:
+def _eos_token_id(model) -> Optional[int]:
+    """The model's greedy-stop token id (a list-valued config field — some
+    checkpoints carry several — collapses to its first entry; None when the
+    model has no config or no eos)."""
+    eos = getattr(getattr(model, "config", None), "eos_token_id", None)
+    if isinstance(eos, (list, tuple)):
+        return int(eos[0]) if eos else None
+    return int(eos) if eos is not None else None
+
+
+def _unwrap_logits(out) -> Optional[torch.Tensor]:
+    """ModelOutput / CausalLMOutputWithPast / tuple / raw tensor -> the
+    (B, T, V) logits tensor (the stub returns a bare tensor; the real
+    CausalLM returns ModelOutput with .logits)."""
+    if isinstance(out, tuple):
+        out = out[0]
+    for attr in ("logits", "last_hidden_state"):
+        if not torch.is_tensor(out) and hasattr(out, attr):
+            out = getattr(out, attr)
+            break
+    if not torch.is_tensor(out) or out.dim() < 3:
+        return None
+    return out
+
+
+def _greedy_decode(model, cache, logits, max_new_tokens: int,
+                   eos_token_id: Optional[int] = None) -> List[int]:
     """Plain greedy loop (step 8). `logits` is the answer-prefill output of
     the stub/model; the loop feeds each argmax back as the next input.
-    Stops early if eos_token_id is generated."""
+    Stops early when eos_token_id is generated."""
     out_ids: List[int] = []
-    # Handle ModelOutput, CausalLMOutputWithPast, or raw tensor
-    cur_logits = logits
-    # Try common output attribute names
-    for attr in ('logits', 'last_hidden_state'):
-        if hasattr(cur_logits, attr) and not isinstance(cur_logits, torch.Tensor):
-            cur_logits = getattr(cur_logits, attr)
-            break
-    if isinstance(cur_logits, tuple):
-        cur_logits = cur_logits[0]
-    if cur_logits is None or cur_logits.dim() < 3:
+    cur_logits = _unwrap_logits(logits)
+    if cur_logits is None:
         return out_ids
     next_id = torch.tensor([[int(cur_logits[:, -1, :].argmax(dim=-1))]])
     out_ids.append(int(next_id))
@@ -191,13 +209,8 @@ def _greedy_decode(model, cache, logits, max_new_tokens: int, eos_token_id: Opti
         with torch.no_grad():
             r = model(input_ids=next_id, past_key_values=cache,
                       use_cache=True)
-        cur_logits = r[0] if isinstance(r, tuple) else r
-        # Try common output attribute names
-        for attr in ('logits', 'last_hidden_state'):
-            if hasattr(cur_logits, attr) and not isinstance(cur_logits, torch.Tensor):
-                cur_logits = getattr(cur_logits, attr)
-                break
-        if cur_logits is None or cur_logits.dim() < 3:
+        cur_logits = _unwrap_logits(r)
+        if cur_logits is None:
             break
         next_id = torch.tensor(
             [[int(cur_logits[:, -1, :].argmax(dim=-1))]])

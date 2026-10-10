@@ -2,7 +2,7 @@
 
 Purpose: HOW the cache-engineered RAG contract in `SPECIFICATION.md` maps onto the TurboQuant paper — arXiv:2504.19874, "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate" (Zandieh, Daliri, Hadian & Mirrokni; ICML 2025): paper facts, design decisions D1–D5, build phases P0–P7, risk register R1–R8, acceptance.
 Authority: subordinate to `SPECIFICATION.md` (the contract; cited by clause N##); execution waves and wave statuses live in `TASKS.md`.
-Status: v1 semantics preserved, format rewritten Wv2-7.1; the CPU-side code under `src/rag/` is done (tags `cpu-code-complete` + `base-synced-v1.3`, 169 tests green); phases P0–P7 = GPU box pending; cuts stay cut — no palettizer, no eval plane, no QLoRA stack (model artifacts pre-built per N1).
+Status: v1 semantics preserved, format rewritten Wv2-7.1; the CPU-side code under `src/rag/` is done (tags `cpu-code-complete` + `base-synced-v1.3`, 175 tests green); phases P0–P7 = GPU box pending; cuts stay cut — no palettizer, no eval plane, no QLoRA stack (model artifacts pre-built per N1).
 
 ## 1. Paper facts
 
@@ -137,7 +137,7 @@ MSE-optimal quantizers are biased inner-product estimators: at b=1 the bias is a
 
 ## 3. The build: phases, gates, files
 
-### 3.1 src/rag/ file map (the SPECIFICATION §1–§8 implementation; plus `src/rag/codebooks/` artifacts + `src/rag/tests/` = 11 test files, 169 tests)
+### 3.1 src/rag/ file map (the SPECIFICATION §1–§8 implementation; plus `src/rag/codebooks/` artifacts + `src/rag/tests/` = 12 test files, 175 tests)
 
 | module | role |
 |---|---|
@@ -168,7 +168,7 @@ MSE-optimal quantizers are biased inner-product estimators: at b=1 the bias is a
 | P6 install + end-to-end | query: the full spec §6 flow (tokenize → online-TQ prefill → preselect → rerank → load 3 chunks → dequant-sum-requant install → answer → decode) | (i) OfficeQA e2e accuracy vs a no-RAG baseline AND vs an oracle-retrieval variant (install the CORRECT chunk's codes — the gap oracle-vs-actual isolates retrieval quality from generation quality); (ii) the spec §9 timing ledger (prefill+snapshot ~8 ms, preselect ~10 ms, rerank ~20 ms, load ~3 ms, install ~15 ms, decode ~8 s; total ~8.06 s); (iii) the spec §10 VRAM ledger (~13 GiB on A10G 24 GiB) | src/rag/evals.py e2e + src/rag/evals.py ledger | GPU box pending |
 | P7 hardening (only if gates demand) | CUDA-graph the decode-step write path (quantize-on-write is in the hot loop: FHT 2¹⁹ + bucketize + pack per S unit per step — µs-scale on GPU; graph-capture once the numerics are frozen); mmap the snapshot store; optional entropy coding of indices (~5% at b=4 — skip unless 300 GiB → 285 GiB matters); the prod-variant structured QJL if P5 chose it | every hardening flag default OFF with bit-identical flag-off parity (CPU-side verified); the GPU-side benefit is measured once numerics are frozen | flags: src/rag/turboquant.py --qjl, src/rag/snapshot.py use_mmap, src/rag/tq_cache.py graph_safe | GPU box pending |
 
-CPU-side code for P1–P7 is done and green (169 tests; the wave record in TASKS.md); "GPU box pending" marks the real-tensor gates. Build order is evidence-gated — nothing downstream of a failed gate gets pinned; Phase 1's measurement table is the plan's most important artifact: every quantization hyperparameter (norm granularity, split ratio, variant choice) is decided there, on the real model, before the 50k-chunk ingestion runs.
+CPU-side code for P1–P7 is done and green (175 tests; the wave record in TASKS.md); "GPU box pending" marks the real-tensor gates. Build order is evidence-gated — nothing downstream of a failed gate gets pinned; Phase 1's measurement table is the plan's most important artifact: every quantization hyperparameter (norm granularity, split ratio, variant choice) is decided there, on the real model, before the 50k-chunk ingestion runs.
 
 ## 4. Risk register
 

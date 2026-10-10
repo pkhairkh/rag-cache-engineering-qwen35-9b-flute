@@ -29,16 +29,20 @@ PROPOSAL §2 D2-D4; module commit a27f6fc) via the `layer_types` stub route
   9.  Offline fallback (D4): raw tensors during forward, passthrough
       reads, layer.snapshot_codes() quantizes the held tensors.
   10. resolve_quantizer: canonical kinds (shared D3 instances, seeds
-      101/202/303/404) vs custom power-of-two sizes (kind's seed kept);
-      non-power-of-two sizes raise; registry identity for custom sizes.
+      101/202/303/404) vs custom sizes (kind's seed kept; non-power-of-two
+      sizes are valid under the segmented FHT — the tiny-d positive gates);
+      registry identity for custom sizes; d <= 0 raises.
   11. Non-power-of-two conv geometry (the Qwen3.5 in_proj Q+V window:
-      1×6144×4 = 24,576): zero-padded to the next power of two — 32,768,
-      the CANONICAL conv d, so the D3 frame (seed 202, shared instance)
-      is the same as every power-of-two geometry; dequant strips the pad
-      (the stored norm is unchanged — zeros add no energy). Windowing,
-      mutation re-capture and differential-vs-real-layer contracts hold
-      identically; the conv_codes setter guards unit-d drift; power-of-
-      two geometries keep the exact pre-padding behavior (pad == 0).
+      1×6144×4 = 24,576): the FULL window rides one code unit at
+      d = 24,576 (round-up to 32 only — no truncation, no pow2 padding;
+      the segments 16,384 + 8,192 each fit the FHT kernel's 64 KiB tile)
+      in the conv kind's shared D3 frame (seed 202, custom-d instance).
+      Windowing, mutation re-capture and differential-vs-real-layer
+      contracts hold identically; the conv_codes setter guards unit-d
+      drift (old pre-W11 snapshots raise with the re-ingest hint); the
+      no-truncation regression pins the last 8,192 coordinates' fidelity
+      (the GPU session's 16,384 cap zeroed exactly those). Power-of-two
+      geometries take the SAME code path with pad == 0 (bit-identical).
 
 Determinism: every random draw goes through a torch.Generator pinned to a
 fixed seed; all rel-MSE numbers quoted in comments were measured on this
@@ -80,6 +84,7 @@ from transformers.cache_utils import (
 )
 
 import turboquant as tq
+from turboquant import SEEDS
 from tq_cache import TQCache, TQLinearAttentionLayer, resolve_quantizer
 
 # ---- the stub shapes (power-of-two units so resolve_quantizer accepts them)
@@ -604,24 +609,39 @@ def test_resolve_quantizer_custom_sizes_keep_the_kind_seed():
     assert resolve_quantizer("S", D_UNIT) is not resolve_quantizer("conv", D_UNIT)
 
 
-# Non-power-of-two is now allowed (FHT kernel supports segmentation)
-@pytest.mark.parametrize("numel", [0])  # Only 0 should fail
-def test_resolve_quantizer_rejects_non_power_of_two(numel):
+def test_resolve_quantizer_rejects_non_positive():
+    """d=0 (and negatives) are the only invalid units — the segmented FHT
+    made the power-of-two restriction obsolete (non-pow2 sizes are VALID
+    and covered by the custom-size/registry tests above and the contract-11
+    geometry below)."""
     with pytest.raises(ValueError):
-        resolve_quantizer("S", numel)
+        resolve_quantizer("S", 0)
 
 
-# --- contract 11: non-power-of-two conv geometry (no padding needed) ---------- #
+# positive non-power-of-two resolutions (the W10-era rejections, now valid):
+# every size rides the kind's seed frame; the committed (b, d) codebooks
+# serve each — no test writes a new npz
+@pytest.mark.parametrize("numel", [100, 3, 129, 96])
+def test_resolve_quantizer_accepts_non_power_of_two(numel):
+    q = resolve_quantizer("S", numel)
+    assert q.d == numel and q.seed == SEEDS["S"]
+    x = torch.randn(numel, generator=torch.Generator().manual_seed(numel))
+    codes = q.quant(x)
+    assert codes.d == numel and codes.seed == SEEDS["S"]
+    assert _rel_mse(q.dequant(codes), x) < 0.35   # tiny-d units quantize loosely
+
+
+# --- contract 11: non-power-of-two conv geometry (full-window policy) ---- #
 # The Qwen3.5 in_proj Q+V conv window: 1x6144x4 = 24,576 elements — NOT a
-# power of two. FHT kernel handles this via segmentation (16384 + 8192),
-# so no padding is needed. The quantized unit shares the D3 rotation
-# (seed 202); dequant returns the correct 24,576 elements.
-# energy spreads uniformly over 32,768 coordinates by the rotation, so
-# the kept 3/4 of them carry <= 3/4 of it; measured 0.016 vs 0.022 for
-# the unpadded random unit). Power-of-two geometries take the SAME code
-# path with pad == 0 (a reshape-only no-op — bit-identical).
+# power of two. The segmented FHT (fht.segments: 16,384 + 8,192, every
+# tile fits the 64 KiB kernel budget) quantizes the FULL window — no pad,
+# no truncation. The unit shares the conv kind's D3 rotation (seed 202);
+# dequant returns all 24,576 coordinates (the GPU session's 16,384-truncation
+# experiment — zeroing the last 8,192 coordinates of every read — is the
+# regression this contract pins out). Power-of-two geometries take the SAME
+# code path with pad == 0 (a reshape-only no-op — bit-identical).
 CONV_NP2_UNIT = (1, 6144, 4)           # 24,576 dims — the Qwen3.5 Q+V window
-CONV_NP2_D = 24576                     # No padding needed - FHT segments as 16384+8192
+CONV_NP2_D = 24576                     # full window; FHT segments as 16384+8192
 
 
 def test_next_pow2_helper():
@@ -761,8 +781,31 @@ def test_nonpow2_conv_codes_setter_and_frame_guard():
     # writes a new (b, d) combination) into the 24,576-d layer raises
     rogue = tq.TurboQuant(kind="custom", bits=3.5, d=1024, seed=202)
     bad = rogue.quant(torch.randn(1024, generator=g))
-    with pytest.raises(ValueError, match="padded conv frame"):
+    with pytest.raises(ValueError, match="conv frame"):
         layer.conv_codes = bad
+
+
+def test_conv_full_window_no_truncation_regression():
+    """The direct regression for the GPU session's 16,384 truncation: the
+    read-back window carries EVERY channel's history — the last 8,192
+    coordinates (channels 4,096..6,143, the ones the truncation zeroed)
+    round-trip within the standard budget, and a hard zeroed-tail would
+    blow the budget by construction."""
+    g = torch.Generator().manual_seed(760)
+    cache = TQCache(layer_types=["linear_attention"])
+    layer = cache.layers[0]
+    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16)
+    cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
+
+    w = layer.conv_states[0]
+    # the tail coordinates the truncation used to zero: full fidelity
+    tail = w.reshape(-1)[16384:]
+    x_tail = x.reshape(-1)[16384:]
+    assert _rel_mse(tail, x_tail) < REL_MSE_GATE
+    # and the whole window: one budget over all 24,576 coordinates
+    assert _rel_mse(w, x) < REL_MSE_GATE
+    # the codes unit is the FULL window (never a 16,384 cap)
+    assert layer.conv_codes.d == 24576
 
 
 def test_nonpow2_conv_offline_snapshot():
