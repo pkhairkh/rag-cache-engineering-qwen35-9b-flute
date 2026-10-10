@@ -1,0 +1,120 @@
+============================================================
+RAGGA QUERY TEST (Using Framework)
+============================================================
+
+[1] Loading model...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 1663.58it/s]
+Loading weights:   0%|          | 0/427 [00:00<?, ?it/s]Loading weights:   0%|          | 1/427 [00:00<02:50,  2.50it/s]Loading weights:  19%|█▊        | 80/427 [00:00<00:01, 206.27it/s]Loading weights:  29%|██▉       | 124/427 [00:00<00:01, 251.97it/s]Loading weights:  38%|███▊      | 164/427 [00:00<00:00, 276.86it/s]Loading weights:  47%|████▋     | 202/427 [00:00<00:00, 279.17it/s]Loading weights:  56%|█████▌    | 239/427 [00:00<00:00, 299.23it/s]Loading weights:  65%|██████▌   | 278/427 [00:01<00:00, 311.83it/s]Loading weights:  73%|███████▎  | 313/427 [00:01<00:00, 301.78it/s]Loading weights:  84%|████████▍ | 359/427 [00:01<00:00, 328.13it/s]Loading weights:  93%|█████████▎| 395/427 [00:01<00:00, 319.82it/s]Loading weights: 100%|██████████| 427/427 [00:01<00:00, 274.72it/s]
+  [ROT] recovered AWQ scales for 46 norm group(s) / 99 consumer tensor(s) from norm_gain_edits.json
+  Applied 46 AWQ norm-gain edits (norm_gain_edits.json)
+  Merged heads metadata from /home/ubuntu/qwen3_5_9B_palettized_heads
+[palettized_modules] model.layers.0.linear_attn.in_proj_qkv.weight:Q: metadata group_size 16 is inconsistent with the LUT geometry (n_groups=4, N=2048 -> derived 512); using the derived value
+  [ROT] legacy rotate-then-AWQ fold order compensated on 133 tensor group(s) — exact loader-side fix (M = D T D^-1; main project: scripts/diagnose_greedy_bug.py claim 4)
+  [GS] group_size metadata mismatch on 132 tensor component(s) — the recorded sweep field is stale (first: model.layers.0.linear_attn.in_proj_qkv.weight:Q: gs 16 vs derived 512); the LUT geometry is trusted for every one of them (policy;  aggregation). Fix the writer: the deployed composition's gs is what the metadata should record.
+  [merge] FusedPalettizedMLP installed on 32 MLP group(s) — the M == 1 decode route merges gate+up+SiLU*mul into one split-K GEMV launch (FLUTE_NO_MERGE=1 disables)
+    Model loaded
+
+[2] Loading ingested data...
+    System: sysstate-ba83a4b3
+    100 chunks
+
+[3] Loading questions...
+    Loaded 5 questions
+
+[4] Running queries (direct rerank over all chunks)...
+
+    Query 1: What are the default size limits for file uploads and total request size for the...
+    Top 3 chunks: [70, 80, 71]
+    Scores: [0.7044, 0.6976, 0.692]
+    Answer: �,nacho and
+bfins
+
+
+-b：�,hsments of-・
+  -，sYpxed
+
+ to\n to
+
+ I
+-DaEN+-高当时
+
+tCD
+
+FCrsve BY.  
+ nums2
+kable,
+CD
+,
+\ Ss() sk宽
+
+x a        丝
+ ×,
+b  ): saB
+e, inasation:
+1. lT' wlypy {\S ...
+
+    Query 2: What is the name of the new metric added so SRE can track when server-side strea...
+    Top 3 chunks: [71, 80, 70]
+    Scores: [0.6929, 0.6927, 0.6918]
+    Answer: -s.pi
+ ( to=  IF |key inning (q-d or 
+ is
+
+ed r- param inudy andAPHIee and
+yA 
+
+yhad &, &;, PF
+
+
+
+
+
+
+
+  : #,Accountynes
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ '
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ the： for
+
+ingly ne娘
+
+ghly     _na_Lan •on...
+
+    Query 3: What are the acceptance criteria for the project introducing an algorithm to gen...
+    Top 3 chunks: [80, 70, 71]
+    Scores: [0.7141, 0.7124, 0.7098]

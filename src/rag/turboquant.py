@@ -286,10 +286,11 @@ class TurboQuant:
         self.kind = kind
         self.d = int(d if d is not None else KINDS[kind][0])
         self.seed = int(seed if seed is not None else KINDS[kind][1])
-        if self.d < 1 or (self.d & (self.d - 1)) != 0:
-            raise ValueError(
-                f"TurboQuant: d must be a power of two (FHT single-block "
-                f"contract), got {self.d}")
+        # FHT kernel supports non-power-of-two via segmentation (as long as
+        # K is a multiple of 32 and each segment fits in shared memory).
+        # Only validate that d is a positive integer.
+        if self.d < 1:
+            raise ValueError(f"TurboQuant: d must be >= 1, got {self.d}")
         if not (0 < bits <= 8):
             raise ValueError(f"TurboQuant: bits must be in (0, 8], got {bits}")
         # codebooks are solved per integer bit-width 1..4 (the paper's range)

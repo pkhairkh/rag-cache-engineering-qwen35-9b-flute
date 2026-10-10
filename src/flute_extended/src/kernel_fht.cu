@@ -199,11 +199,24 @@ void launch_fht(const scalar_t* in, const float* signs, scalar_t* out,
     for (int i = 0; i < segs.n; ++i) b_max = std::max(b_max, segs.len[i]);
     const int smem_bytes = b_max * static_cast<int>(sizeof(float));
 
+    // Query device max shared memory
+    int device = 0;
+    cudaGetDevice(&device);
+    int max_smem = 0;
+    cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    
     const void* kfn = kBackward
         ? reinterpret_cast<const void*>(&fht_backward_kernel<scalar_t, THREADS>)
         : reinterpret_cast<const void*>(&fht_forward_kernel<scalar_t, THREADS>);
-    if (smem_bytes > kMaxDefaultSmem) {
+    if (smem_bytes > kMaxDefaultSmem && smem_bytes <= max_smem) {
         C10_CUDA_CHECK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    }
+    if (smem_bytes > max_smem) {
+        // Segment too large for device - this shouldn't happen with proper
+        // segmentation. The caller should guarantee b_max fits in shared memory.
+        TORCH_CHECK(false, "FHT segment size ", b_max, " requires ", smem_bytes,
+                    " bytes shared memory, but device max is ", max_smem,
+                    ". Use smaller segments or fix the segender.");
     }
     if (kBackward) {
         fht_backward_kernel<scalar_t, THREADS>

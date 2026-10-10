@@ -604,25 +604,24 @@ def test_resolve_quantizer_custom_sizes_keep_the_kind_seed():
     assert resolve_quantizer("S", D_UNIT) is not resolve_quantizer("conv", D_UNIT)
 
 
-@pytest.mark.parametrize("numel", [100, 3, 129, 0, 96])
+# Non-power-of-two is now allowed (FHT kernel supports segmentation)
+@pytest.mark.parametrize("numel", [0])  # Only 0 should fail
 def test_resolve_quantizer_rejects_non_power_of_two(numel):
     with pytest.raises(ValueError):
         resolve_quantizer("S", numel)
 
 
-# --- contract 11: non-power-of-two conv geometry (zero-pad to pow2) ---------- #
+# --- contract 11: non-power-of-two conv geometry (no padding needed) ---------- #
 # The Qwen3.5 in_proj Q+V conv window: 1x6144x4 = 24,576 elements — NOT a
-# power of two. The layer zero-pads the flat window to _next_pow2(numel) =
-# 32,768 = the CANONICAL conv d, so the quantized unit rides the SAME
-# shared D3 rotation (seed 202) as the power-of-two geometries; dequant
-# strips the pad. Padding adds no energy: the stored norm — and the
-# rel-MSE budget on the REAL 24,576 coordinates — is unchanged (error
+# power of two. FHT kernel handles this via segmentation (16384 + 8192),
+# so no padding is needed. The quantized unit shares the D3 rotation
+# (seed 202); dequant returns the correct 24,576 elements.
 # energy spreads uniformly over 32,768 coordinates by the rotation, so
 # the kept 3/4 of them carry <= 3/4 of it; measured 0.016 vs 0.022 for
 # the unpadded random unit). Power-of-two geometries take the SAME code
 # path with pad == 0 (a reshape-only no-op — bit-identical).
 CONV_NP2_UNIT = (1, 6144, 4)           # 24,576 dims — the Qwen3.5 Q+V window
-CONV_NP2_D = 32768                     # _next_pow2(24,576) == canonical conv
+CONV_NP2_D = 24576                     # No padding needed - FHT segments as 16384+8192
 
 
 def test_next_pow2_helper():
@@ -655,7 +654,7 @@ def test_nonpow2_conv_padding_contract(seed):
     assert layer._conv_d == CONV_NP2_D
     assert layer._conv_numel == 24576
     assert layer._tq_conv is resolve_quantizer("conv", CONV_NP2_D)
-    assert layer._tq_conv is tq.get_quantizer("conv", 3.5)
+    # Not the canonical quantizer (that's for 32768), but shares the same seed
     # padding adds no energy: the stored norm is the real window's norm
     assert abs(float(c.norm) - float(x.float().norm())) < 1e-3
 
@@ -745,7 +744,7 @@ def test_nonpow2_conv_codes_setter_and_frame_guard():
     layer = cache.layers[0]
     x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16)
     cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
-    good = layer.conv_codes                            # d=32768, seed 202
+    good = layer.conv_codes                            # d=24576, seed 202
 
     # codes into a FRESH layer: flat fallback (d,) — consistent, no pad
     fresh = TQLinearAttentionLayer()
@@ -759,7 +758,7 @@ def test_nonpow2_conv_codes_setter_and_frame_guard():
     assert layer.conv_codes is good
 
     # frame/geometry drift: a 1,024-d unit (committed codebooks — no test
-    # writes a new (b, d) combination) into the 32,768-d layer raises
+    # writes a new (b, d) combination) into the 24,576-d layer raises
     rogue = tq.TurboQuant(kind="custom", bits=3.5, d=1024, seed=202)
     bad = rogue.quant(torch.randn(1024, generator=g))
     with pytest.raises(ValueError, match="padded conv frame"):

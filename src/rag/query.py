@@ -154,33 +154,54 @@ def answer_query(
     # [8] decode
     if max_new_tokens > 0:
         t0 = time.perf_counter()
+        eos_id = getattr(getattr(model, 'config', None), 'eos_token_id', None)
         if decode_fn is not None:
             res.new_token_ids = list(decode_fn(
                 model, cache, logits, max_new_tokens))
         else:
             res.new_token_ids = _greedy_decode(
-                model, cache, logits, max_new_tokens)
+                model, cache, logits, max_new_tokens, eos_token_id=eos_id)
         t["decode"] = time.perf_counter() - t0
 
     res.timings = t
     return res
 
 
-def _greedy_decode(model, cache, logits, max_new_tokens: int) -> List[int]:
+def _greedy_decode(model, cache, logits, max_new_tokens: int, eos_token_id: Optional[int] = None) -> List[int]:
     """Plain greedy loop (step 8). `logits` is the answer-prefill output of
-    the stub/model; the loop feeds each argmax back as the next input."""
+    the stub/model; the loop feeds each argmax back as the next input.
+    Stops early if eos_token_id is generated."""
     out_ids: List[int] = []
+    # Handle ModelOutput, CausalLMOutputWithPast, or raw tensor
     cur_logits = logits
+    # Try common output attribute names
+    for attr in ('logits', 'last_hidden_state'):
+        if hasattr(cur_logits, attr) and not isinstance(cur_logits, torch.Tensor):
+            cur_logits = getattr(cur_logits, attr)
+            break
+    if isinstance(cur_logits, tuple):
+        cur_logits = cur_logits[0]
+    if cur_logits is None or cur_logits.dim() < 3:
+        return out_ids
     next_id = torch.tensor([[int(cur_logits[:, -1, :].argmax(dim=-1))]])
     out_ids.append(int(next_id))
+    if eos_token_id is not None and int(next_id) == eos_token_id:
+        return out_ids
     for _ in range(max_new_tokens - 1):
         with torch.no_grad():
             r = model(input_ids=next_id, past_key_values=cache,
                       use_cache=True)
         cur_logits = r[0] if isinstance(r, tuple) else r
+        # Try common output attribute names
+        for attr in ('logits', 'last_hidden_state'):
+            if hasattr(cur_logits, attr) and not isinstance(cur_logits, torch.Tensor):
+                cur_logits = getattr(cur_logits, attr)
+                break
         if cur_logits is None or cur_logits.dim() < 3:
             break
         next_id = torch.tensor(
             [[int(cur_logits[:, -1, :].argmax(dim=-1))]])
         out_ids.append(int(next_id))
+        if eos_token_id is not None and int(next_id) == eos_token_id:
+            break
     return out_ids
