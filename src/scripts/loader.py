@@ -16,7 +16,8 @@ __all__ = ["load_quant_model"]
 
 def load_quant_model(artifacts_dir, model_name, device,
                      residual=False, dtype=None, forward="kernel",
-                     awq_compensation=True, heads_dir=None):
+                     awq_compensation=True, heads_dir=None,
+                     use_m1m2=True, m1m2_mem_size=128):
     """The quant loader. Returns (model, metadata).
 
     forward: "kernel" (the box default — the FLUTE fused path) or
@@ -31,6 +32,9 @@ def load_quant_model(artifacts_dir, model_name, device,
     heads_dir: optional separate heads artifacts dir. When set, loads
     transformer layers from artifacts_dir and embed_tokens/lm_head from
     heads_dir (the separate head-pass output with higher-quality LUT).
+
+    use_m1m2: enable M1/M2 global memories (default True for RAGGA).
+    m1m2_mem_size: memory size for M1/M2 (default 128).
     """
     if dtype is None:
         import torch
@@ -39,4 +43,5 @@ def load_quant_model(artifacts_dir, model_name, device,
     return pmod.load_palettized_model(
         artifacts_dir, model_name, device=device, dtype=dtype,
         residual=residual, reference=(forward == "reference"),
-        awq_compensation=awq_compensation, heads_dir=heads_dir)
+        awq_compensation=awq_compensation, heads_dir=heads_dir,
+        use_m1m2=use_m1m2, m1m2_mem_size=m1m2_mem_size)

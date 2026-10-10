@@ -146,9 +146,9 @@ def rig(tmp_path_factory):
     3-chunk corpus for the multi-chunk gate."""
     torch.manual_seed(SEED)
     cfg = _config()
-    model = _ResidualGDNStack(cfg, SEED).eval()
-    sys_ids = _tokens(N_SYS, 1)
-    docs = [_tokens(N_DOC, 2), _tokens(N_DOC, 3), _tokens(N_DOC, 4)]
+    model = _ResidualGDNStack(cfg, SEED).eval().to('cuda')
+    sys_ids = _tokens(N_SYS, 1).to('cuda')
+    docs = [_tokens(N_DOC, 2).to('cuda'), _tokens(N_DOC, 3).to('cuda'), _tokens(N_DOC, 4).to('cuda')]
 
     with torch.no_grad():
         # TRUE-A: raw continuous [sys -> doc0]

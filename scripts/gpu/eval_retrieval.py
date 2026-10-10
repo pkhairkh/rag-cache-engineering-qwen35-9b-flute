@@ -119,7 +119,7 @@ def main() -> int:
                 questions.append((text, gold))
     print(f"    {len(questions)} usable (text + in-corpus gold doc)")
 
-    frames = {"absolute": None, "sys": _sys_frame(sys_vec),
+    frames = {"absolute": None, "sys": _SysFrame(sys_vec),
               "sys+mean": frame}
     hits = {name: {1: 0, 3: 0, 5: 0} for name in frames}
     spreads = {name: [] for name in frames}

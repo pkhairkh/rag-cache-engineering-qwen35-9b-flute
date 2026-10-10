@@ -3267,7 +3267,9 @@ def load_palettized_model(artifacts_dir: str, model_name: str,
                           reference: bool = False,
                           apply_norm_edits: bool = True,
                           awq_compensation: bool = True,
-                          heads_dir: Optional[str] = None):
+                          heads_dir: Optional[str] = None,
+                          use_m1m2: bool = True,
+                          m1m2_mem_size: int = 128):
     """Load the base model and swap in the idx4 artifacts.
 
     Shared by the evaluators (main project: eval_greedy_match, eval_ppl)
@@ -3293,11 +3295,19 @@ def load_palettized_model(artifacts_dir: str, model_name: str,
     instead of artifacts_dir. Useful for combining a separate head-pass
     (higher quality LUT with compensation streams + residual) with the
     layer artifacts from the main pass.
+
+    use_m1m2: enable M1/M2 global memories (default True for RAGGA).
+    m1m2_mem_size: memory size for M1/M2 (default 128).
     """
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM, AutoConfig
     metadata = load_metadata(artifacts_dir)
+    # Load config and enable M1/M2 before model instantiation
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    if use_m1m2:
+        config.use_m1m2 = True
+        config.m1m2_mem_size = m1m2_mem_size
     model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, dtype=dtype,
-        low_cpu_mem_usage=True)
+        low_cpu_mem_usage=True, config=config)
     awq_scales: Dict = {}
     if apply_norm_edits:
         norm_doc = _read_norm_gain_doc(artifacts_dir)

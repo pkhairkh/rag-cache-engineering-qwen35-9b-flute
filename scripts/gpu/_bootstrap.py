@@ -36,13 +36,18 @@ DEFAULTS = {
 
 
 def load_model(artifacts_dir=None, heads_dir=None, model_name=None,
-               device=None):
-    """load_quant_model with the box defaults (loader.py's entry point)."""
+               device=None, use_m1m2=True):
+    """load_quant_model with the box defaults (loader.py's entry point).
+    """
     from loader import load_quant_model
     model, meta = load_quant_model(
         artifacts_dir=artifacts_dir or DEFAULTS["artifacts_dir"],
         model_name=model_name or DEFAULTS["model_name"],
         device=device or DEFAULTS["device"],
         heads_dir=heads_dir or DEFAULTS["heads_dir"])
+    # Enable M1/M2 global memories
+    if use_m1m2:
+        model.config.use_m1m2 = True
+        model.config.m1m2_mem_size = getattr(model.config, 'm1m2_mem_size', 128)
     model = model.eval()
     return model, meta
