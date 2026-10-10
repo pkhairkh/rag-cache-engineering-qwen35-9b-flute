@@ -31,6 +31,14 @@ PROPOSAL §2 D2-D4; module commit a27f6fc) via the `layer_types` stub route
   10. resolve_quantizer: canonical kinds (shared D3 instances, seeds
       101/202/303/404) vs custom power-of-two sizes (kind's seed kept);
       non-power-of-two sizes raise; registry identity for custom sizes.
+  11. Non-power-of-two conv geometry (the Qwen3.5 in_proj Q+V window:
+      1×6144×4 = 24,576): zero-padded to the next power of two — 32,768,
+      the CANONICAL conv d, so the D3 frame (seed 202, shared instance)
+      is the same as every power-of-two geometry; dequant strips the pad
+      (the stored norm is unchanged — zeros add no energy). Windowing,
+      mutation re-capture and differential-vs-real-layer contracts hold
+      identically; the conv_codes setter guards unit-d drift; power-of-
+      two geometries keep the exact pre-padding behavior (pad == 0).
 
 Determinism: every random draw goes through a torch.Generator pinned to a
 fixed seed; all rel-MSE numbers quoted in comments were measured on this
@@ -600,3 +608,178 @@ def test_resolve_quantizer_custom_sizes_keep_the_kind_seed():
 def test_resolve_quantizer_rejects_non_power_of_two(numel):
     with pytest.raises(ValueError):
         resolve_quantizer("S", numel)
+
+
+# --- contract 11: non-power-of-two conv geometry (zero-pad to pow2) ---------- #
+# The Qwen3.5 in_proj Q+V conv window: 1x6144x4 = 24,576 elements — NOT a
+# power of two. The layer zero-pads the flat window to _next_pow2(numel) =
+# 32,768 = the CANONICAL conv d, so the quantized unit rides the SAME
+# shared D3 rotation (seed 202) as the power-of-two geometries; dequant
+# strips the pad. Padding adds no energy: the stored norm — and the
+# rel-MSE budget on the REAL 24,576 coordinates — is unchanged (error
+# energy spreads uniformly over 32,768 coordinates by the rotation, so
+# the kept 3/4 of them carry <= 3/4 of it; measured 0.016 vs 0.022 for
+# the unpadded random unit). Power-of-two geometries take the SAME code
+# path with pad == 0 (a reshape-only no-op — bit-identical).
+CONV_NP2_UNIT = (1, 6144, 4)           # 24,576 dims — the Qwen3.5 Q+V window
+CONV_NP2_D = 32768                     # _next_pow2(24,576) == canonical conv
+
+
+def test_next_pow2_helper():
+    from tq_cache import _next_pow2
+    assert _next_pow2(1) == 1
+    assert _next_pow2(2) == 2
+    assert _next_pow2(3) == 4
+    assert _next_pow2(128) == 128            # already pow2: identity
+    assert _next_pow2(192) == 256
+    assert _next_pow2(24576) == 32768
+    assert _next_pow2(24577) == 32768
+    assert _next_pow2(32768) == 32768
+    with pytest.raises(ValueError):
+        _next_pow2(0)
+
+
+@pytest.mark.parametrize("seed", [700, 701, 702])
+def test_nonpow2_conv_padding_contract(seed):
+    g = torch.Generator().manual_seed(seed)
+    cache = TQCache(layer_types=["linear_attention"])
+    layer = cache.layers[0]
+    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16)
+
+    full = cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
+    assert tuple(full.shape) == CONV_NP2_UNIT          # prefill verbatim
+
+    c = layer.conv_codes
+    # the padded unit IS the canonical conv kind: shared rotation, seed 202
+    assert c.d == CONV_NP2_D and c.seed == 202
+    assert layer._conv_d == CONV_NP2_D
+    assert layer._conv_numel == 24576
+    assert layer._tq_conv is resolve_quantizer("conv", CONV_NP2_D)
+    assert layer._tq_conv is tq.get_quantizer("conv", 3.5)
+    # padding adds no energy: the stored norm is the real window's norm
+    assert abs(float(c.norm) - float(x.float().norm())) < 1e-3
+
+    # read-back: strip the pad, reshape to the real window shape
+    w = layer.conv_states[0]
+    assert tuple(w.shape) == CONV_NP2_UNIT
+    assert dict.get(layer.conv_states, 0) is None       # still no fp16 store
+    assert _rel_mse(w, x) < REL_MSE_GATE                # measured 0.015-0.017
+
+    # decode: the (B, D, k+1) cat contract, quantized window round-trip
+    tok = torch.randn(1, 6144, 1, generator=g, dtype=torch.float16)
+    d = cache.update_conv_state(tok, 0)
+    assert tuple(d.shape) == (1, 6144, 5)
+    w2 = layer.conv_states[0]
+    assert tuple(w2.shape) == CONV_NP2_UNIT
+    assert _rel_mse(w2, d[..., -CONV_KERNEL:]) < REL_MSE_GATE
+
+    # power-of-two geometry is UNCHANGED: pad == 0, the exact same codes
+    # as the pre-padding behavior (bit-identity of the legacy path)
+    g2 = torch.Generator().manual_seed(seed)
+    x2 = torch.randn(*CONV_UNIT, generator=g2, dtype=torch.float16)
+    layer2 = TQLinearAttentionLayer()
+    layer2.update_conv_state(x2, 0, conv_kernel_size=CONV_KERNEL)
+    assert layer2._conv_d == layer2._conv_numel == 128
+    c2 = layer2.conv_codes
+    assert c2.d == 128 and c2.seed == 202
+    padded = layer2._pad_conv_flat(x2)
+    assert padded.numel() == 128 and torch.equal(padded, x2.reshape(-1))
+
+
+def test_nonpow2_conv_mutation_capture():
+    # the causal_conv1d_update decode pattern at the padded geometry:
+    # roll-left + RANDOM fresh last column (a constant column is
+    # adversarial by construction — see the contract-5 note), then the
+    # next read re-captures it into codes.
+    g = torch.Generator().manual_seed(710)
+    cache = TQCache(layer_types=["linear_attention"])
+    layer = cache.layers[0]
+    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16)
+    cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
+
+    state = layer.conv_states[0]                        # the handed-out transient
+    assert tuple(state.shape) == CONV_NP2_UNIT
+    codes_before = layer.conv_codes
+
+    state.copy_(torch.roll(state, shifts=-1, dims=-1))
+    state[..., -1] = torch.randn(1, 6144, generator=g, dtype=torch.float16)
+
+    recaptured = layer.conv_states[0]
+    assert recaptured is not state                      # fresh transient
+    assert tuple(recaptured.shape) == CONV_NP2_UNIT     # pad stripped on read
+    assert _rel_mse(recaptured, state) < REL_MSE_GATE   # measured 0.016
+    assert not np.array_equal(layer.conv_codes.idx_lo, codes_before.idx_lo)
+    assert dict.get(layer.conv_states, 0) is None
+    assert layer.writes["conv"] == 1                    # counter-transparent
+
+
+def test_nonpow2_conv_differential_vs_real_layer():
+    # windowing shapes differential vs the REAL transformers layer at the
+    # 6,144-channel geometry — identical (B, D, *) shapes at every step.
+    g = torch.Generator().manual_seed(720)
+    prefill = torch.randn(1, 6144, 7, generator=g, dtype=torch.float16)
+    token = torch.randn(1, 6144, 1, generator=g, dtype=torch.float16)
+    real, tql = LinearAttentionLayer(), TQLinearAttentionLayer()
+
+    f_real = real.update_conv_state(prefill, 0, conv_kernel_size=CONV_KERNEL)
+    f_tq = tql.update_conv_state(prefill, 0, conv_kernel_size=CONV_KERNEL)
+    assert tuple(f_tq.shape) == (1, 6144, 7) == tuple(f_real.shape)
+    assert torch.equal(f_tq, f_real)                    # no quant on the way out
+
+    d_real = real.update_conv_state(token, 0, conv_kernel_size=CONV_KERNEL)
+    d_tq = tql.update_conv_state(token, 0, conv_kernel_size=CONV_KERNEL)
+    assert tuple(d_tq.shape) == (1, 6144, 5) == tuple(d_real.shape)
+
+    w_real, w_tq = real.conv_states[0], tql.conv_states[0]
+    assert tuple(w_tq.shape) == CONV_NP2_UNIT == tuple(w_real.shape)
+    assert _rel_mse(w_tq, w_real) < REL_MSE_GATE        # two quant rounds
+    assert _rel_mse(w_tq, d_tq[..., -CONV_KERNEL:]) < REL_MSE_GATE
+
+
+def test_nonpow2_conv_codes_setter_and_frame_guard():
+    # the W7 install path at the padded geometry: codes install into an
+    # initialized layer when the unit d matches; a mismatched d (geometry
+    # or frame drift) raises LOUDLY instead of silently mis-stripping.
+    g = torch.Generator().manual_seed(730)
+    cache = TQCache(layer_types=["linear_attention"])
+    layer = cache.layers[0]
+    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16)
+    cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
+    good = layer.conv_codes                            # d=32768, seed 202
+
+    # codes into a FRESH layer: flat fallback (d,) — consistent, no pad
+    fresh = TQLinearAttentionLayer()
+    fresh.conv_codes = good
+    assert fresh._conv_shape == (CONV_NP2_D,)
+    assert fresh._conv_numel == fresh._conv_d == CONV_NP2_D
+    assert tuple(fresh.conv_states[0].shape) == (CONV_NP2_D,)
+
+    # matching codes replace an initialized layer's store (install)
+    layer.conv_codes = good
+    assert layer.conv_codes is good
+
+    # frame/geometry drift: a 1,024-d unit (committed codebooks — no test
+    # writes a new (b, d) combination) into the 32,768-d layer raises
+    rogue = tq.TurboQuant(kind="custom", bits=3.5, d=1024, seed=202)
+    bad = rogue.quant(torch.randn(1024, generator=g))
+    with pytest.raises(ValueError, match="padded conv frame"):
+        layer.conv_codes = bad
+
+
+def test_nonpow2_conv_offline_snapshot():
+    # the D4 fallback at the padded geometry: raw tensors during forward
+    # (offline mode), snapshot_codes() quantizes the held tensor — padded,
+    # same canonical frame as the online regime.
+    g = torch.Generator().manual_seed(740)
+    layer = TQLinearAttentionLayer(online=False)
+    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16)
+    layer.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
+
+    raw = dict.get(layer.conv_states, 0)              # offline: plain store
+    assert tuple(raw.shape) == CONV_NP2_UNIT
+
+    codes = layer.snapshot_codes()["conv"]
+    assert codes.d == CONV_NP2_D and codes.seed == 202
+    v = layer._tq_conv.dequant(codes, dtype=torch.float32)
+    stripped = v[: 24576].reshape(*CONV_NP2_UNIT)     # the pad strip
+    assert _rel_mse(stripped, raw) < REL_MSE_GATE     # measured 0.016

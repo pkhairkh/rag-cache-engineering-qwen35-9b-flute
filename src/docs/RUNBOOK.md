@@ -23,7 +23,7 @@ Build verification ladder (new hardware or after a compiler change):
 ## 1. CPU box: the suite + the self-tests
 
 ```bash
-python3 -m pytest src/rag/tests -q          # 161 tests
+python3 -m pytest src/rag/tests -q          # 169 tests
 python3 src/rag/evals.py <roundtrip|streaming|margin|recall|e2e|ledger> --self-test
 ```
 

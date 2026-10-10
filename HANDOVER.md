@@ -3,11 +3,19 @@
 ## Current State
 
 ### What's Done
-1. **All 161 tests passing** - Fixed 9 failing tests to run on CUDA
+1. **All 161 tests passing** - Fixed 9 failing tests to run on CUDA (169 after the CPU-box W10 wave added the conv-padding contract tests)
 2. **GPU memory profile completed** - Model loads at 6GB, forward pass at 8-9GB peak
 3. **EnterpriseRAG-Bench loaded** - 512K documents in `/home/ubuntu/RAGGA/disk/enterprise_rag_bench/`
 
 ### Critical Blocker: TurboQuant Power-of-Two Requirement
+
+> **RESOLVED on the CPU box (TASKS W10, SPECIFICATION N16.1):** conv windows
+> with a non-power-of-two flattened size are zero-padded to the next power of
+> two INSIDE `TQLinearAttentionLayer` (`tq_cache.py`) — 24,576 → 32,768, the
+> canonical conv d, so the D3 rotation (seed 202) stays shared; dequant
+> strips the pad, the stored norm is unchanged. Power-of-two geometries are
+> bit-identical to before. Pull `main` before re-running ingestion; the fix
+> is covered by `src/rag/tests/test_tq_cache.py` contract 11 (169 tests total).
 
 **The Issue:**
 - TurboQuant requires power-of-two dimensions for FHT (Fast Hadamard Transform)

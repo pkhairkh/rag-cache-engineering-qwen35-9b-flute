@@ -4,8 +4,21 @@ __pycache__/
 build/
 *.egg-info/
 
+# OS junk (3074b32 shipped four .DS_Store files — never again)
+.DS_Store
+.AppleDouble
+Thumbs.db
+
 # toy run artifacts (script-relative, generated)
 scripts/poc_toy/*_results.json
 scripts/poc_toy/test_1000/
+
 # evals artifacts
 src/rag/evals_out/
+
+# runtime artifacts (SPECIFICATION §11 disk layout — not repo files)
+disk/
+
+# editor
+.idea/
+.vscode/

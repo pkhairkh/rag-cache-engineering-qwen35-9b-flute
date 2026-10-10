@@ -36,7 +36,12 @@ M1/M2 slots (spec §2.2/§5): the two global memories are cache STATE —
 kinds and D3 seeds, exactly like S.
 
 Quantizer resolution: the production shapes hit the canonical kinds
-(S: 1×32×128×128 = 524,288; conv: 1×8192×4 = 32,768). Smaller
+(S: 1×32×128×128 = 524,288; conv unit d = 32,768). A conv window whose
+flattened size is NOT a power of two (the Qwen3.5 in_proj Q+V geometry:
+1×6144×4 = 24,576) is zero-padded to the next power of two before the
+FHT — 24,576 → 32,768, the canonical conv d, so the D3 frame (seed 202)
+stays shared across geometries; dequant strips the pad (the stored norm
+is unchanged — zeros add no energy; SPECIFICATION §3.3). Smaller
 power-of-two shapes (tests) resolve to a custom-size quantizer that keeps
 the KIND's seed, so the D3 frame contract holds at every scale.
 
@@ -77,18 +82,29 @@ _ONLINE_ERR = (
     "quantize-on-snapshot fallback (PROPOSAL D4)")
 
 
+def _next_pow2(n: int) -> int:
+    """Smallest power of two >= n (n >= 1) — the conv padding target."""
+    if n < 1:
+        raise ValueError(f"_next_pow2: n must be >= 1, got {n}")
+    return 1 << (n - 1).bit_length()
+
+
 def resolve_quantizer(kind: str, numel: int, bits: float = 3.5) -> TurboQuant:
     """The quantizer for a kind at a given flattened size.
 
     Production sizes hit the canonical kinds (shared rotation per kind,
-    D3). Other power-of-two sizes (tests) get a custom-d quantizer that
-    KEEPS the kind's seed — same frame contract, smaller unit.
+    D3). Other power-of-two sizes (tests, or a padded conv unit) get a
+    custom-d quantizer that KEEPS the kind's seed — same frame contract,
+    smaller unit. Non-power-of-two conv windows are padded to
+    `_next_pow2(numel)` by the LAYER before calling this (never here —
+    the quantizer's own single-block FHT contract stays pure).
     """
     if (numel & (numel - 1)) != 0 or numel < 1:
         raise ValueError(
             f"resolve_quantizer({kind}): flattened size {numel} is not a "
             f"power of two — the FHT single-block contract (PROPOSAL D2) "
-            f"requires power-of-two units")
+            f"requires power-of-two units (conv windows are zero-padded "
+            f"to the next power of two by the CALLING layer)")
     canonical_d, seed = KINDS[kind]
     if numel == canonical_d:
         return tq.get_quantizer(kind, bits)
@@ -124,8 +140,7 @@ class _StateView(dict):
                 codes = layer._conv_codes
                 if codes is None:
                     return None
-                t = layer._tq_conv.dequant(codes, dtype=layer._conv_dtype)
-                t = t.reshape(layer._conv_shape)
+                t = layer._dequant_conv(layer._conv_dtype)
                 # move to tracked device
                 if layer._device is not None and t.device != layer._device:
                     t = t.to(layer._device)
@@ -176,6 +191,8 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         self._s_dtype: torch.dtype = torch.float16
         self._conv_shape: Optional[torch.Size] = None
         self._conv_dtype: torch.dtype = torch.float16
+        self._conv_numel: Optional[int] = None   # real window size (pre-pad)
+        self._conv_d: Optional[int] = None       # quantizer unit size (pow2)
         self._handed_conv: Optional[torch.Tensor] = None
         # track device for correct dequant placement
         self._device: Optional[torch.device] = None
@@ -187,13 +204,33 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         self.recurrent_states = _StateView(self, "s")
 
     # ------------------------------------------------------------ helpers -
+    def _pad_conv_flat(self, t: torch.Tensor) -> torch.Tensor:
+        """The (numel,) flat conv window, zero-padded to the (d,) quantizer
+        unit — a no-op for power-of-two geometries (`_conv_d ==
+        _conv_numel`). Padding adds no energy: the stored norm (and the
+        relative-MSE budget on the REAL coordinates) is unchanged."""
+        flat = t.reshape(-1)
+        pad = (self._conv_d if self._conv_d is not None
+               else flat.numel()) - flat.numel()
+        if pad > 0:
+            flat = torch.nn.functional.pad(flat, (0, pad))
+        return flat
+
+    def _dequant_conv(self, dtype: torch.dtype) -> torch.Tensor:
+        """Codes -> the shaped window: dequant the (d,) unit, STRIP the
+        pad, reshape to `_conv_shape`. Caller owns device placement."""
+        t = self._tq_conv.dequant(self._conv_codes, dtype=dtype)
+        if self._conv_numel is not None and t.numel() > self._conv_numel:
+            t = t[: self._conv_numel]
+        return t.reshape(self._conv_shape)
+
     def _sync_conv(self) -> None:
         """Re-capture the handed-out conv tensor (in-place mutation by
         causal_conv1d_update) into codes — the lazy quantize-on-write."""
         if self.online and self._handed_conv is not None:
             if self._conv_codes is not None:
                 t = self._handed_conv
-                self._conv_codes = self._tq_conv.quant(t.reshape(-1))
+                self._conv_codes = self._tq_conv.quant(self._pad_conv_flat(t))
             self._handed_conv = None
 
     def _init_s(self, tensor: torch.Tensor, state_idx: int) -> None:
@@ -212,8 +249,11 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         n = 1
         for s in window_shape:
             n *= s
-        self._tq_conv = resolve_quantizer("conv", n, self.bits)
+        d = _next_pow2(n)   # 24,576 (Qwen3.5 Q+V) -> 32,768 = canonical conv
+        self._tq_conv = resolve_quantizer("conv", d, self.bits)
         self._conv_shape = tuple(window_shape)
+        self._conv_numel = n
+        self._conv_d = d
         self._conv_dtype = conv_states.dtype
         self._device = conv_states.device
         self.conv_kernel_size[state_idx] = kernel
@@ -272,18 +312,13 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
                 full = torch.nn.functional.pad(full, (pad, 0), value=0.0)
             self.has_previous_state[state_idx] = True
         else:
-            old = self._tq_conv.dequant(self._conv_codes,
-                                        dtype=self._conv_dtype)
-            old = old.reshape(self._conv_shape)
+            old = self._dequant_conv(self._conv_dtype)
             # ensure device consistency with new input
             if old.device != conv_states.device:
                 old = old.to(conv_states.device)
             full = torch.cat([old, conv_states], dim=-1)
         window = full[..., -kernel:]
-        self._conv_codes = self._tq_conv.quant(window.reshape(-1))
-        # ensure device consistency with input
-        if full.device != conv_states.device:
-            full = full.to(conv_states.device)
+        self._conv_codes = self._tq_conv.quant(self._pad_conv_flat(window))
         return full
 
     def update_recurrent_state(self, recurrent_states: torch.Tensor,
@@ -364,8 +399,16 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
                 self._tq_conv = resolve_quantizer("conv", codes.d, self.bits)
                 if self._conv_shape is None:
                     self._conv_shape = (codes.d,)  # flat until a real shape is known
+                    self._conv_numel = codes.d
+                    self._conv_d = codes.d
                 self._conv_dtype = torch.float16
                 self.is_conv_states_initialized[0] = True
+            elif self._conv_d is not None and codes.d != self._conv_d:
+                raise ValueError(
+                    f"conv_codes setter: codes.d={codes.d} != the layer's "
+                    f"quantizer unit d={self._conv_d} (geometry/frame "
+                    f"drift — the codes and the layer must share the "
+                    f"padded conv frame)")
             # kernel size from the window shape when known (reseeded layers
             # skip lazy init — conv_kernel_size must not stay None)
             if self._conv_shape is not None and len(self._conv_shape) >= 1 \
@@ -389,7 +432,7 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         if c is not None and self._tq_conv is None:
             self._init_conv(c, 0, None)
         if c is not None:
-            out["conv"] = self._tq_conv.quant(c.reshape(-1))
+            out["conv"] = self._tq_conv.quant(self._pad_conv_flat(c))
         return out
 
     # -------------------------------------------------- inherited overrides -

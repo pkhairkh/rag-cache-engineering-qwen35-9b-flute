@@ -383,7 +383,8 @@ class TurboQuant:
             # ±1 exactly (np.sign; 0 only on an exact-zero projection —
             # measure-zero for generic residuals, degrades that coordinate
             # by 1/√d of its weight)
-            signs = np.sign(proj.numpy()).astype(np.int8)
+            signs = np.sign(proj.cpu().numpy() if proj.is_cuda
+                            else proj.numpy()).astype(np.int8)
         else:
             signs = np.zeros(self.d, dtype=np.int8)
         codes.qjl_signs = signs

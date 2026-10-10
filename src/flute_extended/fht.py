@@ -321,7 +321,7 @@ def kernel_available(x: Optional[torch.Tensor] = None) -> bool:
 
 def _resolve_backend(backend: FhtBackend, x: torch.Tensor) -> str:
     if backend not in ("auto", "kernel", "reference", "matmul"):
-        raise ValueError(f"fht: unknown backend {backend!r} (expected 'auto', "
+        raise ValueError(f"fht: unknown backend {backend!r} (expected 'auto', 'kernel', "
             f"'reference' or 'matmul')")
     if backend in ("reference", "matmul"):
         return backend

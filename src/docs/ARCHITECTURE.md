@@ -155,7 +155,7 @@ Every stage carries its own differential gate, and the chain composes:
    `idxN == kernel-internal == debug_simple`);
 3. **real weights**: `src/flute_extended/test_qwen_weights.py` (GPU,
    against the pure-torch reference on actual checkpoint tensors);
-4. **runtime wiring + RAG plane**: `src/rag/tests/` (161 tests — loader,
+4. **runtime wiring + RAG plane**: `src/rag/tests/` (169 tests — loader,
    routing, hooks, quantization, ingestion, retrieval; see
    [RAG_PIPELINE.md](RAG_PIPELINE.md); main project:
    `tests/test_palettized_modules.py`, `tests/test_eval_*`);

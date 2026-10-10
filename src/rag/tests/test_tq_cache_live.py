@@ -100,8 +100,16 @@ def test_real_config_builds_and_wraps_layers():
     layer_types, per_layer_kwargs = get_layer_types_and_kwargs(
         cfg.get_text_config(decoder=True))
     assert layer_types == LAYER_PLAN
-    # transformers API changed: per_layer_kwargs is now a dict shared across layers
-    assert per_layer_kwargs == {"number_of_states": 1}
+    # per_layer_kwargs' container shape differs across transformers 5.x
+    # minors: 5.17 (the GPU lock) returns ONE dict shared across layers;
+    # 5.19 (the CPU lock) returns a per-layer list aligned with the plan.
+    # Both carry the same content — pin the CONTENT, not the container:
+    if isinstance(per_layer_kwargs, dict):
+        assert per_layer_kwargs == {"number_of_states": 1}
+    else:
+        assert per_layer_kwargs == [
+            {"number_of_states": 1} if lt == "linear_attention" else {}
+            for lt in LAYER_PLAN]
 
     cache = TQCache(config=cfg)
     assert isinstance(cache, DynamicCache)             # a real transformers Cache

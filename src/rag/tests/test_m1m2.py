@@ -6,7 +6,7 @@ memories, SPECIFICATION.md §2.2) plus its W3.2 wiring in
 `Qwen3_5GatedDeltaNet.forward`, gated by `config.use_m1m2`, default OFF).
 
 Gates (all deterministic — pinned torch seeds, fp32 for bit-identical
-asserts, CUDA-only, no network):
+asserts, device-agnostic (CUDA when available, else CPU), no network):
 
   A. LAYER PARITY (torch.equal — the first forward is bit-exact through
      every cache route):
@@ -48,7 +48,8 @@ asserts, CUDA-only, no network):
            store (the D4 delta protocol at the wiring level): dequant(A)
            + dequant(B) == dequant(sequential A-then-B) within the house
            quant tolerance rel-MSE < 0.06 (measured 0.031 / 0.024) —
-           via the `m1m2_from_cache` / `push_to_cache` §3.2 glue.  E. LOUD GUARDS: read/write shape mismatches, k/v disagreement, bad
+           via the `m1m2_from_cache` / `push_to_cache` §3.2 glue.
+  E. LOUD GUARDS: read/write shape mismatches, k/v disagreement, bad
      positions, non-tensors, bool layer_idx and layer_idx >=
      num_linear_layers (read, write AND forward) all raise.
 
@@ -65,7 +66,7 @@ bit-exactly, so the plain-cache baseline from A.1 is the honest
 reference there.
 
 WIRING NOTE (reported to the W3.2 owner, not pinned here): the modeling
-block calls `_m1m2(_q, _k, _v, ...)`` WITHOUT `positions`, so every call
+block calls `_m1m2(_q, _k, _v, ...)` WITHOUT `positions`, so every call
 scatters into slots arange(T) mod mem — decode steps (T=1) all write
 slot 0 and a second chunk re-uses slots 0..T-1 instead of T..2T-1.
 Invisible at zero gates (writes are no-ops) and irrelevant to every
@@ -283,7 +284,8 @@ def test_b_full_model_flag_parity_and_wiring_structure():
     # bit-identical outputs, cache route (default use_cache=True — the
     # internal plain DynamicCache has no read_m1, so the block is skipped)
     # and cache-free alike:
-    ids = torch.randint(0, 128, (2, 6), device=DEVICE)
+    ids = torch.randint(0, 128, (2, 6), device=DEVICE,
+                        generator=torch.Generator(device=DEVICE).manual_seed(22))
     with torch.no_grad():
         out_off = model_off(input_ids=ids).last_hidden_state
         out_on = model_on(input_ids=ids).last_hidden_state

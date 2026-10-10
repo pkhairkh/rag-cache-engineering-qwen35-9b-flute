@@ -25,13 +25,13 @@ Status: written Wv2-8 for THIS repo (the one page with no main-project counterpa
 Housekeeping, not in the 13: `__init__.py`, `_paths.py` (the sys.path
 anchor — no dedicated test file).
 
-Suite: `python3 -m pytest src/rag/tests -q` → 161 tests, CPU-only.
+Suite: `python3 -m pytest src/rag/tests -q` → 169 tests, CPU-only.
 
 ## 2. Run matrix
 
 | box | runs |
 |---|---|
-| CPU | `python3 -m pytest src/rag/tests -q` (161 tests; `-m "not slow"` skips full-scale) |
+| CPU | `python3 -m pytest src/rag/tests -q` (169 tests; `-m "not slow"` skips full-scale) |
 | CPU | `python3 src/rag/evals.py <roundtrip\|streaming\|margin\|recall\|e2e\|ledger> --self-test` (artifacts under `evals_out/`) |
 | GPU | kernel build + the ladder gates: `src/docs/BUILD.md` §2/§5 (`test_flute.py`, `test_qwen_weights.py`) |
 | GPU | model load: `load_quant_model(artifacts_dir, model_name, device, forward="kernel")` (`forward="reference"` = the CPU-legal route) |

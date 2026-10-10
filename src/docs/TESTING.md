@@ -2,12 +2,12 @@
 
 Purpose: the gate suite — what runs where, what each gate pins, and the collection policy that keeps a CPU-only checkout green.
 Authority: authoritative for the test layout; subordinate to `SPECIFICATION.md` for RAG semantics.
-Status: synced from the main project @ ab78893, scoped to this repo Wv2-8 — this repo's suite is `src/rag/tests/` (161 CPU tests) plus two GPU-side standalone gates under `src/flute_extended/`; the main project's ~190-test kernel/training/eval suite is not part of this repo.
+Status: synced from the main project @ ab78893, scoped to this repo Wv2-8 — this repo's suite is `src/rag/tests/` (169 CPU tests) plus two GPU-side standalone gates under `src/flute_extended/`; the main project's ~190-test kernel/training/eval suite is not part of this repo.
 
 ## 1. Running
 
 ```bash
-python3 -m pytest src/rag/tests -q              # this repo's whole CPU suite (161 tests)
+python3 -m pytest src/rag/tests -q              # this repo's whole CPU suite (169 tests)
 python3 -m pytest src/rag/tests/test_query.py -q  # one file
 python3 -m pytest src/rag/tests -q -m "not slow"  # skip the full-scale CPU tests
 ```
