@@ -78,12 +78,12 @@ def _tokens(n: int, seed: int):
     q/k (B, T, HK, K) repeat_interleaved to HV (modeling.py:688), v
     (B, T, HV, V), beta sigmoided, g strictly negative (log decay)."""
     g = torch.Generator().manual_seed(seed)
-    q = (torch.randn(B, n, HK, KD, generator=g) * 0.8
+    q = (torch.randn(B, n, HK, KD, generator=g).cuda() * 0.8
          ).repeat_interleave(HV // HK, dim=2)
-    k = (torch.randn(B, n, HK, KD, generator=g) * 0.8
+    k = (torch.randn(B, n, HK, KD, generator=g).cuda() * 0.8
          ).repeat_interleave(HV // HK, dim=2)
-    v = torch.randn(B, n, HV, VD, generator=g) * 0.8
-    beta = torch.sigmoid(torch.randn(B, n, HV, generator=g))
+    v = torch.randn(B, n, HV, VD, generator=g).cuda() * 0.8
+    beta = torch.sigmoid(torch.randn(B, n, HV, generator=g).cuda())
     decay = -torch.rand(B, n, HV, generator=g) * 0.08 - 0.002
     return q, k, v, beta, decay
 
@@ -111,11 +111,11 @@ def rig():
     # the TQ online path: reseeded layer -> doc prefill -> codes (the
     # exact ingest_chunk flow: read dequant(sys), evolve, write codes)
     layer = TQLinearAttentionLayer(bits=BITS, online=True)
-    layer._init_s(s_sys_recon.half(), 0)
+    layer._init_s(s_sys_recon.half().cuda(), 0)
     layer.s_codes = sys_codes
     read0 = layer.recurrent_states[0]
     _, s_doc_tq = _prefill(read0.float(), doc_tokens)
-    layer.update_recurrent_state(s_doc_tq.half(), 0)
+    layer.update_recurrent_state(s_doc_tq.half().cuda(), 0)
     doc_codes = layer.s_codes
 
     # the D4 delta + the install sum (sum_turboquant_codes, one requant)

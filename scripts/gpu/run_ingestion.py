@@ -60,7 +60,7 @@ def main() -> int:
                     help="W16: 'absolute' (default) stores the cache's own "
                          "end-of-chunk codes — the single-chunk install is "
                          "VERBATIM (the W16 noise decomposition measured the "
-                         "delta path's 2 extra rounds at ~70% of the "
+                         "delta path's 2 extra rounds at ~70 percent of the "
                          "write-path distortion); 'delta-v1' keeps the D4 "
                          "legacy layout (the A/B)")
     args = ap.parse_args()

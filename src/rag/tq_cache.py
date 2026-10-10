@@ -680,6 +680,12 @@ class TQCache(DynamicCache):
         self._check_m_geometry("read_m1", "M1", self._m1_codes.d,
                                self._m1_shape)
         t = self._tq_m1.dequant(self._m1_codes, dtype=dtype).reshape(self._m1_shape)
+        # infer device from layers if not yet tracked
+        if self._m_device is None and self.layers:
+            for layer in self.layers:
+                if hasattr(layer, "_device") and layer._device is not None:
+                    self._m_device = layer._device
+                    break
         if self._m_device is not None and t.device != self._m_device:
             t = t.to(self._m_device)
         return t
@@ -713,6 +719,12 @@ class TQCache(DynamicCache):
         self._check_m_geometry("read_m2", "M2", self._m2_codes.d,
                                self._m2_shape)
         t = self._tq_m2.dequant(self._m2_codes, dtype=dtype).reshape(self._m2_shape)
+        # infer device from layers if not yet tracked
+        if self._m_device is None and self.layers:
+            for layer in self.layers:
+                if hasattr(layer, "_device") and layer._device is not None:
+                    self._m_device = layer._device
+                    break
         if self._m_device is not None and t.device != self._m_device:
             t = t.to(self._m_device)
         return t

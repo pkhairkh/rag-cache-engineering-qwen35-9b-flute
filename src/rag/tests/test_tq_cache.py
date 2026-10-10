@@ -138,7 +138,7 @@ def test_layer_types_route_rejects_unknown_types():
 def test_conv_quantize_on_write_dequantize_on_read(seed):
     g = torch.Generator().manual_seed(seed)
     cache = TQCache(layer_types=["linear_attention"])
-    x = torch.randn(1, 32, 7, generator=g, dtype=torch.float16)  # prefill, T > k
+    x = torch.randn(1, 32, 7, generator=g, dtype=torch.float16).cuda()  # prefill, T > k
     full = cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
     layer = cache.layers[0]
 
@@ -164,7 +164,7 @@ def test_conv_quantize_on_write_dequantize_on_read(seed):
 def test_s_quantize_on_write_dequantize_on_read(seed):
     g = torch.Generator().manual_seed(seed)
     cache = TQCache(layer_types=["linear_attention"])
-    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16)
+    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).cuda()
     out = cache.update_recurrent_state(s, 0)
     layer = cache.layers[0]
 
@@ -192,8 +192,8 @@ def test_no_fp16_invariant():
     assert layer.conv_states[0] is None
     assert layer.recurrent_states[0] is None
 
-    x = torch.randn(*CONV_UNIT, generator=g, dtype=torch.float16)
-    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16)
+    x = torch.randn(*CONV_UNIT, generator=g, dtype=torch.float16).cuda()
+    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).cuda()
     cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
     cache.update_recurrent_state(s, 0)
 
@@ -229,8 +229,8 @@ def test_interception_counters():
     assert layer.conv_states[0] is None
     assert layer.reads == {"conv": 1, "s": 0}
 
-    x = torch.randn(*CONV_UNIT, generator=g, dtype=torch.float16)
-    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16)
+    x = torch.randn(*CONV_UNIT, generator=g, dtype=torch.float16).cuda()
+    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).cuda()
     cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
     cache.update_recurrent_state(s, 0)
     # writes bump only writes
@@ -258,8 +258,8 @@ def test_interception_counters():
 @pytest.mark.parametrize("seed", [400, 401, 402])
 def test_conv_windowing_differential_vs_real_layer(seed):
     g = torch.Generator().manual_seed(seed)
-    prefill = torch.randn(1, 32, 7, generator=g, dtype=torch.float16)  # T > k
-    token = torch.randn(1, 32, 1, generator=g, dtype=torch.float16)    # decode
+    prefill = torch.randn(1, 32, 7, generator=g, dtype=torch.float16).cuda()  # T > k
+    token = torch.randn(1, 32, 1, generator=g, dtype=torch.float16).cuda()    # decode
     real = LinearAttentionLayer()
     tql = TQLinearAttentionLayer()
 
@@ -296,8 +296,8 @@ def test_conv_windowing_differential_vs_real_layer(seed):
 
 def test_conv_windowing_pads_short_prefill_differentially():
     g = torch.Generator().manual_seed(500)
-    short = torch.randn(1, 32, 2, generator=g, dtype=torch.float16)   # T < k
-    token = torch.randn(1, 32, 1, generator=g, dtype=torch.float16)
+    short = torch.randn(1, 32, 2, generator=g, dtype=torch.float16).cuda()   # T < k
+    token = torch.randn(1, 32, 1, generator=g, dtype=torch.float16).cuda()
     real, tql = LinearAttentionLayer(), TQLinearAttentionLayer()
 
     # prefill shorter than the kernel: both left-pad with zeros to (B, D, k)
@@ -319,7 +319,7 @@ def test_inplace_mutation_capture(seed):
     g = torch.Generator().manual_seed(seed)
     cache = TQCache(layer_types=["linear_attention"])
     layer = cache.layers[0]
-    x = torch.randn(*CONV_UNIT, generator=g, dtype=torch.float16)
+    x = torch.randn(*CONV_UNIT, generator=g, dtype=torch.float16).cuda()
     cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
 
     state = layer.conv_states[0]              # the handed-out transient
@@ -333,7 +333,7 @@ def test_inplace_mutation_capture(seed):
     # norm and rescales the rotated lattice — adversarial by construction,
     # rel-MSE ~0.14, documented in the module docstring + worklog.)
     state.copy_(torch.roll(state, shifts=-1, dims=-1))
-    state[..., -1] = torch.randn(1, 32, generator=g, dtype=torch.float16)
+    state[..., -1] = torch.randn(1, 32, generator=g, dtype=torch.float16).cuda()
 
     # the NEXT read re-captures (requantizes) the mutated tensor
     recaptured = layer.conv_states[0]
@@ -359,11 +359,11 @@ def test_has_previous_state_flow():
     # an S-only write does NOT flip the gate: has_previous_state is the
     # conv-prefill gate (exactly the real LinearAttentionLayer's semantics)
     cache.update_recurrent_state(torch.randn(*S_UNIT, generator=g,
-                                             dtype=torch.float16), 0)
+                                             dtype=torch.float16).cuda(), 0)
     assert cache.has_previous_state(0) is False
 
     cache.update_conv_state(torch.randn(*CONV_UNIT, generator=g,
-                                        dtype=torch.float16), 0,
+                                        dtype=torch.float16).cuda(), 0,
                             conv_kernel_size=CONV_KERNEL)
     assert cache.has_previous_state(0) is True
     assert layer.has_previous_state[0] is True
@@ -378,8 +378,8 @@ def test_has_previous_state_flow():
 def test_m1_m2_roundtrip_and_d3_seeds(seed):
     g = torch.Generator().manual_seed(seed)
     cache = TQCache(layer_types=[])
-    m1 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16)
-    m2 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16)
+    m1 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16).cuda()
+    m2 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16).cuda()
 
     out1 = cache.update_m1(m1)
     out2 = cache.update_m2(m2)
@@ -411,9 +411,9 @@ def test_m1_m2_read_before_write_is_none():
 def test_m1_m2_code_install_setters():
     g = torch.Generator().manual_seed(604)
     src = TQCache(layer_types=[])
-    m1 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16)
+    m1 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16).cuda()
     src.update_m1(m1)
-    m2 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16)
+    m2 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16).cuda()
     src.update_m2(m2)
 
     dst = TQCache(layer_types=[])
@@ -424,7 +424,8 @@ def test_m1_m2_code_install_setters():
     # shape unknown to the fresh cache -> flat (d,) reads
     flat = dst.read_m1()
     assert tuple(flat.shape) == (D_UNIT,)
-    assert torch.equal(flat, src.read_m1().reshape(D_UNIT))  # same codes, same frame
+    src_m1 = src.read_m1().reshape(D_UNIT)
+    assert torch.equal(flat.cuda() if not flat.is_cuda else flat, src_m1.cuda() if not src_m1.is_cuda else src_m1)  # same codes, same frame
     assert dst.read_m2().shape == (D_UNIT,)
 
 
@@ -433,7 +434,7 @@ def test_code_injection_reshapes_to_layer_shape():
     g = torch.Generator().manual_seed(800)
     cache = TQCache(layer_types=["linear_attention"])
     layer = cache.layers[0]
-    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16)
+    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).cuda()
 
     # shape-initialize the LIVE layer without writing state: online
     # lazy_initialization captures shapes only — no fp16 ever allocated
@@ -462,7 +463,7 @@ def test_cache_code_views_and_setters():
     assert cache.s_codes == {0: None, 2: None}
     assert cache.conv_codes == {0: None, 2: None}
 
-    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16)
+    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).cuda()
     cache.update_recurrent_state(s, 0)
     assert cache.s_codes[0] is cache.layers[0].s_codes
     assert cache.s_codes[2] is None
@@ -473,7 +474,7 @@ def test_cache_code_views_and_setters():
     assert cache.s_codes[2] is s_codes
     assert cache.layers[2].s_codes is s_codes
 
-    x = torch.randn(*CONV_UNIT, generator=g, dtype=torch.float16)
+    x = torch.randn(*CONV_UNIT, generator=g, dtype=torch.float16).cuda()
     cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
     conv_codes = cache.conv_codes[0]
     cache.set_conv_codes(2, conv_codes)
@@ -495,8 +496,8 @@ def test_cache_code_views_and_setters():
 def _offline_cache(seed: int = 700):
     g = torch.Generator().manual_seed(seed)
     cache = TQCache(layer_types=["linear_attention"], online=False)
-    x = torch.randn(1, 32, 7, generator=g, dtype=torch.float16)  # prefill, T > k
-    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16)
+    x = torch.randn(1, 32, 7, generator=g, dtype=torch.float16).cuda()  # prefill, T > k
+    s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).cuda()
     full = cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
     out = cache.update_recurrent_state(s, 0)
     return cache, x, s, full, out
@@ -663,7 +664,7 @@ def test_nonpow2_conv_padding_contract(seed):
     g = torch.Generator().manual_seed(seed)
     cache = TQCache(layer_types=["linear_attention"])
     layer = cache.layers[0]
-    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16)
+    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16).cuda()
 
     full = cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
     assert tuple(full.shape) == CONV_NP2_UNIT          # prefill verbatim
@@ -690,7 +691,7 @@ def test_nonpow2_conv_padding_contract(seed):
     assert _rel_mse(w, x) < REL_MSE_GATE                # measured 0.015-0.017
 
     # decode: the (B, D, k+1) cat contract, quantized window round-trip
-    tok = torch.randn(1, 6144, 1, generator=g, dtype=torch.float16)
+    tok = torch.randn(1, 6144, 1, generator=g, dtype=torch.float16).cuda()
     d = cache.update_conv_state(tok, 0)
     assert tuple(d.shape) == (1, 6144, 5)
     w2 = layer.conv_states[0]
@@ -700,7 +701,7 @@ def test_nonpow2_conv_padding_contract(seed):
     # power-of-two geometry is UNCHANGED: pad == 0, the exact same codes
     # as the pre-padding behavior (bit-identity of the legacy path)
     g2 = torch.Generator().manual_seed(seed)
-    x2 = torch.randn(*CONV_UNIT, generator=g2, dtype=torch.float16)
+    x2 = torch.randn(*CONV_UNIT, generator=g2, dtype=torch.float16).cuda()
     layer2 = TQLinearAttentionLayer()
     layer2.update_conv_state(x2, 0, conv_kernel_size=CONV_KERNEL)
     assert layer2._conv_d == layer2._conv_numel == 128
@@ -718,7 +719,7 @@ def test_nonpow2_conv_mutation_capture():
     g = torch.Generator().manual_seed(710)
     cache = TQCache(layer_types=["linear_attention"])
     layer = cache.layers[0]
-    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16)
+    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16).cuda()
     cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
 
     state = layer.conv_states[0]                        # the handed-out transient
@@ -726,7 +727,7 @@ def test_nonpow2_conv_mutation_capture():
     codes_before = layer.conv_codes
 
     state.copy_(torch.roll(state, shifts=-1, dims=-1))
-    state[..., -1] = torch.randn(1, 6144, generator=g, dtype=torch.float16)
+    state[..., -1] = torch.randn(1, 6144, generator=g, dtype=torch.float16).cuda()
 
     recaptured = layer.conv_states[0]
     assert recaptured is not state                      # fresh transient
@@ -741,8 +742,8 @@ def test_nonpow2_conv_differential_vs_real_layer():
     # windowing shapes differential vs the REAL transformers layer at the
     # 6,144-channel geometry — identical (B, D, *) shapes at every step.
     g = torch.Generator().manual_seed(720)
-    prefill = torch.randn(1, 6144, 7, generator=g, dtype=torch.float16)
-    token = torch.randn(1, 6144, 1, generator=g, dtype=torch.float16)
+    prefill = torch.randn(1, 6144, 7, generator=g, dtype=torch.float16).cuda()
+    token = torch.randn(1, 6144, 1, generator=g, dtype=torch.float16).cuda()
     real, tql = LinearAttentionLayer(), TQLinearAttentionLayer()
 
     f_real = real.update_conv_state(prefill, 0, conv_kernel_size=CONV_KERNEL)
@@ -767,7 +768,7 @@ def test_nonpow2_conv_codes_setter_and_frame_guard():
     g = torch.Generator().manual_seed(730)
     cache = TQCache(layer_types=["linear_attention"])
     layer = cache.layers[0]
-    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16)
+    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16).cuda()
     cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
     good = layer.conv_codes                            # d=24576, seed 202
 
@@ -785,7 +786,7 @@ def test_nonpow2_conv_codes_setter_and_frame_guard():
     # frame/geometry drift: a 1,024-d unit (committed codebooks — no test
     # writes a new (b, d) combination) into the 24,576-d layer raises
     rogue = tq.TurboQuant(kind="custom", bits=3.5, d=1024, seed=202)
-    bad = rogue.quant(torch.randn(1024, generator=g))
+    bad = rogue.quant(torch.randn(1024, generator=g).cuda())
     with pytest.raises(ValueError, match="conv frame"):
         layer.conv_codes = bad
 
@@ -799,7 +800,7 @@ def test_conv_full_window_no_truncation_regression():
     g = torch.Generator().manual_seed(760)
     cache = TQCache(layer_types=["linear_attention"])
     layer = cache.layers[0]
-    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16)
+    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16).cuda()
     cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
 
     w = layer.conv_states[0]
@@ -819,7 +820,7 @@ def test_nonpow2_conv_offline_snapshot():
     # same canonical frame as the online regime.
     g = torch.Generator().manual_seed(740)
     layer = TQLinearAttentionLayer(online=False)
-    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16)
+    x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16).cuda()
     layer.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
 
     raw = dict.get(layer.conv_states, 0)              # offline: plain store

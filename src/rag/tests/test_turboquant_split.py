@@ -221,7 +221,7 @@ def test_layer_conv_split_readback_and_idempotency():
     cache = TQCache(layer_types=["linear_attention"], bits=BITS)
     layer = cache.layers[0]
     g = torch.Generator().manual_seed(SEED)
-    x = _channel_window(SEED + 1).reshape(1, N_CH, TAPS).half()
+    x = _channel_window(SEED + 1).reshape(1, N_CH, TAPS).half().cuda()
     cache.update_conv_state(x, 0, conv_kernel_size=TAPS)
     c = layer.conv_codes
     assert c.partition == "outlier" and c.group == TAPS
@@ -253,7 +253,7 @@ def test_install_carries_split_conv_verbatim(tmp_path):
     q_s = resolve_quantizer("S", 128, bits)
     q_c = resolve_quantizer("conv", D, bits, group=TAPS)
     g = torch.Generator().manual_seed(SEED + 2)
-    sys_s = {0: q_s.quant(torch.randn(128, generator=g) * 0.1)}
+    sys_s = {0: q_s.quant(torch.randn(128, generator=g).cuda() * 0.1)}
     sys_conv = {0: q_c.quant(_channel_window(SEED + 3))}
     system = SystemState(
         s_codes=sys_s, conv_codes=sys_conv, m1_codes=None, m2_codes=None,
@@ -261,7 +261,7 @@ def test_install_carries_split_conv_verbatim(tmp_path):
         s_shapes={0: (1, 128)}, conv_shapes={0: (1, N_CH, TAPS)},
         s_dtype="float16", conv_dtype="float16")
     chunk_conv = q_c.quant(_channel_window(SEED + 4))
-    chunk_s = q_s.quant(torch.randn(128, generator=g) * 0.3)
+    chunk_s = q_s.quant(torch.randn(128, generator=g).cuda() * 0.3)
     snap = ChunkSnapshot(
         chunk_id=0, s_codes={0: chunk_s}, conv_codes={0: chunk_conv},
         m1_codes=None, m2_codes=None, system_ref="w15")
@@ -281,7 +281,8 @@ def test_install_carries_split_conv_verbatim(tmp_path):
     assert tuple(w.shape) == (1, N_CH, TAPS)
     q_read = resolve_quantizer("conv", installed.d, bits,
                                group=installed.group or 1)
-    assert _rel_mse(w.float(), q_read.dequant(installed).float()) < 1e-6
+    dequant = q_read.dequant(installed).to(w.device)
+    assert _rel_mse(w.float(), dequant.float()) < 1e-6
 
 
 # ============================================ misc guards ===================

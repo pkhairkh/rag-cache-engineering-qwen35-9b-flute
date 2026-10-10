@@ -16,14 +16,13 @@ if _RAG not in sys.path:
 import _paths  # noqa: E402,F401  (anchors src/rag, src/scripts, src/flute_extended)
 
 import pytest  # noqa: E402
+import torch  # noqa: E402
 
 
 @pytest.fixture(scope="session")
 def rng():
     """A deterministic torch RNG shared across the session (seed pinned)."""
-    import torch
-
-    return torch.Generator().manual_seed(20261009)
+    return torch.Generator().manual_seed(20261010)
 
 
 @pytest.fixture()
@@ -31,8 +30,6 @@ def unit_vector_factory():
     """Factory: deterministic random unit vectors of a requested dim."""
 
     def make(d: int, count: int = 1, gen=None):
-        import torch
-
         g = gen
         if g is None:
             g = torch.Generator().manual_seed(1234 + d)

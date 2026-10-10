@@ -198,7 +198,7 @@ def test_qjl_flag_parity_and_backward_compat():
     Alg. 2, never makes round-trip MSE meaningfully worse; serialization
     is backward compatible (old arrays -> fields None)."""
     g = torch.Generator().manual_seed(20261009)
-    x = torch.randn(256, generator=g)
+    x = torch.randn(256, generator=g).cuda()
     x = (x / x.norm()).float()
 
     # (a) flag OFF: identical idx streams + fp32 norm bits + dequant,
@@ -248,7 +248,7 @@ def test_qjl_flag_parity_and_backward_compat():
     gg = torch.Generator().manual_seed(5)
     worst, ratios = 0.0, []
     for _ in range(16):
-        v = torch.randn(256, generator=gg)
+        v = torch.randn(256, generator=gg).cuda()
         v = v / v.norm()
         m_off = float(((v - q_off.roundtrip(v)) ** 2).sum())
         m_on = float(((v - q_on.dequant(q_on.quant(v))) ** 2).sum())
@@ -296,8 +296,8 @@ def test_snapshot_use_mmap_parity_and_qjl_codes(tmp_path):
     qc = TurboQuant(kind="custom", bits=3.5, d=CONV_D, seed=CONV_SEED)
     qm = TurboQuant(kind="custom", bits=3.5, d=M_D, seed=M1_SEED, qjl=True)
     g = torch.Generator().manual_seed(9)
-    vs, vs2 = torch.randn(S_D, generator=g), torch.randn(S_D, generator=g)
-    vc, vm = torch.randn(CONV_D, generator=g), torch.randn(M_D, generator=g)
+    vs, vs2 = torch.randn(S_D, generator=g).cuda(), torch.randn(S_D, generator=g).cuda()
+    vc, vm = torch.randn(CONV_D, generator=g).cuda(), torch.randn(M_D, generator=g).cuda()
 
     snap = ChunkSnapshot(
         chunk_id=3, protocol="delta-v1",
@@ -382,12 +382,12 @@ def _drive_cache(cache: TQCache) -> list:
     g = torch.Generator().manual_seed(777)
     outs = []
     for layer in (0, 2):
-        s = torch.randn(_S_SHAPE, generator=g).half()
+        s = torch.randn(_S_SHAPE, generator=g).cuda().half().cuda()
         outs.append(cache.update_recurrent_state(s, layer))
-        c = torch.randn(1, 32, 3, generator=g).half()
+        c = torch.randn(1, 32, 3, generator=g).cuda().half().cuda()
         outs.append(cache.update_conv_state(c, layer, conv_kernel_size=4))
-    outs.append(cache.update_m1(torch.randn(_M_SHAPE, generator=g).half()))
-    outs.append(cache.update_m2(torch.randn(_M_SHAPE, generator=g).half()))
+    outs.append(cache.update_m1(torch.randn(_M_SHAPE, generator=g).cuda().half().cuda()))
+    outs.append(cache.update_m2(torch.randn(_M_SHAPE, generator=g).cuda().half().cuda()))
     outs.append(cache.layers[0].recurrent_states[0])   # dequantized read
     outs.append(cache.layers[2].conv_states[0])
     outs.append(cache.read_m1())

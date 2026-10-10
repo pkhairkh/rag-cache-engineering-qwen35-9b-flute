@@ -150,6 +150,9 @@ class M1M2(nn.Module):
             raise TypeError(
                 f"M1M2.init_state: dtype must be a floating torch dtype, "
                 f"got {dtype!r}")
+        # Infer device from module parameters if not specified
+        if device is None:
+            device = self.write_gate_k.device
         return torch.zeros(self.state_shape(), dtype=dtype, device=device)
 
     def extra_repr(self) -> str:

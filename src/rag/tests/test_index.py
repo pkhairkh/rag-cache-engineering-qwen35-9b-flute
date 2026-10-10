@@ -134,24 +134,26 @@ class StubModel:
         n_tok = int(input_ids.shape[-1])
         for L in self.linears:
             cur = past_key_values.layers[L].recurrent_states[0]
-            cur = torch.zeros(S_D) if cur is None else cur.reshape(-1).float()
+            cur = torch.zeros(S_D, device='cuda') if cur is None else cur.reshape(-1).float().cuda()
             g = torch.Generator().manual_seed(1_000_003 * L + kh)
-            new = cur + self.s_noise * torch.randn(S_D, generator=g)
+            new = cur + self.s_noise * torch.randn(S_D, generator=g).cuda()
             past_key_values.update_recurrent_state(
-                new.reshape(S_SHAPE).half(), L)
+                new.reshape(S_SHAPE).half().cuda(), L)
             g = torch.Generator().manual_seed(1_000_003 * L + 17 * kh)
-            conv_in = torch.randn(1, CONV_D, n_tok, generator=g)
+            conv_in = torch.randn(1, CONV_D, n_tok, generator=g).cuda()
             past_key_values.update_conv_state(
-                conv_in.half(), L, conv_kernel_size=KERNEL)
+                conv_in.half().cuda(), L, conv_kernel_size=KERNEL)
         for which, noise, m_shape in (("m1", self.m1_noise, M_SHAPE),
                                       ("m2", self.m2_noise, M_SHAPE)):
             cur = getattr(past_key_values, f"read_{which}")()
             if cur is None:
-                cur = torch.zeros(*m_shape, dtype=torch.float16)
+                cur = torch.zeros(*m_shape, dtype=torch.float16, device='cuda')
+            else:
+                cur = cur.cuda() if not cur.is_cuda else cur
             g = torch.Generator().manual_seed(9001 + kh if which == "m1"
                                               else 9002 + kh)
-            new = cur + noise * torch.randn(*m_shape, generator=g)
-            getattr(past_key_values, f"update_{which}")(new.half())
+            new = cur + noise * torch.randn(*m_shape, generator=g).cuda()
+            getattr(past_key_values, f"update_{which}")(new.half().cuda())
         return None
 
 

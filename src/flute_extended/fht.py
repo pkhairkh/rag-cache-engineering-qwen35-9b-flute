@@ -148,20 +148,23 @@ def hadamard_matrix(K: int) -> torch.Tensor:
     return H
 
 
-def build_rotation_matrix(K: int, seed: int) -> torch.Tensor:
+def build_rotation_matrix(K: int, seed: int, device=None) -> torch.Tensor:
     """The explicit (K, K) T (block-diagonal over `segments(K)`).
 
     Ground truth for the differential tests and the "matmul" fallback
     backend. Byte-semantics identical to palettize's `_rot_matrix`.
+    
+    device: optional torch device (None = CPU, for backward compat).
     """
     K = int(K)
     s = rotation_signs(K, seed)
     if K >= 1 and (K & (K - 1)) == 0:
-        return hadamard_matrix(K) * s.view(1, K) / math.sqrt(K)
+        T = hadamard_matrix(K) * s.view(1, K) / math.sqrt(K)
+        return T.to(device) if device is not None else T
     T = torch.zeros(K, K, dtype=torch.float32)
     for off, b in segments(K):
         T[off:off + b, off:off + b] = (hadamard_matrix(b) * s[off:off + b].view(1, b) / math.sqrt(b))
-    return T
+    return T.to(device) if device is not None else T
 
 
 # ---------------------------------------------------------------------------

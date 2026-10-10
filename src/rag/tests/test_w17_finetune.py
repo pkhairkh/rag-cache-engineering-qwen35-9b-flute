@@ -45,7 +45,7 @@ def _cfg(use_m1m2=True):
 @pytest.fixture(scope="module")
 def model():
     torch.manual_seed(21)
-    m = modeling.Qwen3_5TextModel(_cfg()).eval()
+    m = modeling.Qwen3_5TextModel(_cfg()).eval().cuda()
     with torch.no_grad():
         m.m1m2.write_gate_k.fill_(0.5)
         m.m1m2.write_gate_v.fill_(0.5)
@@ -54,7 +54,7 @@ def model():
 
 def _ids(n, seed):
     g = torch.Generator().manual_seed(seed)
-    return torch.randint(0, 128, (1, n), generator=g)
+    return torch.randint(0, 128, (1, n), generator=g).cuda()
 
 
 def _system(model):
@@ -154,9 +154,9 @@ def test_w17f_4_infonce_math():
     """Identical positive pairs score lower loss than orthogonal ones;
     the loss is finite and the diagonal is the target."""
     g = torch.Generator().manual_seed(9)
-    base = torch.randn(4, H, MEM, D, generator=g)
-    same_b = base + 0.01 * torch.randn(4, H, MEM, D, generator=g)
-    ortho_b = torch.randn(4, H, MEM, D, generator=g)
+    base = torch.randn(4, H, MEM, D, generator=g).cuda()
+    same_b = base + 0.01 * torch.randn(4, H, MEM, D, generator=g).cuda()
+    ortho_b = torch.randn(4, H, MEM, D, generator=g).cuda()
     with torch.no_grad():
         l_same = ft.infonce_pairs_loss(base, base, same_b, same_b,
                                        tau=0.07)
@@ -191,7 +191,7 @@ def test_w17f_5_training_reduces_the_objective(model):
     g = torch.Generator().manual_seed(33)
     pairs = []
     for i in range(4):
-        base = torch.randint(0, 128, (1, 12), generator=g)
+        base = torch.randint(0, 128, (1, 12), generator=g).cuda()
         pert = base.clone()
         for j in range(6):  # replace half: cos(pos) starts mid-range
             pert[0, j * 2] = int(torch.randint(0, 128, (1,), generator=g))
@@ -282,14 +282,14 @@ def test_w17f_7_gates_artifact_roundtrip(model, tmp_path):
     assert path.endswith(".npz")
 
     fresh = M1M2(num_heads=H, head_dim=D, mem_size=MEM,
-                 num_linear_layers=2)
+                 num_linear_layers=2).cuda()
     meta = ft.load_gates(fresh, path)
     assert meta["pairs_file"] == "pytest"
     for k, w in want.items():
         assert torch.equal(getattr(fresh, k).detach(), w)
 
     other = M1M2(num_heads=H, head_dim=D, mem_size=MEM * 2,
-                 num_linear_layers=2)
+                 num_linear_layers=2).cuda()
     with pytest.raises(ValueError, match="mem_size"):
         ft.load_gates(other, path)
     with pytest.raises(ValueError, match="not found"):
@@ -320,12 +320,12 @@ def test_w17f_9_module_vs_codes_geometry_loud(model):
     from ingest import reseed_cache
     system = _system(model)
     big = M1M2(num_heads=H, head_dim=D, mem_size=MEM * 2,
-               num_linear_layers=2)
+               num_linear_layers=2).cuda()
     cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
     with torch.no_grad():
         big.write_gate_k.fill_(0.5)
         m1, m2 = big.write(
-            torch.randn(1, H, 8, D), torch.randn(1, H, 8, D),
+            torch.randn(1, H, 8, D).cuda(), torch.randn(1, H, 8, D).cuda(),
             big.init_state(dtype=torch.float32),
             big.init_state(dtype=torch.float32), 0)
     cache.update_m1(m1)

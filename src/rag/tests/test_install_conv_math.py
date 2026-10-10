@@ -77,7 +77,7 @@ def _rel_mse(a, b) -> float:
 
 def _tokens(n: int, seed: int) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
-    return torch.randint(0, VOCAB, (B, n), generator=g)
+    return torch.randint(0, VOCAB, (B, n), generator=g).cuda()
 
 
 def _config() -> Qwen3_5Config:
@@ -105,7 +105,7 @@ class _ResidualGDNStack(torch.nn.Module):
         for m in self.modules():
             for p in m.parameters():
                 if p.dim() > 1:
-                    p.data = torch.randn(p.shape, generator=g) * 0.1
+                    p.data = torch.randn(p.shape, generator=g).cuda() * 0.1
                 else:
                     p.data.fill_(1.0)
         for lyr in self.gdn:

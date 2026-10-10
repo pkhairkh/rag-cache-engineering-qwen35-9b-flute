@@ -74,7 +74,7 @@ FHT_SEEDS = (7, 42)               # the brief's rotation-binding seeds
 def _unit_vectors(d: int, n: int, seed: int) -> torch.Tensor:
     """n deterministic random unit vectors, shape (n, d), fp32."""
     g = torch.Generator().manual_seed(seed)
-    x = torch.randn(n, d, generator=g, dtype=torch.float32)
+    x = torch.randn(n, d, generator=g, dtype=torch.float32).cuda()
     return x / x.norm(dim=-1, keepdim=True)
 
 
@@ -91,8 +91,8 @@ def test_fht_binding_matches_rotation_matrix(seed):
     assert torch.equal(q._signs, fht.rotation_signs(D, seed))
 
     g = torch.Generator().manual_seed(seed)
-    x = torch.randn(8, D, generator=g, dtype=torch.float32)
-    T = fht.build_rotation_matrix(D, seed)          # the explicit (D, D) truth
+    x = torch.randn(8, D, generator=g, dtype=torch.float32).cuda()
+    T = fht.build_rotation_matrix(D, seed, device=x.device)  # explicit (D, D) truth on same device
 
     y = fht.fht_apply(x, q._signs)                  # y = x @ T
     assert (y - x @ T).abs().max().item() < 1e-4
@@ -242,7 +242,7 @@ def test_full_chunk_size_gate():
         q = quants[kind]
         kind_total = 0
         for _ in range(count):
-            v = torch.randn(q.d, generator=g, dtype=torch.float32)
+            v = torch.randn(q.d, generator=g, dtype=torch.float32).cuda()
             v = v / v.norm()
             kind_total += q.quant(v).nbytes()       # quantize each unit once
         per_unit[kind] = kind_total // count
@@ -315,12 +315,12 @@ def test_fp16_dtype_roundtrip():
     x32 = _unit_vectors(D, 1, seed=77)[0]
     x16 = x32.to(torch.float16)
 
-    out16 = q.dequant(q.quant(x16), dtype=torch.float16)
+    out16 = q.dequant(q.quant(x16), dtype=torch.float16).to(x16.device)
     assert out16.dtype == torch.float16
     assert out16.shape == (D,)
 
     mse16 = ((x16.float() - out16.float()) ** 2).sum().item()
-    out32 = q.dequant(q.quant(x32))
+    out32 = q.dequant(q.quant(x32)).to(x32.device)
     mse32 = ((x32 - out32) ** 2).sum().item()
     assert mse32 > 0.0
     # fp16 rounding on top of quantization noise: at most a 15% penalty

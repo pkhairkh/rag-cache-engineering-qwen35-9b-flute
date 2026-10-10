@@ -760,7 +760,9 @@ class TurboQuant:
 
     # round-trip helper (evals/Phase-1 measurement harness)
     def roundtrip(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dequant(self.quant(x), dtype=x.dtype)
+        # Preserve device: dequant returns CPU tensors (codebook path is numpy/CPU)
+        out = self.dequant(self.quant(x), dtype=x.dtype)
+        return out.to(x.device) if out.device != x.device else out
 
     # ------------------------------------------------------------ plumbing -
     def _check_codes(self, codes: TQCodes) -> None:
