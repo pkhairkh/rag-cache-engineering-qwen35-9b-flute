@@ -1109,7 +1109,19 @@ record.
 COMMIT: "W20.8.1 — tq_dequant_batched (bfe + smem LUT + adjoint)"
 
 #### W20.8.2 — the kernel-first dispatcher (PROPOSAL §3.7)
-- [ ] done
+- [x] done
+The REV-3 routing table (evaluated in order): CPU input → torch
+always; kernel pair absent → torch (performance fallback, never
+correctness); ineligible → torch (the W15 outlier split, d≤16,384/
+non-pow2/%32, n_lo%16, bits∉{3,4}, qjl-ON this wave, non-fp32/fp16
+dequant dtypes); CUDA + present + eligible → KERNEL, ALWAYS. The
+probe delegates to fht._load_kernel (one extension, one loader) +
+the TQ-name hasattr check. Signs mirrored per instance/device (the
+_dev_signs idiom); boundaries/centroids passed UNSCALED (the kernel
+applies the identity). Mixed-device inputs raise an explicit
+RuntimeError naming both devices. NOTE: the binding's actual
+signature carries `d` (bindings.cpp:125) — the ledger sketch omitted
+it; the code is authority.
 ROLE task-writer · READ `turboquant.py` (quant/dequant +
 _route_for), `fht.py:314-430` (the auto-backend precedent) · WRITE
 `src/rag/turboquant.py`
