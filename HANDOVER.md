@@ -525,6 +525,32 @@ GREEN; the box's reports are the only verdicts there are.
 | W20.11 | K5 COMPLETE: refresh 8 first-class + loader pinning; 9/9 gates authored | `scripts/gpu/finetune_m1m2.py` (`--refresh-every 8`), the pinned capture loader (`m1m2_finetune.py`) |
 | W20.12 | closure — this summary + the final all-DoD audit + the tag | this section, the SPECIFICATION addendum, `w20_static_audit.py --all`, tag `w20-complete` |
 
+### W20.9.5 — box-side fix: the QJL constants (build at ≥ this commit)
+
+The A10G box's first build attempt (nvcc 13.2, `--use_fast_math`)
+failed at `kernel_tq.cu`'s QJL constants, and the handover's theory
+— "compile-time FP evaluation under fast math" — was wrong. The
+hexfloat literals were mis-authored (the mantissa integer pasted
+after `0x1.`: `0x1.206C99p+0` is 1.1266…, `0x1.3504F3p+0` is
+1.2071…, neither its sqrt), and the bracket `static_assert`s
+correctly refused the wrong values — a false static_assert condition
+is ill-formed, which WAS the compile error. The asserts were the
+alarm, not the fire. The fix: the constants are now IEEE-754
+**integer bit patterns** (`0x3FA06C99` / `0x3FB504F3`), the brackets
+are integer comparisons (positive floats order as their bits), and a
+`__host__ __device__` bit-cast (`__uint_as_float` on device — a
+register reinterpretation folded into the consumer's immediate, zero
+PTX of its own; memcpy on host) serves both code paths. Zero
+compile-time FP evaluation remains in the TU; the runtime bits equal
+the twin's `fl32(sqrt(pi/2))` / `fl32(sqrt(2))` exactly. Riding the
+same commit: the two `scripts/gpu/*.sh` exec bits recorded in git,
+and the `w20-baseline` tag (never pushed by W20.1) recreated at
+e9ea357 and pushed — a fresh clone's `auditor --all` now runs
+13/13. **The box operator: `git pull --ff-only origin main` (≥
+W20.9.5) before `bash scripts/gpu/w20_provision.sh` — the failed
+build resolves exactly there; `rm -rf build` stays as the handover
+prescribed.**
+
 ### The GPU-box confirmation sequence
 
 `env/W20_GPU_PROTOCOL.md` is the operator's whole job, five steps in

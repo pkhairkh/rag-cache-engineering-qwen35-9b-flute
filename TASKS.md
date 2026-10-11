@@ -1254,6 +1254,49 @@ attestation.
 COMMIT: "W20.9.4 — wave W20.9 closed: the QJL chain + l2norm
 authored"
 
+#### W20.9.5 — box-side fix: the QJL constants' bit-exact rewrite (post-close)
+- [x] done
+The A10G box's first nvcc 13.2 build (rm -rf build; MAX_JOBS=8
+build_ext) failed at the QJL constants, and the handover blamed
+"--use_fast_math compile-time FP evaluation" — wrong. W20.9.1's
+hexfloat literals were mis-authored: the mantissa INTEGER was pasted
+after "0x1." as if it were the fraction (hex digits after the point
+carry the fraction x 2^24 = the mantissa left-shifted by one), so
+0x1.206C99p+0 is 1.1266... and 0x1.3504F3p+0 is 1.2071... — neither
+its sqrt — and the bracket static_asserts correctly REFUSED them: a
+static_assert on a false condition is ill-formed. The asserts were
+the alarm, not the fire; deleting them to "fix the compile" would
+have run the chain at silently wrong constants (1.1266 in QJL_C's
+seat, 1.2071 in sqrt(2)'s) — the numerical-catastrophe path the
+asserts exist to bar. THE FIX (kernel_tq.cu, the constants block):
+the two constants become IEEE-754 integer bit patterns (kTqQjlCBits
+= 0x3FA06C99u = fl32(sqrt(pi/2)), kTqQjlSqrt2Bits = 0x3FB504F3u =
+fl32(sqrt(2)) — both verified by pure-Python struct round-trip, no
+repo import); the brackets become INTEGER comparisons (positive
+IEEE floats order exactly as their bits: fl32(1.2533) = 0x3FA06C22,
+fl32(1.2534) = 0x3FA06F69, fl32(1.4142) = 0x3FB50481, fl32(1.4143)
+= 0x3FB507C8); a __host__ __device__ tq_qjl_bits_as_float serves
+both code paths (device: __uint_as_float — a register
+reinterpretation, no PTX instruction, folds into the consumer's
+immediate; PTX itself spells fp32 constants as their bits; host: the
+memcpy idiom, strict-aliasing-safe, folded to a register move). ZERO
+compile-time floating-point evaluation remains in the TU — immune to
+any fast-math/constexpr-folding behavior in either nvcc pass — and
+the runtime bits are IDENTICAL to the twin's fl32 constants by
+construction. Riding the same commit (the re-audit's push-
+completeness repairs, all box-facing): (a) w20_provision.sh and
+w20_build_variants.sh exec bits recorded in git (100644 → 100755 —
+a fresh clone could not execute them); (b) the w20-baseline tag
+recreated at e9ea357 and PUSHED (the W20.1 original was local-only
+on the authoring box and never reached origin — a fresh clone's
+auditor --all failed 3/13 before these repairs; 13/13 after). DO-D:
+auditor --all exit 0 on the fixed tree; the W20.9 checks (tq_qjl
+greps, the absent check, the ledger, the git facts) stay green;
+python3 struct-verified bit patterns; no test executed, no CPU test
+authored, no repo module imported (the GPU-ONLY law, unchanged).
+COMMIT: "W20.9.5 — the QJL constants' bit-exact fix (box-side:
+hexfloat authoring bug)"
+
 ---
 
 ## WAVE W20.10 — the serving-side batched passes (K4 end)

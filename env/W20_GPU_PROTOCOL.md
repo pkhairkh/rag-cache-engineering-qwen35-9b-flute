@@ -12,6 +12,15 @@ project's only source of behavioral evidence.
 
 ## Step 1 — Provision the box
 
+> **Build at >= W20.9.5** — the QJL constants' bit-exact fix. The first
+> box build attempt (nvcc 13.2) failed on W20.9.1's mis-authored
+> hexfloat constants (the static_asserts correctly refused 1.1266 /
+> 1.2071 sitting in sqrt(pi/2)'s and sqrt(2)'s seats); W20.9.5 pins
+> the constants as integer bit patterns with zero compile-time FP
+> evaluation. If your clone predates it: `git pull --ff-only origin
+> main` FIRST, then `rm -rf build` and rebuild as below. Details:
+> HANDOVER.md's W20.9.5 note.
+
 ```bash
 bash scripts/gpu/w20_provision.sh
 ```

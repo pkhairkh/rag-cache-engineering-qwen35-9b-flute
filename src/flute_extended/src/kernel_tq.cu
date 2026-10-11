@@ -133,6 +133,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 
 #include "flute/fht.cuh"        // fht_block -- kernel_fht.cu's butterfly
@@ -3656,57 +3657,122 @@ torch::Tensor tq_dequant_batched(
 // -- compile and behavioral verification defer to the A10G box (the
 // W20.5.4 TU registration carries this file; W20.9.3's suite and the
 // G20.P3 qjl leg run there). Authored statically, re-read for review;
-// every defect found here is a box-side discovery.
+// every defect found here is a box-side discovery. The first box build
+// DID find one: W20.9.1's hexfloat constants were mis-authored (the
+// mantissa-integer paste -- the constants block's W20.9.5 note tells
+// the whole story); W20.9.5 is the bit-exact fix, and the box builds
+// at >= that commit.
 // ===========================================================================
 
 namespace {
 
 // ---------------------------------------------------------------------------
-// The two pinned fp32 constants. Both are hand-derived hexfloat literals
-// (exact by construction -- a hexfloat IS the bits); each derivation is
-// written out to be re-checked, and a static_assert brackets the value
-// against its decimal form.
-// ---------------------------------------------------------------------------
-// kTqQjlC = fl32(sqrt(pi/2)) = fl32(turboquant.py:268's QJL_C =
+// The two pinned fp32 constants, as INTEGER BIT PATTERNS (W20.9.5 -- the
+// first A10G build's box-side fix). W20.9.1 authored them as hand-written
+// hexfloat literals, and the hand-authoring was WRONG: the mantissa
+// INTEGER was pasted after "0x1." as if it were the fraction (hex digits
+// after the point carry the fraction x 2^24, i.e. the mantissa LEFT-
+// SHIFTED BY ONE) -- 0x1.206C99p+0 is 1.1266... and 0x1.3504F3p+0 is
+// 1.2071..., neither its sqrt -- so the bracket static_asserts below
+// (correctly!) fired and nvcc refused the TU: a static_assert on a false
+// condition is ill-formed, full stop. The handover's "nvcc 13.2 /
+// --use_fast_math compile-time FP evaluation" theory is exonerated: the
+// asserts were the alarm, not the fire -- and had they been deleted to
+// "fix the compile", the chain would have run at silently wrong
+// constants instead (1.1266 in QJL_C's seat, 1.2071 in sqrt(2)'s).
+// THE FIX: pin the IEEE-754 bits directly as unsigned integers -- a hex
+// integer IS the bits, and NO floating-point constant expression exists
+// anywhere for the front end to evaluate (immune to every fast-math /
+// constexpr-folding behavior, host pass and device pass alike) -- then
+// reinterpret them at the use sites (tq_qjl_bits_as_float, below).
+//
+// kTqQjlCBits = fl32(sqrt(pi/2)) = fl32(turboquant.py:268's QJL_C =
 // math.sqrt(math.pi / 2.0) = 1.253314137315500...): the fp64 root's
 // fraction 0.2533141373155 x 2^23 = 2124952.998..., so the fp32
-// mantissa rounds to 2124953 = 0x206C99. This is the value a wrapped
-// Python scalar takes when torch casts it to the fp32 tensor's dtype
-// before QJL_C * gamma (turboquant.py:1193's first op).
-constexpr float kTqQjlC = 0x1.206C99p+0f;
+// mantissa rounds to 2124953 = 0x206C99; exponent 127 (the value lives
+// in [1, 2)) -> bits 0x3F800000 | 0x206C99 = 0x3FA06C99. This is the
+// value a wrapped Python scalar takes when torch casts it to the fp32
+// tensor's dtype before QJL_C * gamma (turboquant.py:1193's first op).
+//
+// kTqQjlSqrt2Bits = fl32(sqrt(2)) (the odd-exponent powers of two's root
+// factor): the fp64 root 1.4142135623730951 sits 2.4e-8 above
+// fl32(sqrt(2)) = 0x3FB504F3 and 9.5e-8 below the next representable --
+// the double-rounding gap is EMPTY, the narrowed value unique (the
+// derivation tq_qjl_sqrt_pow2 relies on, below). Mantissa 0x3504F3,
+// exponent 127.
+//
+// The brackets stay, as INTEGER comparisons: positive IEEE floats order
+// exactly as their bit patterns (same sign, no NaNs in this domain), so
+// 0x3FA06C22 < kTqQjlCBits < 0x3FA06F69 says precisely what
+// 1.2533f < fl32(sqrt(pi/2)) < 1.2534f said -- fl32(1.2533) =
+// 0x3FA06C22, fl32(1.2534) = 0x3FA06F69, fl32(1.4142) = 0x3FB50481,
+// fl32(1.4143) = 0x3FB507C8 -- with ZERO compile-time FP evaluation.
+// ---------------------------------------------------------------------------
+constexpr unsigned int kTqQjlCBits     = 0x3FA06C99u;  // fl32(sqrt(pi/2))
+constexpr unsigned int kTqQjlSqrt2Bits = 0x3FB504F3u;  // fl32(sqrt(2))
 
-// kTqQjlSqrt2 = fl32(sqrt(2)) (the odd-exponent powers of two's root
-// factor): 0x1.3504F3p+0f == fl32(sqrt(2)) == fl32(fl64(sqrt(2))) --
-// the fp64 root 1.4142135623730951 sits 2.4e-8 above this fp32 and
-// 9.5e-8 below the next, so the double-rounding gap is EMPTY and the
-// narrowed value is unique (the derivation in tq_qjl_sqrt_pow2).
-constexpr float kTqQjlSqrt2 = 0x1.3504F3p+0f;
-
-static_assert(kTqQjlC > 1.2533f && kTqQjlC < 1.2534f,
+static_assert(kTqQjlCBits > 0x3FA06C22u && kTqQjlCBits < 0x3FA06F69u,
               "fl32(sqrt(pi/2)) is 1.2533141... (turboquant.py:268)");
-static_assert(kTqQjlSqrt2 > 1.4142f && kTqQjlSqrt2 < 1.4143f,
+static_assert(kTqQjlSqrt2Bits > 0x3FB50481u &&
+                  kTqQjlSqrt2Bits < 0x3FB507C8u,
               "fl32(sqrt(2)) is 1.4142135...");
+static_assert((kTqQjlCBits >> 23) == 0x7Fu &&
+                  (kTqQjlCBits & 0x7FFFFFu) == 0x206C99u,
+              "kTqQjlC: exponent 127, mantissa 2124953 (the derivation)");
+static_assert((kTqQjlSqrt2Bits >> 23) == 0x7Fu &&
+                  (kTqQjlSqrt2Bits & 0x7FFFFFu) == 0x3504F3u,
+              "kTqQjlSqrt2: exponent 127, fl32(sqrt(2))'s mantissa");
+
+// ---------------------------------------------------------------------------
+// tq_qjl_bits_as_float -- the integer -> fp32 bit reinterpretation, host
+// AND device. THE PTX FACTS (the research W20.9.5 owes): __uint_as_float
+// is one of CUDA's floating-point MANIPULATION intrinsics -- not
+// arithmetic, a REGISTER REINTERPRETATION. It emits no PTX instruction of
+// its own (ptxas allocates straight through it), and with a constant
+// argument the front end folds it away: PTX itself spells fp32
+// immediates as their bits ("0f3FA06C99"), so the constant rides the
+// consumer's immediate operand or one MOV32I on sm_86 -- machine-
+// identical to what a correct float literal would have produced. The
+// Programming Guide pins the manipulation family as callable from host
+// AND device code; the #ifdef belt below keeps that true for every
+// toolkit: the device leg calls the intrinsic, the host leg is the
+// memcpy idiom (strict-aliasing-safe; gcc/clang fold it to a register
+// move at -O1+). No arithmetic, no library call, no compile-time FP
+// evaluation anywhere in the path -- --use_fast_math or not, the bits
+// are the value.
+// ---------------------------------------------------------------------------
+__host__ __device__ inline float tq_qjl_bits_as_float(unsigned int bits) {
+#ifdef __CUDA_ARCH__
+    return __uint_as_float(bits);
+#else
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+#endif
+}
 
 // ---------------------------------------------------------------------------
 // tq_qjl_sqrt_pow2 -- sqrt(K) as fl32 for the chain's power-of-two K,
 // WITHOUT any library call: K = 2^(2m) -> 2^m, EXACT; K = 2^(2m+1) ->
-// 2^m * kTqQjlSqrt2, the ONE rounded constant. This IS fl32(sqrt(K))
-// for every power of two -- what torch's wrapped-scalar cast produces
-// from the twin's math.sqrt(self.d) divisor (turboquant.py:1193): the
-// fp64 root of 2^(2m) is exact, and the fp64 root of 2^(2m+1) is
-// 2^m * fl64(sqrt(2)) (exact scaling) which narrows to 2^m *
-// kTqQjlSqrt2 (power-of-two scaling commutes with rounding -- and the
-// sqrt(2) double-rounding gap is empty, above). m <= 15 over the
-// checked envelope (K a power of two <= 2^30), so 1 << m is an exact
-// int and the int->float cast is exact. Pure exponent arithmetic: the
-// build's --use_fast_math never reaches this C++, and the value is a
-// pure function of K's exponent -- deterministic by construction.
+// 2^m * fl32(sqrt(2)) -- tq_qjl_bits_as_float(kTqQjlSqrt2Bits), the ONE
+// rounded constant. This IS fl32(sqrt(K)) for every power of two --
+// what torch's wrapped-scalar cast produces from the twin's
+// math.sqrt(self.d) divisor (turboquant.py:1193): the fp64 root of
+// 2^(2m) is exact, and the fp64 root of 2^(2m+1) is 2^m * fl64(sqrt(2))
+// (exact scaling) which narrows to 2^m * fl32(sqrt(2)) (power-of-two
+// scaling commutes with rounding -- and the sqrt(2) double-rounding gap
+// is empty, above). m <= 15 over the checked envelope (K a power of two
+// <= 2^30), so 1 << m is an exact int and the int->float cast is exact.
+// Pure exponent arithmetic: the build's --use_fast_math never reaches
+// this host C++, and the value is a pure function of K's exponent --
+// deterministic by construction.
 // ---------------------------------------------------------------------------
 float tq_qjl_sqrt_pow2(int K) {
     const int e = flute::fht_large_log2_floor(K);  // K == 2^e (entry-checked)
     const int m = e >> 1;
     const float base = static_cast<float>(1 << m);  // exact (m <= 15)
-    return (e & 1) ? base * kTqQjlSqrt2 : base;
+    return (e & 1) ? base * tq_qjl_bits_as_float(kTqQjlSqrt2Bits)
+                   : base;
 }
 
 // ---------------------------------------------------------------------------
@@ -3812,8 +3878,12 @@ tq_qjl_compensate_kernel(
     for (int64_t j = tid; j < n; j += stride) {
         const int row = static_cast<int>(j >> row_shift);
         // c_m = (QJL_C * gamma[m]) / sqrt(K): mul.rn then div.rn, the
-        // twin's wrapped-scalar chain (turboquant.py:1193).
-        const float c = __fdiv_rn(__fmul_rn(kTqQjlC, gamma[row]), sqrt_k);
+        // twin's wrapped-scalar chain (turboquant.py:1193); QJL_C is the
+        // bit-pinned constant (W20.9.5 -- folds to the same immediate).
+        const float c =
+            __fdiv_rn(__fmul_rn(tq_qjl_bits_as_float(kTqQjlCBits),
+                                gamma[row]),
+                      sqrt_k);
         // out = g + (c * z): mul.rn then add.rn, same op order.
         out[j] = __fadd_rn(g[j], __fmul_rn(c, z[j]));
     }
