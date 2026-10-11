@@ -920,7 +920,7 @@ COMMIT: "W20.6.2 — canary/trap variants (poison + wrong-fold negative
 control)"
 
 #### W20.6.3 — test_w20_fht_large.py (CUDA-gated)
-- [ ] done
+- [x] done
 ROLE task-writer · READ `_gpu_guard.py`, the fixtures manifest,
 `kernel_fht.cu`'s test conventions in `test_flute.py` (READ ≤60 lines:
 naming/param style) · WRITE `src/rag/tests/w20/test_w20_fht_large.py`
