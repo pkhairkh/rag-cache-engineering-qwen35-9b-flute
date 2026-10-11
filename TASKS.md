@@ -1332,7 +1332,7 @@ pinning. (The "unpacked hot codes" lever is DROPPED per PROPOSAL §8 —
 with bfe, unpacking is free.)
 
 #### W20.11.1 — the refresh-8 regime
-- [ ] done
+- [x] done
 ROLE task-writer · READ `scripts/gpu/finetune_m1m2.py` (the W19 flags
 --refresh-every/--gate-init/--absolute-loss), `src/rag/m1m2_finetune.py`
 (refresh_every docstring), HANDOVER.md's W19 section (the staleness

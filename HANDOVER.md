@@ -137,6 +137,17 @@ Read the run off the new instrumentation:
    RE-INGEST with the gates (`--m1m2-gates ... --m1m2-mem-size SAME`) ->
    run_index -> eval_retrieval (the M1/M2 units now carry trained
    discrimination) -> run_query.
+6. W20 — the refresh-8 A/B row (step 3's complement; now a first-class
+   regime — the W20.11 lever): after the refresh-4 run reads clean, run
+   the SAME command with `--refresh-every 8` — the throughput regime.
+   The staleness bound is the tight one: lr x (N - 1) = lr x 7 (the
+   frozen k/v trail the gates by at most 7 optimizer steps; the replay
+   re-runs per step, so the gradients themselves stay current). Judge
+   it on the same step-log gauges — loss off ln(8) at step 0, |g| > 0,
+   cos(pos)/cos(neg) separating by ~25 steps; if the separation is
+   materially worse than the refresh-4 run, drop back. The default 4 is
+   quality-first; the regime is the operator's call on the box (G20.2's
+   refresh-8 targets: step <= 1 s, 300 steps <= 10 min end-to-end).
 
 ## Open for the next wave (measured/diagnosed, not fixed)
 
