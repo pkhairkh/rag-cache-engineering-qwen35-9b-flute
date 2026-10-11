@@ -100,6 +100,24 @@ moves bytes, not math); the W18 exact-gradient and W19 pool contracts
 are untouched, and the training step's data path (replay over the
 captured k/v) sees nothing new.
 
+W20.14 — THE METRIC BUG (the box's "spread 0.0000 at every step"): the
+held-out discrimination metric reported the "negatives" as the TRUE-pair
+cosine vector ROLLED by one — but a roll is a permutation, and a
+permutation's mean is identical, so cos(pos) == cos(neg) EXACTLY at
+every step, for ANY model, by construction (the box's 0.615/0.615 ...
+0.4801/0.4801 table was this identity, never a learning failure; the
+loss itself was always correct — the full B x B matrix with diagonal
+targets — and the below-ln(B) losses the box logged were real ranking
+signal it could not see). cosine_spread now measures the negatives the
+InfoNCE actually trains against — the OFF-DIAGONAL mean of the same
+sim matrix — and the per-step history carries spread/off_max/diag_min
+plus the pool phase (the refresh-cycle position that explains the loss
+oscillation), all shared through _pair_sim_stats. The H6 investigation
+knob (GatesTrainConfig.train_layers) freezes every write gate outside
+a layer subset (zeroed grads; the default weight_decay=0 keeps them
+bit-anchored) — the "isolate single layer" experiment without code
+changes on the box.
+
 WHAT IS TRAINED: ONLY the M1M2 module's gate vectors
 (write_gate_k/write_gate_v per linear layer, optionally read_gate) —
 `freeze_all_but_gates` turns off every other parameter of the model
@@ -496,17 +514,52 @@ def infonce_pairs_loss(m1_a: torch.Tensor, m2_a: torch.Tensor,
     return torch.nn.functional.cross_entropy(logits, targets)
 
 
-def cosine_spread(m1_a, m2_a, m1_b, m2_b) -> Tuple[float, float]:
-    """(mean cos over the TRUE pairs, mean cos over the SHIFTED pairs) —
-    the held-out discrimination metric (no grad; the gap is the signal)."""
+def _pair_sim_stats(m1_a, m2_a, m1_b, m2_b) -> Dict[str, float]:
+    """W20.14 — the B x B pair-similarity stats the history and the
+    held-out report share (no grad). sim(i, j) = 0.5*(cos(m1_a[i],
+    m1_b[j]) + cos(m2_a[i], m2_b[j])) — EXACTLY the matrix
+    infonce_pairs_loss trains on, so the metric scores the same
+    discrimination the loss optimizes:
+
+      cos_pos   the DIAGONAL mean — the true pairs,
+      cos_neg   the OFF-DIAGONAL mean — the in-batch negatives,
+      spread    cos_pos - cos_neg — the discrimination signal,
+      off_max   the hardest negative (the tightest false pair),
+      diag_min  the weakest true pair.
+
+    B < 2 (no in-batch negatives) returns NaN for the negative-side
+    fields — the same loudness the loss itself has."""
     with torch.no_grad():
-        sim = 0.5 * ((_flat_unit(m1_a) * _flat_unit(m1_b)).sum(-1)
-                     + (_flat_unit(m2_a) * _flat_unit(m2_b)).sum(-1))
+        sim = 0.5 * (_flat_unit(m1_a) @ _flat_unit(m1_b).T
+                     + _flat_unit(m2_a) @ _flat_unit(m2_b).T)
+        diag = torch.diagonal(sim)
         b = sim.shape[0]
         if b < 2:
-            return float(sim.mean()), float("nan")
-        shifted = sim.roll(1)
-        return float(sim.mean()), float(shifted.mean())
+            return {"cos_pos": float(diag.mean()), "cos_neg": float("nan"),
+                    "spread": float("nan"), "off_max": float("nan"),
+                    "diag_min": float(diag.min())}
+        off = sim[~torch.eye(b, dtype=torch.bool, device=sim.device)]
+        return {"cos_pos": float(diag.mean()), "cos_neg": float(off.mean()),
+                "spread": float(diag.mean() - off.mean()),
+                "off_max": float(off.max()), "diag_min": float(diag.min())}
+
+
+def cosine_spread(m1_a, m2_a, m1_b, m2_b) -> Tuple[float, float]:
+    """(mean cos over the TRUE pairs, mean cos over the IN-BATCH
+    negatives) — the held-out discrimination metric (no grad; the gap
+    is the signal).
+
+    W20.14 — THE ROLL BUG (the box's "spread 0.0000 at every step"):
+    v1 built the (B,) true-pair cosine vector and reported the
+    "negatives" as that SAME vector rolled by one — but a roll is a
+    permutation and a permutation's mean is IDENTICAL, so cos(pos) ==
+    cos(neg) EXACTLY at every step, for ANY model, by construction
+    (the box's 0.615/0.615 ... 0.4801/0.4801 table was this identity,
+    never a learning failure). The metric now returns the off-diagonal
+    mean of the same B x B sim matrix the InfoNCE builds — the exact
+    negatives the loss trains against (see _pair_sim_stats)."""
+    s = _pair_sim_stats(m1_a, m2_a, m1_b, m2_b)
+    return s["cos_pos"], s["cos_neg"]
 
 
 # ------------------------------------------------------------- the loop ---
