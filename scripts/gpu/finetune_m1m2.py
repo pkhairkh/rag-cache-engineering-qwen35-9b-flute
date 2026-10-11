@@ -1,18 +1,33 @@
 #!/usr/bin/env python3
 """finetune_m1m2.py — the §7 M1/M2 gate fine-tune on the GPU box.
 
-Trains ONLY the M1/M2 gate vectors (write_gate_k/write_gate_v, optionally
-read_gate) of the W17-wired model, on GENERAL semantic-similarity pairs
-(paraphrase / entailment / QA pairs — MRPC, QQP, PAWS, SNLI, MNLI, STS-B,
-SQuAD ...), NEVER on the served corpus. The goal (the handover's design):
-similar texts -> similar M1/M2 states -> the §4 vector's M1/M2 units carry
-the query-document alignment the S-only vectors lack (measured cos(q, doc)
+Trains ONLY the M1/M2 gate vectors (write_gate_k/write_gate_v —
+per-(layer, head) since W21; read_gate optionally) of the W17-wired
+model, on GENERAL semantic-similarity pairs (paraphrase / entailment /
+QA pairs — MRPC, QQP, PAWS, SNLI, MNLI, STS-B, SQuAD ...), NEVER on
+the served corpus. The goal (the handover's design): similar texts ->
+similar M1/M2 states -> the §4 vector's M1/M2 units carry the
+query-document alignment the S-only vectors lack (measured cos(q, doc)
 ~0.50-0.58, 50% hit rate).
+
+W21 — THE ADDRESSING A/B (the position-lock, answered): the v1 write
+addressed memory slots by POSITION (slot = p mod mem_size), so the
+pair-similarity the InfoNCE trains is a position-aligned key
+correlation — surface overlap, not content; the box's runs plateaued
+at spread ~0.13 with cos_neg parked at ~+0.36 (the anisotropy
+pedestal). This driver now defaults to the W21 module behavior —
+CONTENT-addressed slots (simhash of the per-(b,h) mean-centered key;
+shared-content tokens match anywhere in the two texts) + per-head
+write gates — with the v1 behavior one flag away:
+
+    --write-addr positional      # the v1 slot rule (bit-exact A/B)
+    --no-center-write            # raw keys/values (the pedestal stays)
 
 THE DATA CONTRACT (corpus-independent): a JSONL of
     {"text1": "...", "text2": "...", "label": 1}
-(label 1 = similar; label 0 rows are skipped in v1 — the InfoNCE takes
-its negatives IN-BATCH from the other pairs). Convert any general dataset
+(label 1 = similar; label 0 rows are skipped by the trainer — the
+InfoNCE takes its negatives IN-BATCH from the other pairs; they ride
+along as the held-out CONTROL group). Convert any general dataset
 to this format offline (the box does not need internet at train time);
 EXAMPLES of supported sources: MRPC/QQP/PAWS (paraphrase), SNLI/MNLI
 (entailment=1, contradiction=0), STS-B (score>4 -> 1), SQuAD
@@ -22,45 +37,43 @@ The deployment protocol (ORDER MATTERS): train -> save gates ->
 RE-INGEST with the trained gates (run_ingestion.py --m1m2-gates ...
 --m1m2-mem-size SAME) -> run_index.py -> query (run_query.py
 --m1m2-gates ...). The snapshot geometry (m1_shape in system_state.npz)
-pins the mem_size; the query-side loader fails loudly on drift.
+pins the mem_size; the query-side loader fails loudly on drift. W21:
+a gates .npz trained before W21 ((L,) gate vectors) is REFUSED loudly
+by load_gates — the addressing changed the semantics, retrain.
 
 Examples:
-    # general pairs from a converted dataset
-    python3 scripts/gpu/finetune_m1m2.py --pairs-file mrpc_pairs.jsonl \
-        --gates-out disk/m1m2_gates.npz --m1m2-mem-size 1024
+    # the W21 default run (content-addressed, centered, per-head gates)
+    python3 scripts/gpu/finetune_m1m2.py --pairs-file data/pairs.jsonl \
+        --gates-out m1m2_gates_trained.npz --m1m2-mem-size 1024 \
+        --max-steps 300 --refresh-every 4 --gate-init 0.1
+
+    # the v1 A/B (position-addressed, uncentered — the pre-W21 regime)
+    python3 scripts/gpu/finetune_m1m2.py --pairs-file data/pairs.jsonl \
+        --gates-out m1m2_gates_v1.npz --m1m2-mem-size 1024 \
+        --write-addr positional --no-center-write
 
     # mechanics smoke test on synthetic pairs (NOT training data)
     python3 scripts/gpu/finetune_m1m2.py --self-test --max-steps 5
 
-    # single-layer isolation (the W20.14 H6 investigation knob)
-    python3 scripts/gpu/finetune_m1m2.py --pairs-file mrpc_pairs.jsonl \
-        --gates-out disk/m1m2_gates.npz --train-layers 5
+THE HELD-OUT LADDER ([6], the W21 instrument): the captured k/v of the
+held-out pairs are replayed under EVERY addressing config — the run's
+own, the kappa ladder (1/2/8 blocks), uncentered content, centered
+positional, and the v1 corner — and each row reports
+cos(pos)/cos(neg)/spread vs the in-batch AND the label-0 curated
+negatives, plus the lexical-overlap buckets. One capture, N configs
+(the replay is ~seconds; the prefill is not repeated). The row
+differences ARE the architectural measurement: the v1 row vs the
+content row on the LOW-overlap bucket is the position-lock ceiling,
+made visible; the cos_neg column is the pedestal (centered rows
+should sit near 0, the uncentered rows near +0.36).
 
-    # the W20.15 regime (per-epoch re-batching, 16-pair batches)
-    python3 scripts/gpu/finetune_m1m2.py --pairs-file data/pairs.jsonl \
-        --gates-out m1m2_gates_trained.npz --m1m2-mem-size 1024 \
-        --batch-pairs 16 --max-steps 600
-
-THE W20.15 REGIME (the box's post-fix 300-step run saw a SAWTOOTH:
-loss swinging 0.40..2.98 with the capture batch): the between-block
-loss variance measured 7,595x the within-block variance — the block
-difficulty IS the batch (its 8 pairs' own cross-side alignment; the
-in-batch-negative background cos_neg is stable while cos_pos swings
-0.35..0.74), only 600 of 14,469 train pairs were consumed (4.1%), and
-the v1 iterator FIXED every pair's in-batch negatives to its
-file-layout neighbors for the whole run. This driver now: shuffles
-the split (seeded — the val slice is a random sample, not the file's
-head block), re-batches per epoch (epoch_batches — fresh negative
-sets every epoch, deterministic), tallies coverage, and reports the
-held-out LADDER: true pairs vs the label-0 curated non-pairs (the
-17,519 rows v1 skipped — the datasets' own non-similar pairs, a
-cleaner control than in-batch negatives, which can be
-accidentally-similar cross pairs) vs the in-batch negatives, then
-the gap BUCKETED by lexical overlap (the position-addressed write —
-slot = p mod mem_size, one token per slot at T < mem_size — predicts
-the gap lives in the high-overlap bucket; the report makes that
-celling measurable instead of arguable). --fixed-batches restores
-the v1 file-order regime for the A/B.
+OOM HARDENING (the box's W20.15 run crashed INSIDE [5] and lost the
+trained artifact): the gates artifact + history now save BEFORE any
+held-out report ([5] before [6]); the ladder streams per-pair-side
+vectors (no stacked (B, mem, H, D) states — the 4 x 1.07 GiB stacks
+that OOM'd), frees the replay graphs per side, and every report
+section is a try/except that WARNS and continues (a report failure
+never loses the artifact again).
 """
 from __future__ import annotations
 
@@ -77,10 +90,11 @@ from _bootstrap import DEFAULTS, boot, load_model
 boot()
 
 from ingest import prefill_system  # noqa: E402
-from m1m2_finetune import (GatesTrainConfig, bucketed_spread,  # noqa: E402
-                            cosine_spread, epoch_batches,
-                            lexical_overlap, prefill_capture_calls,
-                            replay_states, save_gates, train_gates)
+from m1m2_finetune import (GatesTrainConfig, bucketed_spread_from_sim,  # noqa: E402
+                            epoch_batches, flat_unit,
+                            lexical_overlap,
+                            prefill_capture_calls, replay_states,
+                            sim_matrix_stats, save_gates, train_gates)
 from tq_cache import TQCache  # noqa: E402
 
 
@@ -165,6 +179,130 @@ def _host_pinned(ids) -> torch.Tensor:
     return t.pin_memory() if torch.cuda.is_available() else t
 
 
+# ------------------------------------------------------ the data report ---
+def _overlap_profile(text_pairs, cap: int = 4000):
+    """[3.5] — the data-quality profile of a pair list: the lexical
+    overlap distribution (lexical_overlap — the W20.15 instrument,
+    word-multiset containment) plus length stats, text-only, no model.
+
+    The question it answers with numbers ("is the data good?"): a
+    positive-pair profile concentrated at low overlap with a label-0
+    profile that MATCHES it means the pairs carry no surface signal —
+    fine for content-based training (W21) but fatal for the v1
+    position-locked write (the W20.15 ceiling); positives clearly above
+    the label-0 profile mean the signal exists and the addressing is
+    the only question. Capped at `cap` pairs (the mean is stable long
+    before 4k; the report is a probe, not a census)."""
+    if not text_pairs:
+        return None
+    sample = text_pairs if len(text_pairs) <= cap else \
+        random.Random(7).sample(text_pairs, cap)
+    ovs, lens = [], []
+    for t1, t2 in sample:
+        ovs.append(lexical_overlap(t1, t2))
+        lens.append((len(t1.split()) + len(t2.split())) / 2.0)
+    ovs.sort()
+    n = len(ovs)
+
+    def q(f):
+        return ovs[min(n - 1, int(f * n))]
+    return {"n": n, "mean": sum(ovs) / n, "median": q(0.5),
+            "p25": q(0.25), "p75": q(0.75),
+            "frac_hi": sum(1 for o in ovs if o >= 0.5) / n,
+            "frac_mid": sum(1 for o in ovs if 0.2 <= o < 0.5) / n,
+            "frac_lo": sum(1 for o in ovs if o < 0.2) / n,
+            "mean_len": sum(lens) / len(lens)}
+
+
+# ----------------------------------------------- the [6] streaming ladder --
+def _side_units(module, calls, m1_i, m2_i):
+    """One pair side -> (u1, u2): the L2-normalized flat DELTA vectors
+    (fp32, (dim,), on the capture device) — the pair_sim_matrix
+    operands. Runs the replay under no_grad and frees the graph before
+    returning (the [6] OOM fix: no stacked states, no retained
+    autograd; the gates' requires_grad is irrelevant under no_grad —
+    this is the metric path, not the training path)."""
+    with torch.no_grad():
+        m1, m2 = replay_states(module, calls, m1_i, m2_i)
+        u1 = flat_unit(m1 - m1_i)[0]
+        u2 = flat_unit(m2 - m2_i)[0]
+    u1, u2 = u1.detach(), u2.detach()
+    del m1, m2
+    return u1, u2
+
+
+def _capture_group(model, system, cache_factory, id_pairs):
+    """Streaming capture of a group of pairs: per pair, per side —
+    prefill through the production path and KEEP ONLY the calls +
+    m_init (the ladder replays them under every addressing config; the
+    cache and the graphs are dropped per side). Returns the list of
+    [(calls_a, m1i_a, m2i_a), (calls_b, m1i_b, m2i_b)] per pair."""
+    sides = []
+    for ids_a, ids_b in id_pairs:
+        ps = []
+        for ids in (ids_a, ids_b):
+            c = cache_factory()
+            calls, m1i, m2i = prefill_capture_calls(model, ids, c, system)
+            del c
+            ps.append((calls, m1i, m2i))
+        sides.append(ps)
+    return sides
+
+
+def _group_units(module, group):
+    """Replay every side of a captured group under the module's CURRENT
+    addressing knobs -> (A1, A2, B1, B2): the four (B, dim) fp32 unit
+    matrices (a-side m1/m2, b-side m1/m2)."""
+    u1a, u2a, u1b, u2b = [], [], [], []
+    for (ca, i1a, i2a), (cb, i1b, i2b) in group:
+        a1, a2 = _side_units(module, ca, i1a, i2a)
+        b1, b2 = _side_units(module, cb, i1b, i2b)
+        u1a.append(a1)
+        u2a.append(a2)
+        u1b.append(b1)
+        u2b.append(b2)
+    return (torch.stack(u1a), torch.stack(u2a),
+            torch.stack(u1b), torch.stack(u2b))
+
+
+def _sim_from_units(A1, A2, B1, B2, chunk: int = 16):
+    """0.5*(cos_m1 + cos_m2) from the unit matrices — the pair_sim_matrix
+    arithmetic, CHUNKED so no full (B, dim) @ (dim, B) fp32 operand pair
+    is ever live (the [6] OOM fix: the transients are (chunk, dim) x
+    (dim, chunk)). The values are identical to the unchunked matmul up
+    to fp32 accumulation order (a report, not a gradient)."""
+    B = A1.shape[0]
+    sim = torch.zeros(B, B, device=A1.device, dtype=torch.float32)
+    for r in range(0, B, chunk):
+        ra1 = A1[r:r + chunk].float()
+        ra2 = A2[r:r + chunk].float()
+        for c in range(0, B, chunk):
+            cb1 = B1[c:c + chunk].float().T
+            cb2 = B2[c:c + chunk].float().T
+            sim[r:r + chunk, c:c + chunk] = \
+                0.5 * (ra1 @ cb1 + ra2 @ cb2)
+    return sim
+
+
+_ADDR_LADDER = [
+    # (label, write_addr, center_write, addr_blocks) — the run's config
+    # rides FIRST (dict-built at call time), then the kappa ladder and
+    # the corners. Every row replays the SAME captured k/v (offline).
+    ("kappa=1", "content", True, 1),
+    ("kappa=2", "content", True, 2),
+    ("kappa=8", "content", True, 8),
+    ("content uncentered", "content", False, 4),
+    ("positional centered", "positional", True, 4),
+    ("positional v1 (A/B)", "positional", False, 4),
+]
+
+
+def _fmt_stats(st):
+    return (f"cos(pos) {st['cos_pos']:+.4f} cos(neg) {st['cos_neg']:+.4f} "
+            f"spread {st['spread']:+.4f} [worst neg {st['off_max']:+.4f} "
+            f"weakest pos {st['diag_min']:+.4f}]")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -184,8 +322,26 @@ def main() -> int:
                     help="the memories' slot count — the architecture's "
                          "band is [1024, 4096] (two GLOBAL states, "
                          "shared across all 24 linear layers; the gates "
-                         "are per-layer); ingest+query must use the SAME "
-                         "value")
+                         "are per-layer per-head); ingest+query must use "
+                         "the SAME value")
+    ap.add_argument("--write-addr", default="content",
+                    choices=("content", "positional"),
+                    help="W21: the slot ADDRESS — 'content' (default: "
+                         "simhash of the centered key; shared-content "
+                         "tokens match anywhere in the two texts) or "
+                         "'positional' (the v1 slot = p mod mem_size, "
+                         "the position-locked A/B)")
+    ap.add_argument("--no-center-write", action="store_true",
+                    help="W21 A/B: write RAW keys/values (skip the "
+                         "per-(b,h) mean-centering that removes the "
+                         "anisotropy pedestal — the +0.36 random-pair "
+                         "cosine floor)")
+    ap.add_argument("--addr-blocks", type=int, default=4,
+                    help="W21: kappa — the number of independent sign "
+                         "blocks (each token writes kappa slots; the "
+                         "collision probability of similar keys rises "
+                         "with kappa, the per-slot resolution falls). "
+                         "The [6] ladder sweeps 1/2/4/8 offline")
     ap.add_argument("--no-memopt", action="store_true",
                     help="A/B: the W17 plain autograd replay chain (retains "
                          "the 24 boundary states per side — the A10G OOM "
@@ -242,7 +398,7 @@ def main() -> int:
                          "isolate-single-layer experiment")
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--val-pairs", type=int, default=64,
-                    help="W20.15: held-out pairs scored in [5] (the v1 "
+                    help="W20.15: held-out pairs scored in [6] (the v1 "
                          "hard-coded 32 starved the bucketed report; "
                          "capped at the val split)")
     ap.add_argument("--shuffle-seed", type=int, default=1234,
@@ -277,6 +433,18 @@ def main() -> int:
                           use_m1m2=not args.no_m1m2,
                           m1m2_mem_size=args.m1m2_mem_size)
 
+    # W21 — apply the addressing config to the shared module BEFORE the
+    # system prefill (the reset point, the captures, the ladder, and
+    # the artifact's provenance all live under this config)
+    inner = getattr(model, "model", model)
+    if not args.no_m1m2:
+        inner.m1m2.write_addr = args.write_addr
+        inner.m1m2.center_write = not args.no_center_write
+        inner.m1m2.addr_blocks = args.addr_blocks
+        print(f"    [W21] write_addr {args.write_addr} / "
+              f"center_write {not args.no_center_write} / "
+              f"addr_blocks (kappa) {args.addr_blocks}")
+
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
@@ -309,7 +477,9 @@ def main() -> int:
             raise SystemExit("--pairs-file is required (or --self-test)")
         texts, neg_texts = load_pairs(args.pairs_file,
                                       limit=args.limit_pairs)
-        print(f"    {len(texts)} positive pairs from {args.pairs_file}")
+        print(f"    {len(texts)} positive pairs "
+              f"({len(neg_texts)} label-0 control rows) from "
+              f"{args.pairs_file}")
         # W20.15 — the seeded regime: the val slice is a RANDOM sample
         # (v1 took the file's head block) and the epoch re-batching is
         # reproducible; --fixed-batches restores the v1 batch cycle.
@@ -328,7 +498,7 @@ def main() -> int:
             pair_texts.append((t1, t2))
     n_val = max(2, int(len(pairs) * args.val_frac)) if len(pairs) > 4 else 0
     # W20.11.2: the held-out prefills' ids stage ONCE here (the same
-    # pinned non_blocking transport — [5] runs the unchanged path)
+    # pinned non_blocking transport — [6] runs the unchanged path)
     if n_val:
         val_pairs = [(a.to(args.device, non_blocking=True),
                       b.to(args.device, non_blocking=True))
@@ -358,9 +528,30 @@ def main() -> int:
 
     train_iter = _tallied(train_iter)
 
+    # [3.5] — the data-quality profile (text-only, no model): the
+    # lexical-overlap distribution of the positives vs the label-0
+    # controls — "is the data good" answered with numbers
+    if pair_texts:
+        pos_prof = _overlap_profile(pair_texts)
+        print("    [W21 data] positives: overlap mean "
+              f"{pos_prof['mean']:.3f} median {pos_prof['median']:.3f} "
+              f"(hi {pos_prof['frac_hi']:.0%} / mid {pos_prof['frac_mid']:.0%}"
+              f" / lo {pos_prof['frac_lo']:.0%}), mean pair len "
+              f"{pos_prof['mean_len']:.0f} words")
+        neg_prof = _overlap_profile(neg_texts)
+        if neg_prof:
+            print("    [W21 data] label-0:    overlap mean "
+                  f"{neg_prof['mean']:.3f} median {neg_prof['median']:.3f} "
+                  f"(hi {neg_prof['frac_hi']:.0%} / mid "
+                  f"{neg_prof['frac_mid']:.0%} / lo {neg_prof['frac_lo']:.0%})"
+                  f", mean pair len {neg_prof['mean_len']:.0f} words")
+            print("    [W21 data] the pos-vs-label0 overlap separation "
+                  f"{pos_prof['mean'] - neg_prof['mean']:+.3f} "
+                  f"(0 = the pairs carry no surface signal — only a "
+                  f"content-addressed write can separate them)")
+
     print(f"\n[4] Training the gates ({args.max_steps} steps, "
           f"batch {args.batch_pairs}, tau {args.tau}, lr {args.lr})...")
-    inner = getattr(model, "model", model)
     cfg = GatesTrainConfig(
         lr=args.lr, tau=args.tau, max_steps=args.max_steps,
         batch_pairs=args.batch_pairs,
@@ -402,107 +593,142 @@ def main() -> int:
           f"({100.0 * min(used, n_train) / max(1, n_train):.1f}% unique "
           f"this run; the tally includes the trailing prefetch)")
 
-    if val_pairs:
-        print("\n[5] Held-out discrimination ladder...")
-        module = inner.m1m2
-        n_eval = min(args.val_pairs, len(val_pairs))
-        states = []
-        with torch.no_grad():
-            for ids_a, ids_b in val_pairs[:n_eval]:
-                ps = []
-                for ids in (ids_a, ids_b):
-                    c = cache_factory()
-                    calls, m1i, m2i = prefill_capture_calls(
-                        model, ids, c, system)
-                    m1, m2 = replay_states(module, calls, m1i, m2i)
-                    # W19: the spread over the DELTAS — the centered
-                    # retrieval frame's geometry (cos of the full states
-                    # is ~+1 trivially off the shared m_init)
-                    ps.append((m1 - m1i, m2 - m2i))
-                states.append(ps)
-        m1_a = torch.stack([s[0][0] for s in states])
-        m2_a = torch.stack([s[0][1] for s in states])
-        m1_b = torch.stack([s[1][0] for s in states])
-        m2_b = torch.stack([s[1][1] for s in states])
-        pos, neg = cosine_spread(m1_a, m2_a, m1_b, m2_b)
-        print(f"    cos(true pairs)   {pos:+.4f} vs cos(in-batch neg) "
-              f"{neg:+.4f} — gap {pos - neg:+.4f} over {len(states)} "
-              f"held-out pairs (the in-batch negatives can be "
-              f"accidentally-similar cross pairs — a noisy floor)")
-
-        # W20.15 — the label-0 CURATED control line: the datasets' own
-        # non-pairs (17,519 rows the v1 loader skipped). The honest
-        # discrimination number is true-pairs vs THESE, not vs random
-        # cross pairs; they never enter training.
-        ctrl_pos = None
-        if neg_texts:
-            ctrl_ids = []
-            for t1, t2 in neg_texts[:n_eval]:
-                c1 = tokenizer.encode(t1, add_special_tokens=False)
-                c2 = tokenizer.encode(t2, add_special_tokens=False)
-                if args.max_tokens:
-                    c1, c2 = c1[:args.max_tokens], c2[:args.max_tokens]
-                if not c1 or not c2:
-                    continue
-                ctrl_ids.append((c1, c2))
-            if len(ctrl_ids) >= 2:
-                ctrl_states = []
-                with torch.no_grad():
-                    for a_ids, b_ids in ctrl_ids[:n_eval]:
-                        ps = []
-                        for ids in (a_ids, b_ids):
-                            c = cache_factory()
-                            calls, m1i, m2i = prefill_capture_calls(
-                                model, _host_pinned(ids).to(
-                                    args.device, non_blocking=True),
-                                c, system)
-                            m1, m2 = replay_states(module, calls, m1i, m2i)
-                            ps.append((m1 - m1i, m2 - m2i))
-                        ctrl_states.append(ps)
-                c1_a = torch.stack([s[0][0] for s in ctrl_states])
-                c2_a = torch.stack([s[0][1] for s in ctrl_states])
-                c1_b = torch.stack([s[1][0] for s in ctrl_states])
-                c2_b = torch.stack([s[1][1] for s in ctrl_states])
-                ctrl_pos, _ = cosine_spread(c1_a, c2_a, c1_b, c2_b)
-                print(f"    cos(label-0 pairs) {ctrl_pos:+.4f} — the "
-                      f"curated negatives ({len(ctrl_states)} pairs; "
-                      f"true-vs-curated gap {pos - ctrl_pos:+.4f})")
-
-        # W20.15 — the gap BUCKETED by lexical overlap: the position-
-        # addressed write (slot = p mod mem_size, ONE token per slot at
-        # T < mem_size — the state delta IS the key sequence) predicts
-        # the discrimination lives in the high-overlap bucket; the
-        # bucket profile decides between "regime" (fixable by training)
-        # and "ceiling" (architectural — next wave's conversation)
-        if val_texts:
-            labels = []
-            for t1, t2 in val_texts[:n_eval]:
-                ov = lexical_overlap(t1, t2)
-                labels.append("high" if ov >= 0.5 else
-                              ("med" if ov >= 0.2 else "low"))
-            rep = bucketed_spread(m1_a, m2_a, m1_b, m2_b, labels)
-            for lbl in ("high", "med", "low"):
-                if lbl in rep["buckets"]:
-                    bb = rep["buckets"][lbl]
-                    print(f"    overlap {lbl:4s} (n={bb['n']:3d}): "
-                          f"cos_pos {bb['cos_pos']:+.4f} "
-                          f"gap {bb['gap']:+.4f}")
-            print("    (gap living only in 'high' = the surface-locked "
-                  "state signature; flat buckets = the signal is not "
-                  "surface-locked — capacity/optimization instead)")
-        if ctrl_pos is None and not val_texts:
-            print("    (self-test: no texts — the ladder/buckets are "
-                  "data-path reports)")
-
+    # W21 — THE ARTIFACT FIRST (the box's v1 run crashed inside the
+    # held-out report and lost 575 s of training): save_gates + the
+    # history BEFORE any report; every [6] section is a warn-and-
+    # continue try/except. The artifact records the addressing config
+    # (provenance: a W21 file names its regime; load_gates refuses the
+    # wrong-shape v1 files loudly).
     out = save_gates(inner.m1m2, args.gates_out, extra_meta={
         "pairs_file": args.pairs_file or "self-test",
         "max_steps": args.max_steps, "tau": args.tau,
-        "final_loss": cfg.history[-1]["loss"] if cfg.history else -1.0})
-    print(f"\n[6] Gates artifact: {out}")
+        "final_loss": cfg.history[-1]["loss"] if cfg.history else -1.0,
+        "write_addr": args.write_addr,
+        "center_write": not args.no_center_write,
+        "addr_blocks": args.addr_blocks})
+    print(f"\n[5] Gates artifact: {out}")
     hist_path = os.path.splitext(out)[0] + "_history.json"
     with open(hist_path, "w") as f:
         json.dump(cfg.history, f, indent=1)
     print(f"    history: {hist_path}")
+
+    # release the training pool's cached blocks before the reports
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if val_pairs and not args.no_m1m2:
+        print("\n[6] Held-out discrimination ladder (W21: one capture, "
+              "every addressing config replayed offline)...")
+        module = inner.m1m2
+        n_eval = min(args.val_pairs, len(val_pairs))
+        # the ladder: the run's config first, then the kappa ladder and
+        # the corners (all replayed from the SAME captured k/v)
+        ladder = [(f"run config ({args.write_addr}, "
+                   f"{'centered' if not args.no_center_write else 'raw'}, "
+                   f"kappa={args.addr_blocks})",
+                   args.write_addr, not args.no_center_write,
+                   args.addr_blocks)] + _ADDR_LADDER
+
+        # ---- capture the held-out group ONCE (streaming; the labels
+        # and the ctrl texts ride along) ----
+        try:
+            val_group = _capture_group(model, system, cache_factory,
+                                       val_pairs[:n_eval])
+        except RuntimeError as exc:
+            print(f"    [WARN] held-out capture failed ({exc}) — "
+                  f"skipping the ladder (artifact already saved)")
+            val_group = None
+        labels = []
+        if val_group is not None and val_texts:
+            for t1, t2 in val_texts[:n_eval]:
+                ov = lexical_overlap(t1, t2)
+                labels.append("high" if ov >= 0.5 else
+                              ("med" if ov >= 0.2 else "low"))
+
+        ctrl_ids = []
+        ctrl_group = None
+        if val_group is not None and neg_texts:
+            try:
+                for t1, t2 in neg_texts[:n_eval]:
+                    c1 = tokenizer.encode(t1, add_special_tokens=False)
+                    c2 = tokenizer.encode(t2, add_special_tokens=False)
+                    if args.max_tokens:
+                        c1, c2 = c1[:args.max_tokens], c2[:args.max_tokens]
+                    if not c1 or not c2:
+                        continue
+                    ctrl_ids.append((c1, c2))
+                ctrl_group = _capture_group(
+                    model, system, cache_factory,
+                    [(_host_pinned(a).to(args.device, non_blocking=True),
+                      _host_pinned(b).to(args.device, non_blocking=True))
+                     for a, b in ctrl_ids[:n_eval]])
+            except RuntimeError as exc:
+                print(f"    [WARN] control capture failed ({exc}) — "
+                      f"the ladder runs without the label-0 line")
+                ctrl_group = None
+                ctrl_ids = []
+        else:
+            ctrl_group = None
+
+        # ---- the ladder sweep: per config, replay BOTH groups (val
+        # first, ctrl after — the units freed between) and report ----
+        for (label, write_addr, center_write, addr_blocks) in ladder:
+            if val_group is None:
+                print("    (ladder skipped — the held-out capture "
+                      "failed; the artifact is saved)")
+                break
+            try:
+                module.write_addr = write_addr
+                module.center_write = center_write
+                module.addr_blocks = addr_blocks
+                A1, A2, B1, B2 = _group_units(module, val_group)
+                sim = _sim_from_units(A1, A2, B1, B2)
+                del A1, A2, B1, B2
+                st = sim_matrix_stats(sim)
+                print(f"    {label:34s} {_fmt_stats(st)}")
+                if labels:
+                    rep = bucketed_spread_from_sim(sim, labels)
+                    for lbl in ("high", "med", "low"):
+                        if lbl in rep["buckets"]:
+                            bb = rep["buckets"][lbl]
+                            print(f"      overlap {lbl:4s} (n={bb['n']:3d}): "
+                                  f"cos_pos {bb['cos_pos']:+.4f} "
+                                  f"gap {bb['gap']:+.4f}")
+                del sim
+                if ctrl_group is not None:
+                    C1, C2, D1, D2 = _group_units(module, ctrl_group)
+                    csim = _sim_from_units(C1, C2, D1, D2)
+                    del C1, C2, D1, D2
+                    cst = sim_matrix_stats(csim)
+                    print(f"      label-0 control: cos(pos) "
+                          f"{cst['cos_pos']:+.4f} — true-vs-curated gap "
+                          f"{st['cos_pos'] - cst['cos_pos']:+.4f}")
+                    del csim
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except RuntimeError as exc:
+                print(f"    [WARN] ladder row {label!r} failed ({exc}) — "
+                      f"continuing (artifact already saved)")
+        # restore the run's config on the module (the artifact's regime)
+        module.write_addr = args.write_addr
+        module.center_write = not args.no_center_write
+        module.addr_blocks = args.addr_blocks
+        if val_group is not None:
+            del val_group
+        if ctrl_group is not None:
+            del ctrl_group
+        if ctrl_ids:
+            del ctrl_ids
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if val_group is not None:
+            print("    (cos(neg) ~0.36 on uncentered rows = the anisotropy "
+                  "pedestal; the low-overlap bucket separating on content "
+                  "rows but not on positional rows = the position lock, "
+                  "measured)")
+    elif not val_pairs:
+        print("\n[6] (self-test: no held-out pairs — the ladder is a "
+              "data-path report)")
 
     print("\n" + "=" * 60)
     print("GATE FINE-TUNE COMPLETE — re-ingest with --m1m2-gates "
