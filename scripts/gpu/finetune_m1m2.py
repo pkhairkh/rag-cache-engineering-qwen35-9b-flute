@@ -115,6 +115,25 @@ def main() -> int:
                          "the 24 boundary states per side — the A10G OOM "
                          "path; the default is the W18 exact-gradient "
                          "memory-safe replay)")
+    ap.add_argument("--gate-init", type=float, default=0.1,
+                    help="W19: fill both write gates with this before step 0 "
+                         "— the P3 zero-init is an EXACT saddle of the "
+                         "InfoNCE (loss ln(B), gradient identically zero; "
+                         "the flat 2.0794 run). 0 = train from the loaded "
+                         "gates (provably dead at P3)")
+    ap.add_argument("--refresh-every", type=int, default=4,
+                    help="W19: the capture pool — ONE batch prefilled, "
+                         "trained on for N GRADIENT STEPS (the 16 "
+                         "prefills/step are ~95%% of the wall clock; 1 = "
+                         "fresh capture every step, the W17 regime). The "
+                         "replay re-runs per step so gradients sit at the "
+                         "current gates; only the k/v freeze (stale by "
+                         "<= lr x N steps)")
+    ap.add_argument("--absolute-loss", action="store_true",
+                    help="A/B: score the ABSOLUTE states (m_final) instead "
+                         "of the W19 default deltas (m_final - m_init; the "
+                         "W16 centered retrieval frame the serving side "
+                         "scores)")
     ap.add_argument("--no-m1m2", action="store_true",
                     help="load without the wiring (the W16-exact A/B)")
     ap.add_argument("--bits", type=float, default=3.5)
@@ -200,6 +219,9 @@ def main() -> int:
         lr=args.lr, tau=args.tau, max_steps=args.max_steps,
         batch_pairs=args.batch_pairs,
         freeze_read_gate=not args.train_read_gate,
+        gate_init=args.gate_init if args.gate_init != 0 else None,
+        refresh_every=args.refresh_every,
+        delta_loss=not args.absolute_loss,
         memopt=False if args.no_memopt else None)
     if args.no_memopt:
         print("    [A/B] plain autograd replay (the W17 OOM path) — "
@@ -207,6 +229,10 @@ def main() -> int:
     else:
         print("    [W18] exact-gradient memory-safe replay "
               "(O(state + k/v), no boundary-state chain)")
+    print(f"    [W19] gate_init {args.gate_init:+.2f} (saddle escape), "
+          f"refresh_every {args.refresh_every} (capture pool), "
+          f"{'delta' if not args.absolute_loss else 'absolute'} loss "
+          f"(retrieval-frame matched)")
 
     def cache_factory():
         return TQCache(config=model.config, bits=args.bits, online=True)
@@ -227,7 +253,10 @@ def main() -> int:
                     calls, m1i, m2i = prefill_capture_calls(
                         model, ids, c, system)
                     m1, m2 = replay_states(module, calls, m1i, m2i)
-                    ps.append((m1, m2))
+                    # W19: the spread over the DELTAS — the centered
+                    # retrieval frame's geometry (cos of the full states
+                    # is ~+1 trivially off the shared m_init)
+                    ps.append((m1 - m1i, m2 - m2i))
                 states.append(ps)
         m1_a = torch.stack([s[0][0] for s in states])
         m2_a = torch.stack([s[0][1] for s in states])
@@ -235,7 +264,8 @@ def main() -> int:
         m2_b = torch.stack([s[1][1] for s in states])
         pos, neg = cosine_spread(m1_a, m2_a, m1_b, m2_b)
         print(f"    cos(true pairs) {pos:+.4f} vs cos(shifted) {neg:+.4f} "
-              f"— gap {pos - neg:+.4f} (the discrimination signal)")
+              f"— gap {pos - neg:+.4f} (the discrimination signal; "
+              f"the §4 vector's M1/M2 units carry this)")
 
     out = save_gates(inner.m1m2, args.gates_out, extra_meta={
         "pairs_file": args.pairs_file or "self-test",

@@ -30,8 +30,14 @@ no-ops and the untrained model's behavior is bit-unchanged (write
 returns the state bit-identical; read of zero memories returns exact
 zeros). The write is deliberately ONE branch-free gated add
 (`m + g · Σ_t k_t`): a `if gate == 0: skip` short-circuit would zero the
-gradient ∂m_new/∂g = Σ_t k_t exactly where P3's fine-tune has to start
-opening the gates.
+LOCAL Jacobian ∂m_new/∂g = Σ_t k_t exactly where P3's fine-tune has to
+start opening the gates. W19 caveat (measured on the box, proven in
+m1m2_finetune's docstring): the P3 point is nonetheless an EXACT SADDLE
+of the §7 contrastive objective — at g=0 every pair-side replays to the
+SAME (zero) state, so the LOSS-level gradient dL/dg = <dL/dm, Δ> is
+identically zero and the gates never open from there BY THEMSELVES; the
+trainer (GatesTrainConfig.gate_init) opens them explicitly before step
+0. The P3 deployment default stays — untrained ingest is a no-op.
 
 Online loop (SPEC §3.2, PROPOSAL D4): `m1m2_from_cache` reads the
 cache's m1/m2 codes, falling back to `init_state()` zeros when the cache
@@ -251,9 +257,11 @@ class M1M2(nn.Module):
         STATE's dtype. MUST NOT mutate m1/m2 in place — returns fresh
         tensors (functional; the wiring quantizes and stores them via the
         cache). Zero gates ⇒ the states come back bit-identical (P3
-        no-op), and the gradient w.r.t. a zero gate still flows (the
-        gated add is branch-free — ∂m_new/∂g = Σ_t k_t ≠ 0, which the
-        fine-tune needs to open the gates).
+        no-op), and the LOCAL gradient w.r.t. a zero gate still flows (the
+        gated add is branch-free — ∂m_new/∂g = Σ_t k_t ≠ 0); NOTE (W19):
+        the §7 InfoNCE sits at an exact saddle at g=0 (dL/dm = 0 on the
+        identical states), so the TRAINER opens the gates via
+        GatesTrainConfig.gate_init — see m1m2_finetune's docstring.
         """
         self._check_layer_idx("write", layer_idx)
         self._check_qkv("write", "k", k)

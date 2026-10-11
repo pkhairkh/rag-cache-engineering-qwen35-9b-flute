@@ -171,5 +171,5 @@ disk/
 | `src/scripts/palettized_modules.py` | `PalettizedLinear.forward(x)` | the idxN LUT forward |
 | `src/flute_extended/src/kernel_fht.cu` | `fht_forward_kernel` | the FHT (TurboQuant's rotation) |
 | `transformers` | `DynamicCache(config=model.config)` | the cache object (TQ-intercepted) |
-| `src/rag/` | `turboquant`, `codebooks`, `tq_cache`, `m1m2`, `hooks`, `ingest`, `snapshot`, `install`, `query`, `finetune`, `lut_export`, `index`, `evals` (+ `codebooks/`, `tests/`) | the §1–§8 implementation; per-section clauses above name each entry point; 179 tests under `src/rag/tests/` |
+| `src/rag/` | `turboquant`, `codebooks`, `tq_cache`, `m1m2`, `hooks`, `ingest`, `snapshot`, `install`, `query`, `finetune`, `m1m2_finetune`, `lut_export`, `index`, `evals` (+ `codebooks/`, `tests/`) | the §1–§8 implementation; per-section clauses above name each entry point; 237 tests under `src/rag/tests/` |
 | `src/flute_extended/src/` | `kernel_gemv*.cu`, `kernel_streaming.cu`, `kernel_fht.cu`, `kernel_debug_simple.cu`, `kernel_cutlass_dense.cu` + `include/flute/` headers | the idxN inference CUDA kernels |

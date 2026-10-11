@@ -36,6 +36,59 @@ diagonal, every other pair in the batch a negative. Positive pairs come
 from GENERAL similarity datasets (MRPC/QQP/PAWS/SNLI/MNLI/STS-B/SQuAD —
 the handover's list); the served corpus is NEVER a training input.
 
+W19 — THE SADDLE (why the first training run never moved): the P3
+zero-init write gates sit at an EXACT saddle of this loss. At g=0
+every pair-side replays to the SAME state (m_init + 0 = m_init), and
+with the system reset point built at P3 gates m_init is exactly zero:
+all pair-states are the zero vector, every cosine is 0, every logit is
+equal, and the loss is ln(B) — the observed flat 2.0794 at B=8. The
+gradient w.r.t. the gates is then IDENTICALLY zero, in both regimes:
+  * zero states: sim = cos(u_a, u_b) with u = 0/||0||_clamped = 0, so
+    dsim/dstate = (du/dstate)^T · u_other = 0 exactly (the huge clamped
+    1/1e-12 Jacobian multiplies a ZERO vector);
+  * identical nonzero states (an open-gate system state): every cosine
+    sits AT its maximum (cos(v, v)), whose local gradient is 0, AND the
+    cross-entropy row gradient (p - y) sums to exactly 0 over each row,
+    so the common-direction component cancels exactly.
+The write path's own Jacobian dm/dg = Delta is nonzero (the branch-free
+gated add, PROPOSAL P3) — but <dL/dm, Delta> needs dL/dm, and dL/dm = 0
+at the saddle. The 50-step flat line on the GPU box is the exact
+arithmetic, not a weak signal. THE FIX: `GatesTrainConfig.gate_init`
+(0.1 by default) opens both write gates before step 0 — any nonzero
+value escapes (the cosine is scale-invariant, so the VALUE only sets
+where optimization starts, not whether signal exists); the P3 default
+in M1M2.__init__ is untouched (deployment semantics). gate_init=0/None
+keeps the loaded values and prints the loud saddle WARNING.
+
+W19 — THE LOSS GEOMETRY (delta-centering): the retrieval side scores
+CHUNK-vs-QUERY M1/M2 units in the W16 centered frame (chunk vector
+minus the system vector — the common component collapses the absolute
+cosine). The trainer now matches that geometry: `delta_loss=True`
+(default) computes the InfoNCE over (m_final - m_init) per side — the
+same deltas retrieval compares, with the system state's common
+direction removed. The absolute form stays available for the A/B
+(`GatesTrainConfig(delta_loss=False)` / the driver's --absolute-loss).
+
+W19 — THE SPEED (the 22 s/step): the per-step cost is ~95% the 16
+capture prefills (each prefill pushes S/M1/M2 through ~50 online
+TurboQuant quants of 2^19-wide units — the torch-reference FHT
+butterfly, 19 stages each, d > 32,768 is not CUDA-kernel-eligible);
+the replay forward + the W18 backward are ~0.5 s combined. THE FIX:
+`GatesTrainConfig.refresh_every` (4 by default) — the capture pool:
+ONE batch of pairs is prefilled, then trained on for refresh_every
+GRADIENT STEPS (the replay re-runs every step, so each gradient is
+taken at the CURRENT gates; only the captured k/v are frozen), and
+the prefill count drops refresh_every-fold. The k/v are DETACHED
+constants either way (the W18 gradient contract is unchanged —
+gradients remain exact w.r.t. the calls in hand); the only
+approximation is capture STALENESS: the k/v depend on the gates
+through the read-path feedback, and the gates move <= lr per step,
+so a retained batch is at most (refresh_every - 1) optimizer steps
+stale. Set --refresh-every 1 for the exact-recapture regime (the W17
+semantics, one gradient step per fresh capture). Phase timers
+(capture/replay/backward/step) and the gate-gradient magnitudes ride
+in every history entry — the box can now SEE where the seconds go.
+
 WHAT IS TRAINED: ONLY the M1M2 module's gate vectors
 (write_gate_k/write_gate_v per linear layer, optionally read_gate) —
 `freeze_all_but_gates` turns off every other parameter of the model
@@ -460,6 +513,18 @@ class GatesTrainConfig:
     seed: int = 1234
     log_every: int = 25
     memopt: Optional[bool] = None   # W18: None = the exact-gradient replay
+    # W19 — the saddle escape: nonzero fill of both write gates before
+    # step 0 (0.1 default; 0/None = keep the loaded values — at P3 zero
+    # that is the PROVABLY dead exact saddle, and the loop warns loudly)
+    gate_init: Optional[float] = 0.1
+    # W19 — the loss geometry: True = InfoNCE over (m - m_init) per side
+    # (the W16 centered retrieval frame); False = the absolute states
+    delta_loss: bool = True
+    # W19 — the capture pool: ONE batch of pairs prefilled, trained on
+    # for this many GRADIENT STEPS (1 = fresh capture every step, the
+    # W17 exact regime; the replay re-runs per step so gradients sit at
+    # the current gates — only the k/v are frozen, stale by <= lr x N)
+    refresh_every: int = 4
     history: List[Dict[str, float]] = field(default_factory=list)
 
 
@@ -472,6 +537,24 @@ def _cosine_lr(step: int, total: int, cfg: GatesTrainConfig) -> float:
                          math.pi * min(1.0, frac))))
 
 
+def _calls_bytes(calls) -> int:
+    """The retained bytes of a captured call list (k/v + positions)."""
+    n = 0
+    for (k, v, _layer, pos) in calls:
+        n += k.numel() * k.element_size() + v.numel() * v.element_size()
+        if pos is not None:
+            n += pos.numel() * pos.element_size()
+    return n
+
+
+def _grad_absmax(param) -> float:
+    """|grad|.max of a (possibly None / zero) parameter — the saddle
+    detector (0.0 = the gradient path is dead; the W19 history field)."""
+    if param is None or param.grad is None:
+        return 0.0
+    return float(param.grad.detach().abs().max())
+
+
 def train_gates(model, pairs: Iterable[Sequence[torch.Tensor]], system,
                 cache_factory: Callable, cfg: Optional[GatesTrainConfig] = None
                 ) -> GatesTrainConfig:
@@ -479,55 +562,133 @@ def train_gates(model, pairs: Iterable[Sequence[torch.Tensor]], system,
     served corpus — corpus independence is the design).
 
     pairs: an iterable of (ids_a, ids_b) positive-pair batches of length
-    cfg.batch_pairs (token-id tensors (1, T); the DRIVER tokenizes). Each
-    step: capture both sides under no_grad (production path), replay
-    under grad, InfoNCE, backward, AdamW step on the gate vectors ONLY.
+    cfg.batch_pairs (token-id tensors (1, T); the DRIVER tokenizes).
+
+    W19 step anatomy: a CAPTURE POOL — one batch of pairs prefilled under
+    no_grad (the production path), then trained on for
+    cfg.refresh_every gradient steps (the replay re-runs each step, so
+current-gate gradients; frozen k/v) — capture/replay/backward phase
+times and the gate-gradient magnitudes ride every history entry (the
+22 s/step black box is now instrumented). gate_init opens the write
+gates off the P3 exact saddle BEFORE step 0; delta_loss scores the
+states the centered retrieval frame scores (m - m_init).
 
     The model must be loaded with use_m1m2=True (the wiring) — the same
     mem_size as the intended ingestion; freeze_all_but_gates runs first.
     """
     cfg = cfg or GatesTrainConfig()
+    if cfg.refresh_every < 1:
+        raise ValueError(
+            f"train_gates: refresh_every must be >= 1, got "
+            f"{cfg.refresh_every}")
     inner = getattr(model, "model", model)
     module = inner.m1m2
     trainables = freeze_all_but_gates(model,
                                       include_read_gate=not cfg.freeze_read_gate)
+    # W19 — the saddle escape: the P3 zero-init write gates are an exact
+    # saddle of the InfoNCE (dL/dg identically 0; the module docstring's
+    # proof). Open them before step 0 unless explicitly told not to.
+    if cfg.gate_init:
+        with torch.no_grad():
+            module.write_gate_k.fill_(cfg.gate_init)
+            module.write_gate_v.fill_(cfg.gate_init)
+        print(f"    [gates] W19 saddle escape: write gates opened to "
+              f"{cfg.gate_init:+.3f} (P3 zero-init is an exact saddle — "
+              f"loss ln(B), gradient identically zero)", flush=True)
+    elif (float(module.write_gate_k.detach().abs().max()) == 0.0
+          and float(module.write_gate_v.detach().abs().max()) == 0.0):
+        print("    [gates] WARNING: zero write gates (P3) — the EXACT "
+              "saddle: the loss will sit at ln(B) and the gates will "
+              "NOT move; set gate_init/--gate-init != 0 to escape",
+              flush=True)
     torch.manual_seed(cfg.seed)
     opt = torch.optim.AdamW(
         [p for n, p in module.named_parameters()
          if any(n.endswith(t.split(".")[-1]) for t in trainables)],
         lr=cfg.lr, weight_decay=cfg.weight_decay)
+
     t0 = time.perf_counter()
-    for step, batch in enumerate(pairs):
+    phase = {"capture_s": 0.0, "replay_s": 0.0, "backward_s": 0.0}
+    cap_batch: Optional[List[List[Tuple]]] = None   # the retained sides
+    steps_on_batch = 0
+    pool_bytes = 0
+    pending = iter(pairs)
+    step = -1
+    while True:
+        step += 1
         if step >= cfg.max_steps:
             break
-        if len(batch) < 2:
-            raise ValueError(
-                f"train_gates: batch {step} holds {len(batch)} pairs — "
-                f"the InfoNCE needs >= 2 (in-batch negatives)")
+        # ---- the capture pool (W19): one batch of pairs is prefilled,
+        # then trained on for cfg.refresh_every GRADIENT STEPS (the
+        # replay re-runs each step, so the gradient is always taken at
+        # the CURRENT gates; only the captured k/v are frozen). This is
+        # the amortization: prefill count drops refresh_every-fold.
+        # The k/v are detached constants in the replay either way — the
+        # W18 exactness contract is untouched; the traded quantity is
+        # capture staleness (the gates moved <= lr x refresh_every).
+        if cap_batch is None or steps_on_batch >= cfg.refresh_every:
+            tc = time.perf_counter()
+            try:
+                batch = next(pending)
+            except StopIteration:
+                break               # pairs exhausted (the for-loop semantics)
+            if len(batch) < 2:
+                raise ValueError(
+                    f"train_gates: batch {step} holds {len(batch)} "
+                    f"pairs — the InfoNCE needs >= 2 (in-batch "
+                    f"negatives)")
+            cap_batch = []
+            pool_bytes = 0
+            for ids_a, ids_b in batch:
+                sides = []
+                for ids in (ids_a, ids_b):
+                    cache = cache_factory()
+                    calls, m1_i, m2_i = prefill_capture_calls(
+                        model, ids, cache, system)
+                    pool_bytes += _calls_bytes(calls)
+                    sides.append((calls, m1_i, m2_i))
+                    # W18: the calls' k/v stay alive inside the
+                    # replay graph until backward; the CACHE itself
+                    # is droppable now — codes only.
+                    del cache
+                cap_batch.append(sides)
+            steps_on_batch = 0
+            phase["capture_s"] += time.perf_counter() - tc
+            if cfg.log_every:
+                print(f"    [gates] capture batch prefilled: "
+                      f"{len(cap_batch)} pairs ({pool_bytes / 2**20:.0f}"
+                      f" MiB retained k/v)", flush=True)
+        steps_on_batch += 1
+
         for g in opt.param_groups:
             g["lr"] = _cosine_lr(step, cfg.max_steps, cfg)
+        # ---- replay under grad (the W18 exact-gradient Function default)
+        tr = time.perf_counter()
         states = []
-        for ids_a, ids_b in batch:
+        for sides in cap_batch:
             pair_states = []
-            for ids in (ids_a, ids_b):
-                cache = cache_factory()
-                calls, m1_i, m2_i = prefill_capture_calls(
-                    model, ids, cache, system)
+            for (calls, m1_i, m2_i) in sides:
                 m1, m2 = replay_states(module, calls, m1_i, m2_i,
                                        memopt=cfg.memopt)
-                # W18: the calls' k/v stay alive inside the replay graph
-                # until backward (the Function's backward recomputes from
-                # them); the CACHE itself is droppable now — codes only.
-                del cache
+                if cfg.delta_loss:
+                    # W19: score the DELTAS the centered retrieval frame
+                    # scores — the system state's common direction out
+                    m1, m2 = m1 - m1_i, m2 - m2_i
                 pair_states.append((m1, m2))
             states.append(pair_states)
         m1_a = torch.stack([s[0][0] for s in states])
         m2_a = torch.stack([s[0][1] for s in states])
         m1_b = torch.stack([s[1][0] for s in states])
         m2_b = torch.stack([s[1][1] for s in states])
+        phase["replay_s"] += time.perf_counter() - tr
         loss = infonce_pairs_loss(m1_a, m2_a, m1_b, m2_b, tau=cfg.tau)
         opt.zero_grad(set_to_none=True)
+        tb = time.perf_counter()
         loss.backward()
+        # W19 — the saddle/health detector: the gate-grad magnitudes the
+        # box asked for (recorded BEFORE the clip; 0.0 = dead path)
+        gk_absmax = _grad_absmax(module.write_gate_k)
+        gv_absmax = _grad_absmax(module.write_gate_v)
         pos, neg = cosine_spread(m1_a, m2_a, m1_b, m2_b)
         # W18: the replay graphs (the recorded k/v refs + the state
         # outputs) free here; explicit del after the metrics are read
@@ -537,12 +698,29 @@ def train_gates(model, pairs: Iterable[Sequence[torch.Tensor]], system,
             [p for p in module.parameters() if p.requires_grad],
             cfg.grad_clip)
         opt.step()
-        cfg.history.append({"step": step, "loss": float(loss.item()),
-                            "cos_pos": pos, "cos_neg": neg,
-                            "lr": opt.param_groups[0]["lr"]})
+        phase["backward_s"] += time.perf_counter() - tb
+        cfg.history.append({
+            "step": step, "loss": float(loss.item()),
+            "cos_pos": pos, "cos_neg": neg,
+            "lr": opt.param_groups[0]["lr"],
+            "gk_absmax": gk_absmax, "gv_absmax": gv_absmax,
+            **phase})
         if cfg.log_every and step % cfg.log_every == 0:
             print(f"    [gates] step {step:4d} loss {loss.item():.4f} "
                   f"cos(pos) {pos:+.3f} cos(neg) {neg:+.3f} "
                   f"lr {opt.param_groups[0]['lr']:.2e} "
+                  f"|g| {gk_absmax:.2e}/{gv_absmax:.2e} "
+                  f"cap {phase['capture_s'] / (step + 1):.2f}s "
+                  f"rep {phase['replay_s'] / (step + 1):.2f}s "
+                  f"bwd {phase['backward_s'] / (step + 1):.2f}s "
                   f"({time.perf_counter() - t0:.0f}s)", flush=True)
+    if cfg.history:
+        print(f"    [gates] done: {len(cfg.history)} steps in "
+              f"{time.perf_counter() - t0:.1f}s — capture "
+              f"{phase['capture_s']:.1f}s / replay "
+              f"{phase['replay_s']:.1f}s / backward "
+              f"{phase['backward_s']:.1f}s "
+              f"({100 * phase['capture_s'] / max(1e-9, sum(phase.values())):.0f}% "
+              f"capture), final |gk| "
+              f"{_grad_absmax(module.write_gate_k):.2e}", flush=True)
     return cfg
