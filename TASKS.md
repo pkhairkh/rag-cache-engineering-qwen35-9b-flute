@@ -747,7 +747,15 @@ py n/a; the auditor `exists`+`grep` checks.
 COMMIT: "W20.5.1 — the fht_large math contract header"
 
 #### W20.5.2 — `kernel_tq.cu` born: fht_forward_large
-- [ ] done
+- [x] done
+The len_=8,192 stage is LOWERED intra-tile (pass 1's fht_block runs
+sh 0..13 — the header's Boundary note sanctions it; global cross
+launches = log2 K − 14; the accounting constant stays 13). Pass 1
+reuses kernel_fht.cu:90's fht_block primitive (the pairing discipline
+by construction); cp.async 16 B raw on fp32, the converting loop on
+fp16/bf16. int64 pair indexing (M·K can pass 2^31 at the envelope
+edge). CANARY = NaN poison of out; TRAP = clock64-based pair flip;
+both #ifdef, default OFF.
 ROLE task-writer · READ `src/flute_extended/src/kernel_fht.cu:80-200`
 (the fht_stage pairing discipline: low = u+w, high = u−w, ascending —
 the rounding-order contract), `kernel_gemv_splitk.cu:1-120` (the
