@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: IN EXECUTION — 8/13 waves closed (W20.0–W20.7).
+Status: IN EXECUTION — 9/13 waves closed (W20.0–W20.8).
 
 ---
 
@@ -24,7 +24,7 @@ Status: IN EXECUTION — 8/13 waves closed (W20.0–W20.7).
 | W20.5 | K2 | fht_forward_large / fht_backward_large | 6 | — | CLOSED |
 | W20.6 | K2 | debug twins + canary/trap builds | 4 | G20.P2, G20.6 | CLOSED |
 | W20.7 | K3 | tq_quant_batched (the fused encode) | 5 | — | CLOSED |
-| W20.8 | K3 | tq_dequant_batched + dispatcher | 4 | G20.P3, G20.1, G20.2, G20.4 | OPEN |
+| W20.8 | K3 | tq_dequant_batched + dispatcher | 4 | G20.P3, G20.1, G20.2, G20.4 | CLOSED |
 | W20.9 | K4 | QJL kernel chain + tq_l2norm_rows | 4 | — | OPEN |
 | W20.10 | K4 | serving-side batched passes | 4 | G20.5 | OPEN |
 | W20.11 | K5 | trainer levers (refresh 8, loader pinning) | 3 | G20.2 full, G20.3 | OPEN |
@@ -1171,7 +1171,7 @@ scripts/gpu/w20_gates.py` hit; py_compile.
 COMMIT: "W20.8.3 — the TQ kernel suite + G20.P3/P4/1/2 authored"
 
 #### W20.8.4 — wave close W20.8 (K3 complete)
-- [ ] done
+- [x] done
 ROLE orchestrator · standard close-out + HANDOVER's K3 section (the
 two-kernel-chains-per-prefill note; the box runs G20.P3/P4 and the
 G20.1/2 phase-1 timers).
@@ -1428,11 +1428,11 @@ failure). A gate turns GREEN/RED **only** from
 |---|---|---|---|---|
 | G20.P1 | K1: the torch single path vs the frozen fixtures + the 237-suite regression | codes equal except ties ≤ 0.01%; norm ≤ 1 ulp; recon allclose ≤ 1e-5 rel; run-to-run `torch.equal` (CUDA); 237-suite 0 failures | W20.4 | AUTHORED — PENDING (awaiting the A10G box report per env/W20_GPU_PROTOCOL.md) |
 | G20.P2 | K2: fht_large differential twins + determinism | kernel vs debug twin vs torch allclose ≤ 1e-5; run-to-run `torch.equal`; K%32≠0 and K≤16,384 refusals raise | W20.6 | AUTHORED — PENDING (awaiting the A10G box report; build the variants first or G20.6 FAILs honestly) |
-| G20.P3 | K3+K4: TQ kernel parity (quant+dequant+qjl) | same as G20.P1 thresholds on kernel outputs; batched-grid shapes 120–192 units | W20.8 (qjl folds in W20.9) | NOT-AUTHORED |
-| G20.1 | capture cycle + TQ share | capture ≤ 10 s/cycle after K3; TQ ≤ 5 ms/prefill (phase timers) | W20.8 (phase-1) | NOT-AUTHORED |
-| G20.2 | step time + the 300-step run | step ≤ 2 s after K3; ≤ 1 s at refresh 8; 300 steps ≤ 10 min | W20.8 (phase-1) / W20.11 (full) | NOT-AUTHORED |
+| G20.P3 | K3+K4: TQ kernel parity (quant+dequant+qjl) | same as G20.P1 thresholds on kernel outputs; batched-grid shapes 120–192 units | W20.8 (qjl folds in W20.9) | AUTHORED — PENDING (awaiting the A10G box report; the qjl leg completes W20.9) |
+| G20.1 | capture cycle + TQ share | capture ≤ 10 s/cycle after K3; TQ ≤ 5 ms/prefill (phase timers) | W20.8 (phase-1) | AUTHORED — PENDING (phase-1: short-run history timers; full confirmation after K4/K5) |
+| G20.2 | step time + the 300-step run | step ≤ 2 s after K3; ≤ 1 s at refresh 8; 300 steps ≤ 10 min | W20.8 (phase-1) / W20.11 (full) | AUTHORED — PENDING (phase-1; the refresh-8 + 300-step legs evaluate W20.11) |
 | G20.3 | W19 convergence (re-run on the kernel path) | loss leaves ln(8) at step 0; gk/gv_absmax > 0; held-out spread positive | W20.11 | NOT-AUTHORED |
-| G20.4 | the parity contract (levels 1–2) | level 1: run-to-run `torch.equal` (codes + recon, kernel); level 2: ties ≤ 0.01%, norm ≤ 1 ulp, allclose ≤ 1e-5 | W20.8 | NOT-AUTHORED |
+| G20.4 | the parity contract (levels 1–2) | level 1: run-to-run `torch.equal` (codes + recon, kernel); level 2: ties ≤ 0.01%, norm ≤ 1 ulp, allclose ≤ 1e-5 | W20.8 | AUTHORED — PENDING (awaiting the A10G box report) |
 | G20.5 | protocol integrity | TRAIN → RE-INGEST → INDEX → EVAL → QUERY on the kernel path; npz digests stable run-to-run; cross-backend decode allclose ≤ 1e-5; W16 verbatim install bit-exact within backend | W20.10 | NOT-AUTHORED |
 | G20.6 | canary/trap | canary build: zero poison survives; trap build: FAILS the determinism gate (the negative control must fail) | W20.6 | AUTHORED — PENDING (the variants must be built on the box first — scripts/gpu/w20_build_variants.sh) |
 
@@ -1454,7 +1454,7 @@ truthful (PROMPT.md §1.4):
 | W20.5 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.5 exit 0 (27/27, re-verified post-tag; incl. the kernel_fht.cu byte-identical git fact via the new git_diff_empty kind); compile deferred to the A10G box (nvcc ABSENT, recorded); push w20-wave-5 |
 | W20.6 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.6 exit 0 (20/20, re-verified post-tag); push w20-wave-6 |
 | W20.7 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.7 exit 0 (17/17, re-verified post-tag; the module-wide atomics-free absent-check green); compile deferred to the A10G box; push w20-wave-7 |
-| W20.8 | — (pending) |
+| W20.8 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.8 exit 0 (21/21, re-verified post-tag); push w20-wave-8 |
 | W20.9 | — (pending) |
 | W20.10 | — (pending) |
 | W20.11 | — (pending) |

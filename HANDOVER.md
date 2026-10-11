@@ -399,3 +399,28 @@ mirrors; the y workspace is 2 MiB/unit (chunk if VRAM-tight);
 G20.P3's quant half lands with dequant next wave. Tier-D 17/17
 post-tag; attestation truthful. Next: W20.8 — tq_dequant_batched +
 the kernel-first dispatcher (K3 end — TQ leaves the profile).
+
+## W20.8 — K3 COMPLETE: the decode + the dispatcher, TQ leaves the profile (CLOSED 2026-10-11)
+
+tq_dequant_batched (the mirror of quant: bfe-semantics unpack — the
+exact inverse of the pack — the smem LUT broadcast with zero global
+gather, fht_backward_large launched verbatim, the norms broadcast,
+one cast); the kernel-first dispatcher (REV-3 routing: CUDA +
+eligible → the KERNEL path, ALWAYS; CPU/absent/ineligible → the torch
+twin — the performance fallback, never correctness; the W15 outlier
+split and the 24,576 conv window stay twin-side; mixed-device inputs
+raise by name); the CUDA-gated TQ kernel suite (7 tests — the ladder
+vs the twin via the one-probe monkeypatch, the batched-grid shapes,
+run-to-run determinism, the refusals).
+
+**7 of 9 gates are now AUTHORED — PENDING** (G20.P1, P2, P3, P4, G6 +
+the phase-1 G20.1/G20.2 whose full legs evaluate at W20.11; the
+remaining stubs: G20.3 → W20.11, G20.5 → W20.10). The two
+kernel-chains-per-prefill design is live in code: the ~4,000 host
+round trips are structurally gone on the CUDA path. The box runs
+G20.P3/P4 + the phase-1 timers per the protocol (the finetune
+short-run history; the TQ-share CUDA-event timing).
+
+Wave DoD: Tier-D 21/21 post-tag (incl. turboquant's numpy-zero still
+0 and the module-wide atomics-free check); attestation truthful.
+Next: W20.9 — the QJL kernel chain + tq_l2norm_rows (K4).

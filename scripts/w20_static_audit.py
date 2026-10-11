@@ -666,7 +666,51 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.7.5 —"},
         {"kind": "git_tag", "target": "w20-wave-7"},
     ],
-    # W20.8 … W20.12 — appended by each wave's close-out task.
+    # W20.8 — tq_dequant_batched + the dispatcher (appended at W20.8.4)
+    "W20.8": [
+        # W20.8.1 — tq_dequant_batched
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "tq_dequant_batched"},
+        {"kind": "grep", "target": "src/flute_extended/src/bindings.cpp",
+         "pattern": "tq_dequant_batched"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "lut|LUT"},
+        # W20.8.2 — the kernel-first dispatcher
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "kernel_available|dispatch"},
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "tq_quant_batched|tq_dequant_batched"},
+        {"kind": "py_compile", "target": "src/rag/turboquant.py"},
+        {"kind": "absent", "target": "src/rag/turboquant.py",
+         "pattern": r"np\.|numpy"},
+        # W20.8.3 — the suite + the gates
+        {"kind": "exists", "target":
+         "src/rag/tests/w20/test_w20_tq_kernels.py"},
+        {"kind": "grep", "target":
+         "src/rag/tests/w20/test_w20_tq_kernels.py",
+         "pattern": "def test_"},
+        {"kind": "grep", "target":
+         "src/rag/tests/w20/test_w20_tq_kernels.py",
+         "pattern": "_gpu_guard"},
+        {"kind": "py_compile", "target":
+         "src/rag/tests/w20/test_w20_tq_kernels.py"},
+        {"kind": "grep", "target": "scripts/gpu/w20_gates.py",
+         "pattern": "gate_g20_p3|gate_g20_4"},
+        {"kind": "grep", "target": "scripts/gpu/w20_gates.py",
+         "pattern": "NOT-AUTHORED-YET"},
+        {"kind": "py_compile", "target": "scripts/gpu/w20_gates.py"},
+        # The determinism contract, module-wide
+        {"kind": "absent", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "atomic"},
+        # W20.8.4 — wave close: ledger + git facts
+        {"kind": "ledger", "target": "W20.8"},
+        {"kind": "git_log", "target": "W20.8.1 —"},
+        {"kind": "git_log", "target": "W20.8.2 —"},
+        {"kind": "git_log", "target": "W20.8.3 —"},
+        {"kind": "git_log", "target": "W20.8.4 —"},
+        {"kind": "git_tag", "target": "w20-wave-8"},
+    ],
+    # W20.9 … W20.12 — appended by each wave's close-out task.
 }
 
 
