@@ -89,6 +89,16 @@ def synthetic_pairs(n: int, vocab: int, length: int = 96, seed: int = 5):
     return out
 
 
+def _host_pinned(ids) -> torch.Tensor:
+    """W20.11.2 — the loader pinning: token-id tensors are built on the
+    HOST as PINNED (page-locked) tensors, so the capture loop's
+    per-refresh H2D staging rides async DMA (non_blocking). Transport
+    only — the values are bit-identical to the plain host tensors;
+    without CUDA the plain tensor is returned (same values, no pin)."""
+    t = torch.tensor([ids])
+    return t.pin_memory() if torch.cuda.is_available() else t
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -128,7 +138,14 @@ def main() -> int:
                          "fresh capture every step, the W17 regime). The "
                          "replay re-runs per step so gradients sit at the "
                          "current gates; only the k/v freeze (stale by "
-                         "<= lr x N steps)")
+                         "<= lr x N steps). W20: 8 = the THROUGHPUT "
+                         "regime — a first-class A/B row; at refresh 8 "
+                         "the staleness bound is lr x (N - 1) = lr x 7 "
+                         "(the tight form of the N bound above: the "
+                         "frozen k/v trail the gates by at most 7 "
+                         "optimizer steps, and the prefill count halves "
+                         "again). The default 4 stays quality-first — "
+                         "the operator's call on the box")
     ap.add_argument("--absolute-loss", action="store_true",
                     help="A/B: score the ABSOLUTE states (m_final) instead "
                          "of the W19 default deltas (m_final - m_init; the "
@@ -177,9 +194,12 @@ def main() -> int:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
     print("\n[2] Building the system reset point (the delta zero)...")
-    system_ids = torch.tensor(
-        [tokenizer.encode(args.system_prompt, add_special_tokens=False)],
-        dtype=torch.long).to(args.device)
+    # W20.11.2 — the loader pinning: the system prefill's inputs stage
+    # through the same pinned transport (host-built -> pinned ->
+    # non_blocking H2D; values identical)
+    system_ids = _host_pinned(
+        tokenizer.encode(args.system_prompt, add_special_tokens=False)
+    ).to(args.device, non_blocking=True)
     cache = TQCache(config=model.config, bits=args.bits, online=True)
     system = prefill_system(model.model, system_ids, cache,
                             system_ref="m1m2-finetune", bits=args.bits)
@@ -187,10 +207,13 @@ def main() -> int:
           f"m1 {'present' if system.m1_codes is not None else 'zero-init'}")
 
     print("\n[3] Loading pairs...")
+    # W20.11.2 — the loader pinning: pairs are built on HOST as PINNED
+    # tensors and the H2D moves INTO the capture loop — each pool
+    # refresh stages its prefill inputs there, the staging window
+    # being the refresh cycle (transport only, values bit-identical)
     if args.self_test:
         raw = synthetic_pairs(64, vocab=tokenizer.vocab_size)
-        pairs = [(torch.tensor([p[0]]).to(args.device),
-                  torch.tensor([p[1]]).to(args.device)) for p in raw]
+        pairs = [(_host_pinned(p[0]), _host_pinned(p[1])) for p in raw]
         print("    [SELF-TEST] 64 synthetic pairs (mechanics only)")
     else:
         if not args.pairs_file:
@@ -205,10 +228,16 @@ def main() -> int:
                 ids1, ids2 = ids1[:args.max_tokens], ids2[:args.max_tokens]
             if not ids1 or not ids2:
                 continue
-            pairs.append((torch.tensor([ids1]).to(args.device),
-                          torch.tensor([ids2]).to(args.device)))
+            pairs.append((_host_pinned(ids1), _host_pinned(ids2)))
     n_val = max(2, int(len(pairs) * args.val_frac)) if len(pairs) > 4 else 0
-    val_pairs = pairs[:n_val] if n_val else []
+    # W20.11.2: the held-out prefills' ids stage ONCE here (the same
+    # pinned non_blocking transport — [5] runs the unchanged path)
+    if n_val:
+        val_pairs = [(a.to(args.device, non_blocking=True),
+                      b.to(args.device, non_blocking=True))
+                     for a, b in pairs[:n_val]]
+    else:
+        val_pairs = []
     train_iter = _cycle_batches(pairs[n_val:] if n_val else pairs,
                                 args.batch_pairs)
 

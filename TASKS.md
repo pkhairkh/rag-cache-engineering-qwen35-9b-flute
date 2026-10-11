@@ -1349,7 +1349,17 @@ docstring; py_compile both.
 COMMIT: "W20.11.1 — the refresh-8 regime documented (staleness lr×7)"
 
 #### W20.11.2 — the loader pinning
-- [ ] done
+- [x] done
+Realization: the driver's pair/system token-id tensors built
+host-side then pinned (_host_pinned, guarded — plain tensors without
+CUDA, values identical); the H2D moved INTO the capture loop
+(non_blocking, the pinned sources ride async DMA); train_gates
+pre-fetches the NEXT pool's ids during the current refresh cycle (the
+staging window); already-device ids pass through as the same objects;
+non-tensor id placeholders pass verbatim (the W19 test shims must
+stay green). Bit-identical values, batch order, termination, RNG.
+Same-stream async (µs-scale copies — a side stream would be
+over-engineering, noted).
 ROLE task-writer · READ `src/rag/m1m2_finetune.py` (the capture pool's
 batch feed), `scripts/gpu/finetune_m1m2.py` (the pairs-file loading) ·
 WRITE either

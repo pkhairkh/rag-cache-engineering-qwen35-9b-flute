@@ -89,6 +89,17 @@ semantics, one gradient step per fresh capture). Phase timers
 (capture/replay/backward/step) and the gate-gradient magnitudes ride
 in every history entry — the box can now SEE where the seconds go.
 
+W20.11 — THE LOADER PINNING (transport, not math): the capture loop's
+host->device path is pinned — the driver hands (pinned) HOST token-id
+tensors, and each pool refresh stages its prefill inputs on the
+capture device with a non_blocking H2D. The staging window IS the
+refresh cycle: the NEXT pool's ids stage while the current pool
+trains, resident on the device before the next prefill wave needs
+them. Zero semantics change — the values are bit-identical (pinning
+moves bytes, not math); the W18 exact-gradient and W19 pool contracts
+are untouched, and the training step's data path (replay over the
+captured k/v) sees nothing new.
+
 WHAT IS TRAINED: ONLY the M1M2 module's gate vectors
 (write_gate_k/write_gate_v per linear layer, optionally read_gate) —
 `freeze_all_but_gates` turns off every other parameter of the model
@@ -523,7 +534,13 @@ class GatesTrainConfig:
     # W19 — the capture pool: ONE batch of pairs prefilled, trained on
     # for this many GRADIENT STEPS (1 = fresh capture every step, the
     # W17 exact regime; the replay re-runs per step so gradients sit at
-    # the current gates — only the k/v are frozen, stale by <= lr x N)
+    # the current gates — only the k/v are frozen, stale by <= lr x N).
+    # W20.11 — the regimes: 4 (the default) is quality-first; 8 is the
+    # THROUGHPUT regime, a first-class A/B row — the staleness bound is
+    # lr x (N - 1) = lr x 7 at refresh 8 (the tight form of the N bound
+    # above: the captured k/v trail the gates by at most 7 optimizer
+    # steps; the prefill count halves again vs 4). The operator's call
+    # on the box — A/B it and watch the loss/cos separation.
     refresh_every: int = 4
     history: List[Dict[str, float]] = field(default_factory=list)
 
@@ -555,6 +572,28 @@ def _grad_absmax(param) -> float:
     return float(param.grad.detach().abs().max())
 
 
+def _stage_ids(ids, dev):
+    """W20.11.2 — the loader pinning: one prefill input onto the capture
+device (non_blocking H2D — a pinned host source rides async DMA;
+bit-identical values, transport only). An id tensor already on `dev`
+passes through unchanged (.to() no-op); a NON-tensor id (the W19 test
+shim's None placeholders) passes through verbatim — the capture call
+sees exactly what it saw before."""
+    if isinstance(ids, torch.Tensor):
+        return ids.to(dev, non_blocking=True)
+    return ids
+
+
+def _stage_prefill_ids(batch, dev):
+    """W20.11.2 — the loader pinning: pre-stage a pair batch's prefill
+inputs on the capture device (per pool refresh — the staging window
+is the refresh cycle; see train_gates). Values bit-identical."""
+    staged = []
+    for ids_a, ids_b in batch:
+        staged.append((_stage_ids(ids_a, dev), _stage_ids(ids_b, dev)))
+    return staged
+
+
 def train_gates(model, pairs: Iterable[Sequence[torch.Tensor]], system,
                 cache_factory: Callable, cfg: Optional[GatesTrainConfig] = None
                 ) -> GatesTrainConfig:
@@ -573,6 +612,14 @@ times and the gate-gradient magnitudes ride every history entry (the
 gates off the P3 exact saddle BEFORE step 0; delta_loss scores the
 states the centered retrieval frame scores (m - m_init).
 
+    W20.11.2 — the loader pinning: each pool refresh stages its prefill
+inputs on the capture device (a non_blocking H2D — the driver hands
+pinned HOST id tensors; ids already on the device pass through), and
+the NEXT pool's ids pre-stage during the current refresh cycle (the
+staging window), resident before the next prefill wave. Transport
+only — values bit-identical; the training step's data path (replay
+over the captured k/v) is untouched.
+
     The model must be loaded with use_m1m2=True (the wiring) — the same
     mem_size as the intended ingestion; freeze_all_but_gates runs first.
     """
@@ -583,6 +630,10 @@ states the centered retrieval frame scores (m - m_init).
             f"{cfg.refresh_every}")
     inner = getattr(model, "model", model)
     module = inner.m1m2
+    # W20.11.2 — the loader pinning: the capture device (where the
+    # gates/model live — the pool's prefill inputs stage onto it per
+    # refresh; ids already there pass through .to() unchanged)
+    cap_dev = module.write_gate_k.device
     trainables = freeze_all_but_gates(model,
                                       include_read_gate=not cfg.freeze_read_gate)
     # W19 — the saddle escape: the P3 zero-init write gates are an exact
@@ -614,6 +665,13 @@ states the centered retrieval frame scores (m - m_init).
     pool_bytes = 0
     pending = iter(pairs)
     step = -1
+    # W20.11.2 — the loader pinning: `staged` holds the NEXT pool's
+    # prefill inputs, already on the capture device (the staging window
+    # IS the refresh cycle — the next pool's ids stage while the
+    # current pool trains, resident before the next prefill wave).
+    # None = nothing pre-staged (the first refresh, or the pairs ran
+    # out at the prefetch).
+    staged: Optional[List] = None
     while True:
         step += 1
         if step >= cfg.max_steps:
@@ -628,10 +686,13 @@ states the centered retrieval frame scores (m - m_init).
         # capture staleness (the gates moved <= lr x refresh_every).
         if cap_batch is None or steps_on_batch >= cfg.refresh_every:
             tc = time.perf_counter()
-            try:
-                batch = next(pending)
-            except StopIteration:
-                break               # pairs exhausted (the for-loop semantics)
+            if staged is None:
+                try:
+                    staged = _stage_prefill_ids(next(pending), cap_dev)
+                except StopIteration:
+                    break    # pairs exhausted (the for-loop semantics)
+            batch = staged
+            staged = None
             if len(batch) < 2:
                 raise ValueError(
                     f"train_gates: batch {step} holds {len(batch)} "
@@ -652,6 +713,15 @@ states the centered retrieval frame scores (m - m_init).
                     # is droppable now — codes only.
                     del cache
                 cap_batch.append(sides)
+            # W20.11.2 — pre-stage the NEXT pool's prefill inputs NOW:
+            # the staging window is the rest of this refresh cycle (the
+            # tiny non_blocking copies ride the current stream during
+            # this pool's gradient steps; same-stream ordering has them
+            # complete long before any use — values bit-identical).
+            try:
+                staged = _stage_prefill_ids(next(pending), cap_dev)
+            except StopIteration:
+                staged = None
             steps_on_batch = 0
             phase["capture_s"] += time.perf_counter() - tc
             if cfg.log_every:
