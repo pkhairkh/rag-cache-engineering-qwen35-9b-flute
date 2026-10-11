@@ -315,6 +315,14 @@ class M1M2(nn.Module):
         self.center_write = center_write
         self.addr_blocks = addr_blocks
         self.read_topk = read_topk
+        # W23: the answer-time A/B knob — True (default) keeps the
+        # read/write block active in the model forward (modeling.py's
+        # guard reads it via getattr); the query drivers set it False
+        # around the ANSWER phase only, reproducing the true-doc
+        # control's regime (retrieval-side prefills keep it ON — the §4
+        # vector still carries the M1/M2 codes). Not a parameter, never
+        # serialized: a pure runtime flag.
+        self.enabled = True
         self._sqrt_d = math.sqrt(head_dim)
         # GATES — the only weights (the §7 fine-tune trains these).
         self.write_gate_k = nn.Parameter(

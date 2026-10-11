@@ -724,8 +724,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # quantize-on-write, §3.2); zero-init write gates = bit-identical
         # no-op (PROPOSAL P3). Write positions run on a per-cache token
         # counter (decode steps stop overwriting slot 0).
+        # W23 `enabled` (module attribute, default True): the answer-time
+        # A/B — the query drivers set it False to run the answer in the
+        # true-doc control's regime (no memory read/write during the
+        # answer; the retrieval-side query prefill keeps it ON, so the
+        # §4 vector is unaffected).
         _m1m2 = getattr(self, "m1m2", None)
-        if _m1m2 is not None and cache_params is not None and hasattr(cache_params, "read_m1"):
+        if _m1m2 is not None and cache_params is not None \
+                and hasattr(cache_params, "read_m1") \
+                and getattr(_m1m2, "enabled", True):
             _m1 = cache_params.read_m1(dtype=value.dtype)
             _m2 = cache_params.read_m2(dtype=value.dtype)
             if _m1 is None:
