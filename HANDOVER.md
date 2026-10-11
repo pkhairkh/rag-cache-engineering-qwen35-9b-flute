@@ -212,3 +212,25 @@ commits W20.0.1–W20.0.5 on origin; annotated tag `w20-wave-0` pushed.
 Tier-G: none in this wave. No test executed, no CPU test authored, no
 repo module imported on the dev box (the attestation ledger, TASKS.md
 §5). Next: W20.1 — the baseline tag + frozen probe fixtures.
+
+## W20.1 — baseline tag + frozen probe fixtures (CLOSED 2026-10-11)
+
+- `w20-baseline` (annotated tag) → e9ea357 — the numpy-era runtime
+  tree pinned BEFORE the rewrite (W20.0 was infra-only; runtime
+  byte-identical to 9af04fe). This is the fixture-capture checkout.
+- `scripts/gpu/w20_capture_fixtures.py` — the capture vehicle,
+  refusal-first: pinned-checkout assert (exit 2) → CUDA assert
+  (exit 3) → only then the pinned repo imports. 14 seeded probes
+  (G1 d=2^19 ×4, G2 d=24,576 ×4 the conv geometry with the W15
+  outlier-split, G3 d=2^22 ×2; mse/prod(=qjl)/b∈{3,4}/3.5-bit split
+  covered; source-true deviations pinned in the TASKS.md ledger).
+- `env/W20_GPU_PROTOCOL.md` — the A10G operator's five-step sequence
+  (provision → capture → commit-from-box → per-wave gates → final
+  registry run), with the §4 gate registry transcribed 1:1.
+  `env/w20_gate_reports/` gitignored (box-written, never committed).
+
+Wave DoD: Tier-D green (25/25, auditor --wave W20.1 exit 0 post-tag);
+Tier-G: the capture is AUTHORED, PENDING until the A10G box runs it
+(protocol step 2). Attestation truthful (no test executed, no CPU
+test authored, no repo module imported on this box). Next: W20.2 —
+the TQCodes device contract + codebook mirror.

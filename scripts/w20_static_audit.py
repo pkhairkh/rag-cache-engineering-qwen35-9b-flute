@@ -293,7 +293,53 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.0.5 —"},
         {"kind": "git_tag", "target": "w20-wave-0"},
     ],
-    # W20.1 … W20.12 — appended by each wave's close-out task.
+    # W20.1 — baseline tag + frozen probe fixtures (appended at W20.1.4)
+    "W20.1": [
+        # W20.1.1 — tag the pre-rewrite tree
+        {"kind": "git_tag", "target": "w20-baseline"},
+        {"kind": "grep", "target": "TASKS.md", "pattern": "e9ea357"},
+        # W20.1.2 — the fixture capture script (GPU-box, pinned checkout)
+        {"kind": "exists", "target": "scripts/gpu/w20_capture_fixtures.py"},
+        {"kind": "py_compile", "target": "scripts/gpu/w20_capture_fixtures.py"},
+        {"kind": "grep", "target": "scripts/gpu/w20_capture_fixtures.py",
+         "pattern": "w20-baseline"},
+        {"kind": "grep", "target": "scripts/gpu/w20_capture_fixtures.py",
+         "pattern": "sha256"},
+        {"kind": "grep", "target": "scripts/gpu/w20_capture_fixtures.py",
+         "pattern": "torch.cuda.is_available"},
+        {"kind": "grep", "target": "scripts/gpu/w20_capture_fixtures.py",
+         "pattern": "fixtures_manifest.json"},
+        {"kind": "grep", "target": "scripts/gpu/w20_capture_fixtures.py",
+         "pattern": "e9ea357fee"},
+        {"kind": "absent", "target": "scripts/gpu/w20_capture_fixtures.py",
+         "pattern": r"def test_"},
+        # W20.1.3 — the A10G protocol doc (five steps in order)
+        {"kind": "exists", "target": "env/W20_GPU_PROTOCOL.md"},
+        {"kind": "grep", "target": "env/W20_GPU_PROTOCOL.md",
+         "pattern": "w20-baseline"},
+        {"kind": "grep", "target": "env/W20_GPU_PROTOCOL.md",
+         "pattern": "w20_gates.py"},
+        {"kind": "grep", "target": "env/W20_GPU_PROTOCOL.md",
+         "pattern": "Step 1"},
+        {"kind": "grep", "target": "env/W20_GPU_PROTOCOL.md",
+         "pattern": "Step 2"},
+        {"kind": "grep", "target": "env/W20_GPU_PROTOCOL.md",
+         "pattern": "Step 3"},
+        {"kind": "grep", "target": "env/W20_GPU_PROTOCOL.md",
+         "pattern": "Step 4"},
+        {"kind": "grep", "target": "env/W20_GPU_PROTOCOL.md",
+         "pattern": "Step 5"},
+        {"kind": "grep", "target": ".gitignore",
+         "pattern": "env/w20_gate_reports/"},
+        # W20.1.4 — wave close: ledger + git facts
+        {"kind": "ledger", "target": "W20.1"},
+        {"kind": "git_log", "target": "W20.1.1 —"},
+        {"kind": "git_log", "target": "W20.1.2 —"},
+        {"kind": "git_log", "target": "W20.1.3 —"},
+        {"kind": "git_log", "target": "W20.1.4 —"},
+        {"kind": "git_tag", "target": "w20-wave-1"},
+    ],
+    # W20.2 … W20.12 — appended by each wave's close-out task.
 }
 
 

@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: IN EXECUTION — 1/13 waves closed (W20.0).
+Status: IN EXECUTION — 2/13 waves closed (W20.0, W20.1).
 
 ---
 
@@ -17,7 +17,7 @@ Status: IN EXECUTION — 1/13 waves closed (W20.0).
 | wave | phase (PROPOSAL §8) | title | tasks | gates authored | status |
 |---|---|---|---|---|---|
 | W20.0 | pre-K | environment + audit infrastructure | 5 | — | CLOSED |
-| W20.1 | K1 | baseline tag + frozen probe fixtures | 4 | (capture) | OPEN |
+| W20.1 | K1 | baseline tag + frozen probe fixtures | 4 | (capture) | CLOSED |
 | W20.2 | K1 | TQCodes device contract + codebook mirror | 3 | — | OPEN |
 | W20.3 | K1 | turboquant.py torch rewrite (the core) | 6 | — | OPEN |
 | W20.4 | K1 | wiring + serving sweep + K1 gates | 7 | G20.P1 | OPEN |
@@ -255,7 +255,7 @@ DO-D: doc exists; contains all five steps in order + `w20-baseline` +
 COMMIT: "W20.1.3 — the A10G protocol doc (provision → capture → gates)"
 
 #### W20.1.4 — wave close W20.1
-- [ ] done
+- [x] done
 ROLE orchestrator · standard close-out (PROMPT.md §5).
 Tier-D: tasks 1–3 DO-D sets; tag pushed; ledger updated.
 Tier-G: the capture (execution belongs to the box; AUTHORED here).
@@ -1215,7 +1215,7 @@ truthful (PROMPT.md §1.4):
 | wave | attestation |
 |---|---|
 | W20.0 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.0 exit 0 (26/26, re-verified post-tag); push w20-wave-0 |
-| W20.1 | — (pending) |
+| W20.1 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.1 exit 0 (25/25, re-verified post-tag); push w20-wave-1 |
 | W20.2 | — (pending) |
 | W20.3 | — (pending) |
 | W20.4 | — (pending) |
