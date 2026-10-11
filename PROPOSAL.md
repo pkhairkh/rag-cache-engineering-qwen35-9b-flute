@@ -7,8 +7,17 @@ round-trips in the hot loop**. This re-opens the `PROPOSAL.md` slot
 (D1–D5, P0–P7) was retired in the doc sweep — historical decision IDs
 still cited in code comments refer to that retired record. The IDs below
 are fresh: the design is **G-TQ** (GPU-resident TurboQuant), its build
-phases **W20.1–W20.4**, risks **R20.1–R20.6**, gates **G20.1–G20.5**.
-Status: proposed (this document); no code changed in this commit.
+phases **W20.1–W20.5**, risks **R20.1–R20.6**, gates **G20.1–G20.5**.
+Status: **rev 1 — the ALL-GPU directive** (the user's follow-up,
+verbatim: "WE NEED ALL OF TURBOQUANT ON GPU! WE NEED NO CPU PATHS AS
+FAR AS POSSIBLE!"): rev 0 kept the CPU numpy path as a live runtime
+reference; rev 1 removes it from the runtime entirely. One
+device-parametric torch path serves every box — CUDA tensors in
+production (never a numpy array, never a sync), CPU tensors only where
+the surrounding box has no GPU (this dev box, the test twin). The legacy
+numpy behavior is pinned by frozen probe fixtures inside the TEST
+SUITE, not by a live code path. Proposed; no code changed in this
+commit.
 
 Trigger — the GPU box's W19-post report (verbatim findings):
 
@@ -33,6 +42,17 @@ the PCIe bus twice and runs its reconstruction math on one CPU thread**.
 This proposal removes the crossings and the CPU math — not by touching
 the backward (it is already exact and cheap, W18/W19), but by making
 the quant/dequant round trip a resident GPU operation.
+
+**REV 1, THE HARDENED DIRECTIVE**: rev 0 spoke of a "GPU twin with the
+CPU reference kept intact". That is withdrawn. The runtime keeps ONE
+path — device-parametric torch — and the numpy implementations are
+DELETED from it, not branched around. Every quant, dequant, codebook
+access, pack/unpack, QJL sketch, snapshot install and retrieval-vector
+build in the serving/training stack runs torch ops on the caller's
+device. What remains outside torch is exactly two FOREIGN boundaries
+(§3.5): the npz file format at the disk edge and the faiss CPU index at
+the retrieval edge — and even there, all MATH is torch/GPU; only the
+final bytes hand off.
 
 ---
 
@@ -93,32 +113,69 @@ today.
 
 ## 3. The design: G-TQ — GPU-resident TurboQuant
 
-The contract: **when the input tensor is CUDA, `quant()` and
-`dequant()` never leave the device and never sync the stream.** The CPU
-reference path stays byte-for-byte intact (tests, the CPU box, parity
-probes) — G-TQ engages on exactly the same discipline as `fht.py`'s
-auto backend ("CUDA kernel when built + CUDA input, torch butterfly
-otherwise"). Persistence (snapshots, install, the index loader) keeps
-its numpy contract through one cold conversion boundary (§3.5).
+The contract (rev 1): **ONE device-parametric torch path. When the
+input tensor is CUDA, `quant()` and `dequant()` never leave the device,
+never sync the stream, and never construct a numpy array. When the
+input tensor is CPU (the GPU-less dev box, the test twin), the SAME
+code runs the SAME torch ops on CPU tensors — there is no second,
+numpy implementation anywhere in the runtime.** The legacy numpy
+semantics (searchsorted buckets, packed-bit layout, QJL signs, the
+npz field layout) are pinned by frozen probe fixtures in the test
+suite — assertions about outputs, not a live path that can drift (and
+that is the point: two live paths drift; one path plus fixtures cannot).
+The FHT backend keeps `fht.py`'s auto discipline (CUDA kernel when
+eligible + CUDA input, torch butterfly otherwise) — that is a KERNEL
+dispatch, not a CPU detour: on a CUDA input the butterfly is never on
+the CPU.
+
+### 3.0 The CPU-elimination audit (what gets deleted, module by module)
+
+Measured at HEAD c4c1091 — every numpy / sync / transfer touchpoint in
+the TQ runtime stack and its fate under rev 1:
+
+| module | CPU touchpoints | fate under G-TQ rev 1 |
+|---|---|---|
+| `turboquant.py` | **103** (`.item()` norms, `y.cpu().numpy()`, `np.searchsorted`, `pack_bits`/`unpack_bits`, `centroids[idx]` gathers, `from_numpy` adjoints, `np.sign`/`np.array` in the QJL path, the split path's `einsum/argsort/packbits`) | quant/dequant/QJL/split rewritten as torch ops on the input's device; numpy calls DELETED (not bypassed) |
+| `index.py` | 3 (retrieval vectors → `.numpy()` at `:372/:473/:510`) | vector math stays torch/GPU; ONE hand-off at the faiss boundary (§3.5) |
+| `evals.py` | 5 (`.item()` MSE reads, concentration/norm `.numpy()`, the CRC id) | measurement harness goes torch; `.numpy()` only where numpy IS the consumer (faiss/matplotlib) |
+| `m1m2.py` | 1 (`positions.min().item()` in a guard message, `:345`) | replaced by a torch-native format of the same value (no stream sync) |
+| `snapshot.py` | 1 (`raw.item()` metadata decode, `:464`) | stays — the npz disk edge (§3.5) |
+| `hooks.py` | 0 live sites (a comment mentions np.packbits padding) | comment updated; the popcount itself becomes a torch op if used |
+| `tq_cache.py`, `install.py` | 0 direct sites (they call into turboquant) | inherit the fix through the single path |
+| `codebooks.py` | the solver (pure numpy, run once per (b, d), artifacts committed) | stays OFFLINE — an artifact build, not a runtime path; the LOADED books mirror to device tensors at first use (§3.1) |
 
 ### 3.1 W20.1 — the pure-torch GPU round trip (no new CUDA code)
 
-The math of quant/dequant is already device-agnostic torch + numpy; the
-numpy parts all have exact torch twins:
+The math of quant/dequant is already torch for the heavy parts; the
+numpy parts are REPLACED (deleted) by their exact torch equivalents,
+executed on the input's device:
 
-| CPU step today | GPU twin | parity |
+| numpy step today (DELETED) | torch replacement (input's device) | parity |
 |---|---|---|
-| `float(x32.norm().item())` | `n = x32.norm()` — a 0-dim CUDA tensor carried in the codes object; `.item()` only at persistence | exact |
+| `float(x32.norm().item())` | `n = x32.norm()` — a 0-dim CUDA tensor carried in the codes object; `.item()` only at the disk edge (§3.6) | exact |
 | `np.searchsorted(boundaries, y)` | `torch.searchsorted(b_gpu, y_gpu)` | **left-side semantics verified identical, ties included** (both default side=left; probe below) |
 | `np.packbits` bit-packing | torch shift/or on uint8 views — **or deferred entirely** (§3.4) | bit-identical gate G20.4 |
 | `centroids[idx]` gather | `torch.index_select(centroids_gpu, 0, idx_gpu)` | exact |
 | `np.unpackbits` | torch bit ops (or skipped — unpacked indices ride the hot loop) | bit-identical gate G20.4 |
 | `fht.fht_adjoint(from_numpy(y))` | `fht.fht_adjoint(y_cuda)` — the butterfly is already device-agnostic; with a CUDA input it runs ~114 GPU launches, ~1–2 ms | allclose ≤ 1e-5 rel (sum-order only, G20.4) |
 | `.to(device)` at return | nothing — the tensor never left | — |
+| QJL `np.sign`, `np.array` sketches | `torch.sign`, direct tensor ops (qjl flag off in production — the path is unified regardless) | exact (sign of ±fp32) |
+| split path `np.einsum/argsort/packbits` | `torch.argsort` (stable), gather/scatter, torch pack | stable-sort + tie gates pin it (R20.2) |
 
 Codebooks (boundaries + centroids, ≤ 16 fp32 entries each at b ≤ 4) are
-mirrored once per quantizer instance as CUDA tensors — kilobytes, built
-lazily on first CUDA use, immutable thereafter.
+LOADED from the committed npz once and mirrored as device tensors at
+first use per quantizer instance — kilobytes, immutable thereafter. No
+numpy object is held by a live quantizer; `Codebook` gains a
+`device_tensors()` accessor and the numpy fields become load-time-only.
+
+**The deletion discipline (why fixtures, not a twin):** before any
+numpy line is deleted, its exact behavior on a frozen probe set
+(reference states at d=2^19 and 24,576, fixed seeds) is captured — codes
+byte-for-byte, reconstructions to the fp32 bit — into the test suite.
+The numpy implementation then dies; the fixtures hold it accountable
+forever. This is the same discipline `flute_train_kernels` uses for its
+G-B1…G-B5 gates (debug twins + canaries pinning behavior, not shipping
+a second production path).
 
 **Expected effect (arithmetic, to be measured by the W19 phase timers
 already riding every history entry):** per round trip, CPU ~80–160 ms →
@@ -129,17 +186,18 @@ at refresh_every=4 that is **~2–5 s/step**, and 300 steps ≈ **10–25
 minutes** instead of half a day. No new CUDA, no build step, no kernel
 risk — this is the phase that lands first.
 
-### 3.2 W20.2 — the codes device contract (the numpy boundary)
+### 3.2 W20.2 — the codes device contract (torch-native codes)
 
-`TQCodes.idx_lo/idx_hi` may now hold torch uint8 tensors (device-
-resident) produced by a CUDA quant; `norm` may hold a 0-dim CUDA tensor.
-Every cold consumer — `to_arrays()` (npz persistence), `snapshot.py`,
-`install.py`, `index.py`'s loader, evals, the CPU tests — goes through
-one accessor (`_as_np`) that performs a single batched `.cpu()` per
-unit. The hot loop (quant → codes → dequant inside one
-`update_recurrent_state`/`update_m1` call) never touches the accessor.
-The QJL sketch fields stay numpy (qjl default off; its A/B is a
-separate lever, W16-measured not-noise-relevant).
+`TQCodes.idx_lo/idx_hi/norm` become torch tensors BY CONSTRUCTION — the
+quantizer emits device-resident uint8/0-dim tensors, full stop. The QJL
+sketch fields likewise (int8 tensor + 0-dim norm). There is no numpy
+carrier anywhere in the object graph at runtime. The ONLY conversion is
+the disk edge: `to_arrays()` (npz write) performs one batched
+`.cpu()` per unit and packs ON GPU before the copy; `from_arrays()`
+(npz read) lifts the bytes back to the caller's device in one H2D per
+unit. Snapshot write/read, install, the index loader — all consumers go
+through these two edges, and their MATH (multi-chunk sums, requant,
+retrieval-vector assembly) is torch on the caller's device (W20.5).
 
 ### 3.3 W20.3 — `fht_large`: the multi-block FHT kernel for K = 2^19
 
@@ -188,6 +246,12 @@ s**; combined with §3.4, under 1 s.
 
 ### 3.4 W20.4 — trainer-level levers (already half-built by W19)
 
+- `m1m2.py:345`'s guard `.item()` dies with W20.1 (a torch-native
+  format call replaces the sync).
+- `evals.py`'s measurement sites (5) go torch — the MSE reads and
+  concentration stats become tensor reductions; `.numpy()` appears
+  only at a true external consumer.
+
 - `refresh_every` 8 (the driver flag exists) — capture amortizes
   another 2×; the staleness bound stays lr × N (the W19 argument; the
   held-out spread is the gate).
@@ -198,37 +262,62 @@ s**; combined with §3.4, under 1 s.
 - The pairs loader tokenizes up front (driver-side, already) — no
   per-step CPU work remains beyond the `log_every` prints.
 
-### 3.5 What deliberately stays CPU
+### 3.5 W20.5 — the serving side goes GPU too (ALL of TurboQuant)
 
-Persistence and tests: `to_arrays()`/npz writes, the index loader, the
-CPU reference quant/dequant path (the parity twin), the codebook solver
-(pure numpy by design, solved once). These are cold paths — one
-batched `.cpu()` per unit at snapshot time is ~µs-scale and off the
-training critical path. The CPU tests keep running unchanged on the CPU
-box; the GPU gates below run on the GPU box. **This wave (the
-proposal) changes zero code — no tests were run or needed; the last
-green suite (237) pins the pre-W20 tree.**
+"All of TurboQuant" includes the deployment path, not just the
+trainer. Today `install_snapshot`'s requant round, the index loader's
+per-chunk vector builds (`index.py:372/473/510`), and the eval harness
+dequantize unit-by-unit through the CPU path. Under rev 1 they become
+BATCHED GPU passes: one launch shape over all 24 S units + M1 + M2 (the
+install requant), one over every chunk's units (the retrieval-frame
+build), with the codes lifted to device once (W20.2's read edge). The
+faiss add/search stays on its CPU index (faiss-cpu is the pinned
+dependency) — but its INPUT vectors are produced on GPU and handed off
+once, already normalized, already centered (the W16 frame math on
+device).
 
-## 4. Numerics and parity contract
+### 3.6 The two remaining numpy edges (foreign formats, not CPU paths)
 
-1. **Codes are ints — they must be IDENTICAL.** `torch.searchsorted`
-   and `np.searchsorted` share left-side semantics (verified on ties:
-   both place a boundary-exact value in the upper bucket — probe:
-   `np/torch searchsorted([-1,-.5,0,.5], .5) → 3/3`). Boundary-exact
-   inputs are measure-zero on real states; the gate asserts identical
-   codes on the probe sets.
-2. **Reconstruction is fp32 sum-order — allclose ≤ 1e-5 rel.** The only
-   divergence source is the butterfly's summation order on GPU vs CPU;
-   this is the existing kernel-vs-reference discipline
+1. **The npz disk format** (`to_arrays`/`from_arrays`, snapshot read/write,
+   the committed codebook artifacts): numpy is the FILE FORMAT. The pack,
+   unpack, sum and requant math on both sides of the bytes is torch on
+device; the conversion is one batched copy at the disk edge. There is
+no per-unit CPU math anywhere on the way in or out.
+2. **The faiss CPU index** (add/search at the retrieval edge): an external
+   library boundary. Vectors arrive GPU-computed; the hand-off is a
+   single `.numpy()` per batch. (A faiss-gpu swap is explicitly out of
+   scope — the CPU index is tiny, the queries are few, and the W16
+   centered rerank dominates cost.)
+
+Everything else in the TQ stack is torch. The dev box (this machine,
+CPU-only) runs the SAME single path on CPU tensors — that is not a CPU
+path, that is the same code with a different device argument. **This
+wave (the proposal) changes zero code — no tests were run or needed;
+the last green suite (237) pins the pre-W20 tree.**
+
+## 4. Numerics and parity contract (fixtures, not twins)
+
+1. **Codes are ints — they must be IDENTICAL to the frozen fixtures.**
+   `torch.searchsorted` and `np.searchsorted` share left-side semantics
+   (verified on ties: both place a boundary-exact value in the upper
+   bucket — probe: `np/torch searchsorted([-1,-.5,0,.5], .5) → 3/3`).
+   The pre-deletion numpy outputs on the frozen probe set (codes,
+   byte-for-byte) become the test fixtures; the single torch path must
+   reproduce them exactly (G20.4).
+2. **Reconstruction is fp32 sum-order — allclose ≤ 1e-5 rel** vs the
+   fixtures. The only divergence source is the butterfly's summation
+   order; this is the existing kernel-vs-reference discipline
    (`fht.py`'s differential twins), extended to G-TQ.
 3. **Snapshots stay byte-identical.** The npz artifacts are the
    protocol's interchange format (TRAIN → RE-INGEST → INDEX → EVAL →
-   QUERY); G-TQ's cold-path packing produces the same packed bytes
-   (gate G20.4 pins bit-identity vs the numpy packer on probes).
-4. **The auto-engagement rule** mirrors `fht.py` exactly: CUDA input →
-   GPU math; CPU input → today's path, bit-for-bit. No flag days, no
-   corpus re-ingest requirement from the change itself (a corpus may of
-   course be re-ingested per protocol whenever gates are re-confirmed).
+   QUERY); the disk-edge packing produces the same packed bytes (gate
+   G20.4 pins bit-identity vs the frozen fixtures).
+4. **One path means no drift.** rev 0's "CPU reference kept intact"
+   is withdrawn precisely because two live paths drift; rev 1 keeps ONE
+   runtime path and holds it to fixtures captured from the numpy era.
+   A corpus re-ingest is not required by the change itself (same codes,
+   same bytes — gate G20.5); the protocol's re-confirm sequence runs
+   whenever gates are re-confirmed as usual.
 
 ## 5. The qlora backward-kernel question, answered precisely
 
@@ -272,9 +361,10 @@ The directive: "maybe we can reuse / alternate the backward kernel from
 | step | change | capture cycle (16 prefills) | s/step (refresh 4) | risk |
 |---|---|---|---|---|
 | W19 (measured) | CPU TQ round trips | **263 s** | ~66 + 0.5 replay | — |
-| W20.1 | torch-GPU quant/dequant (§3.1–3.2) | ~8–20 s (est.) | ~2–5 | low |
+| W20.1 | torch-native quant/dequant, numpy DELETED (§3.0–3.2) | ~8–20 s (est.) | ~2–5 | low |
 | W20.3 | `fht_large` multi-block kernel (§3.3) | ~5–10 s (est.) | ~1.3–2.5 | medium |
 | W20.4 | refresh 8 + unpacked hot codes (§3.4) | halves the amortized share | ~0.7–1.3 | low |
+| W20.5 | serving-side batched GPU install/index/evals (§3.5) | — (ingest/index/query path) | — | low |
 
 (All post-W20.1 numbers are arithmetic estimates anchored on the
 measured 16.4 s/prefill CPU constant and the ~1–2 ms GPU butterfly
@@ -288,7 +378,7 @@ rung on the box.)
 | R20.1 | GPU bit-packing diverges from numpy `packbits` | differential gate: bit-identical packed bytes on probe sets (G20.4) |
 | R20.2 | `searchsorted` tie divergence CPU↔GPU | left-side semantics verified identical incl. ties; gate asserts equal codes on probes |
 | R20.3 | VRAM growth (unpacked uint8 codes, mirrors, capture pool) | ~50–100 MiB against 24 GB; the W18 pool already tracks `_calls_bytes` |
-| R20.4 | `TQCodes` device-union ripples into cold consumers | one `_as_np` accessor boundary; the 237-suite must stay green (CPU box) + GPU parity gates |
+| R20.4 | the single-path rewrite ripples into every consumer | that is the POINT (no dual-path drift); the frozen fixtures + the 237-suite (same code, CPU tensors) + GPU gates hold it |
 | R20.5 | `fht_large` numerics / coverage | differential twin vs `fht_reference` (1e-5), poison canary, no-atomics determinism — the flute_train_kernels gate family |
 | R20.6 | capture staleness at refresh 8/16 | bounded by lr × N (W19); the held-out spread is the acceptance metric, unchanged |
 
@@ -301,17 +391,23 @@ rung on the box.)
   min end-to-end.
 - **G20.3** — the W19 convergence gates still hold: loss leaves ln(8)
   at step 0, `gk/gv_absmax > 0`, held-out spread positive.
-- **G20.4** — parity: GPU codes identical to CPU codes on probe units;
-  reconstruction allclose ≤ 1e-5 rel; packed bytes bit-identical.
+- **G20.4** — parity: the single torch path reproduces the frozen
+  fixtures exactly — codes byte-identical on CUDA AND CPU tensors,
+  reconstruction allclose ≤ 1e-5 rel, packed bytes bit-identical.
 - **G20.5** — protocol integrity: TRAIN → RE-INGEST → INDEX → EVAL →
-  QUERY on the G-TQ path produces snapshot digests identical to the CPU
-  path (byte-identical npz).
+  QUERY on the G-TQ path produces snapshot digests identical to the
+  pre-W20 CPU artifacts (byte-identical npz) AND the serving side
+  (install requant, index vectors, eval metrics) matches the frozen
+  fixtures on device.
 
 ## 9. Build order
 
-W20.1 + W20.2 (one wave: torch-GPU round trip + codes device contract +
-parity gates) → box confirmation (G20.1/2/3/4) → W20.3 (`fht_large` +
-its gate family) → box confirmation → W20.4 flags (refresh 8, unpacked
-hot codes) → the unchanged deployment protocol with the trained gates.
-The implementation waves run the full CPU suite (237) plus the new GPU
-gates; this proposal wave is doc-only and changed no code.
+W20.1 + W20.2 (one wave: torch-native quant/dequant with numpy
+DELETED + torch-native codes + the frozen fixtures) → box confirmation
+(G20.1/2/3/4) → W20.3 (`fht_large` + its gate family) → box
+confirmation → W20.4 flags (refresh 8, unpacked hot codes) → W20.5
+(the serving-side batched GPU passes) → the unchanged deployment
+protocol with the trained gates. The implementation waves run the full
+suite on the single path (CPU tensors here, CUDA tensors on the box —
+same code) plus the new GPU gates; this proposal wave is doc-only and
+changed no code.
