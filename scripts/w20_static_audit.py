@@ -785,7 +785,23 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.11.3 —"},
         {"kind": "git_tag", "target": "w20-wave-11"},
     ],
-    # W20.12 — appended by the closure wave.
+    # W20.12 — closure (appended at W20.12.2)
+    "W20.12": [
+        # W20.12.1 — the handover + spec addendum
+        {"kind": "grep", "target": "HANDOVER.md",
+         "pattern": r"## W20 — the complete wave summary"},
+        {"kind": "grep", "target": "SPECIFICATION.md",
+         "pattern": "W20 implementation status"},
+        # W20.12.2 — the final audit facts
+        {"kind": "grep", "target": "TASKS.md",
+         "pattern": "13/13 waves closed"},
+        {"kind": "ledger", "target": "W20.12"},
+        # W20.12.3 — the final tag
+        {"kind": "git_log", "target": "W20.12.1 —"},
+        {"kind": "git_log", "target": "W20.12.2 —"},
+        {"kind": "git_log", "target": "W20.12.3 —"},
+        {"kind": "git_tag", "target": "w20-complete"},
+    ],
 }
 
 
