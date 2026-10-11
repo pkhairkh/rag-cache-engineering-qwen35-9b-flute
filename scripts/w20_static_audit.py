@@ -339,7 +339,52 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.1.4 —"},
         {"kind": "git_tag", "target": "w20-wave-1"},
     ],
-    # W20.2 … W20.12 — appended by each wave's close-out task.
+    # W20.2 — TQCodes device contract + codebook mirror (appended at W20.2.3)
+    "W20.2": [
+        # W20.2.1 — TQCodes torch-native
+        {"kind": "exists", "target": "src/rag/tq_codes.py"},
+        {"kind": "py_compile", "target": "src/rag/tq_codes.py"},
+        {"kind": "grep", "target": "src/rag/tq_codes.py",
+         "pattern": "class TQCodes"},
+        {"kind": "grep", "target": "src/rag/tq_codes.py",
+         "pattern": "norm:"},
+        {"kind": "grep", "target": "src/rag/tq_codes.py",
+         "pattern": "idx_lo:"},
+        {"kind": "grep", "target": "src/rag/tq_codes.py",
+         "pattern": "qjl_signs"},
+        {"kind": "grep", "target": "src/rag/tq_codes.py",
+         "pattern": "def to_arrays"},
+        {"kind": "grep", "target": "src/rag/tq_codes.py",
+         "pattern": "def from_arrays"},
+        {"kind": "grep", "target": "src/rag/tq_codes.py",
+         "pattern": "torch"},
+        {"kind": "absent", "target": "src/rag/tq_codes.py",
+         "pattern": r"\.item\(\)"},
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "from tq_codes import TQCodes"},
+        {"kind": "absent", "target": "src/rag/turboquant.py",
+         "pattern": r"^class TQCodes"},
+        {"kind": "py_compile", "target": "src/rag/turboquant.py"},
+        # W20.2.2 — codebook device mirror
+        {"kind": "grep", "target": "src/rag/codebooks.py",
+         "pattern": "OFFLINE-NUMPY-ISLAND"},
+        {"kind": "grep", "target": "src/rag/codebooks.py",
+         "pattern": "DeviceCodebook"},
+        {"kind": "grep", "target": "src/rag/codebooks.py",
+         "pattern": "_DEVICE_TENSOR_CACHE"},
+        {"kind": "grep", "target": "src/rag/codebooks.py",
+         "pattern": "def device_tensors"},
+        {"kind": "grep", "target": "src/rag/codebooks.py",
+         "pattern": "device=None"},
+        {"kind": "py_compile", "target": "src/rag/codebooks.py"},
+        # W20.2.3 — wave close: ledger + git facts
+        {"kind": "ledger", "target": "W20.2"},
+        {"kind": "git_log", "target": "W20.2.1 —"},
+        {"kind": "git_log", "target": "W20.2.2 —"},
+        {"kind": "git_log", "target": "W20.2.3 —"},
+        {"kind": "git_tag", "target": "w20-wave-2"},
+    ],
+    # W20.3 … W20.12 — appended by each wave's close-out task.
 }
 
 

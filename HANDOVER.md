@@ -234,3 +234,29 @@ Tier-G: the capture is AUTHORED, PENDING until the A10G box runs it
 (protocol step 2). Attestation truthful (no test executed, no CPU
 test authored, no repo module imported on this box). Next: W20.2 —
 the TQCodes device contract + codebook mirror.
+
+## W20.2 — the codes contract is torch-native (CLOSED 2026-10-11)
+
+- `src/rag/tq_codes.py` — TQCodes by construction: norm is a 0-dim
+  fp32 torch tensor, idx_lo/idx_hi device-resident uint8 tensors, the
+  W15 outlier trio + W9.2 qjl pair as optional tensors;
+  to(device)/device/nbytes()/sync-free repr; to_arrays/from_arrays are
+  THE npz disk edge (numpy structurally confined to those two bodies;
+  the legacy key set/dtypes/conditional presence replicated 1:1 — old
+  readers and old digests unaffected).
+- `src/rag/turboquant.py` — the old numpy TQCodes class removed;
+  house flat re-export at :118 keeps `from turboquant import TQCodes`
+  symbol-compatible (install/tq_cache/snapshot untouched imports).
+- `src/rag/codebooks.py` — the OFFLINE-NUMPY-ISLAND markers (solve +
+  quadrature + npz cache byte-identical, diff-verified) + the runtime
+  mirror: get_codebook(device=...) → the DeviceCodebook view
+  (boundaries/centroids fp32 tensors, identity-keyed
+  _DEVICE_TENSOR_CACHE, .numpy_codebook for the digest edge).
+- Staged breakage (intentional, resolves in W20.3): quant() still
+  constructs with numpy → the torch-asserting constructor refuses;
+  nothing executes until the A10G box gates.
+
+Wave DoD: Tier-D green (24/24, auditor --wave W20.2 exit 0 post-tag);
+Tier-G none (parity is W20.4's G20.P1); attestation truthful. Next:
+W20.3 — the turboquant.py torch rewrite (the core, the six CPU
+syndromes).

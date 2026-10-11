@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: IN EXECUTION — 2/13 waves closed (W20.0, W20.1).
+Status: IN EXECUTION — 3/13 waves closed (W20.0, W20.1, W20.2).
 
 ---
 
@@ -18,7 +18,7 @@ Status: IN EXECUTION — 2/13 waves closed (W20.0, W20.1).
 |---|---|---|---|---|---|
 | W20.0 | pre-K | environment + audit infrastructure | 5 | — | CLOSED |
 | W20.1 | K1 | baseline tag + frozen probe fixtures | 4 | (capture) | CLOSED |
-| W20.2 | K1 | TQCodes device contract + codebook mirror | 3 | — | OPEN |
+| W20.2 | K1 | TQCodes device contract + codebook mirror | 3 | — | CLOSED |
 | W20.3 | K1 | turboquant.py torch rewrite (the core) | 6 | — | OPEN |
 | W20.4 | K1 | wiring + serving sweep + K1 gates | 7 | G20.P1 | OPEN |
 | W20.5 | K2 | fht_forward_large / fht_backward_large | 6 | — | OPEN |
@@ -340,7 +340,7 @@ COMMIT: "W20.2.2 — codebook device mirror (solve stays the offline
 numpy island)"
 
 #### W20.2.3 — wave close W20.2
-- [ ] done
+- [x] done
 ROLE orchestrator · standard close-out.
 Tier-D: 2.1/2.2 DO-D sets; py_compile; auditor green.
 Tier-G: none (parity is W20.4's G20.P1).
@@ -1232,7 +1232,7 @@ truthful (PROMPT.md §1.4):
 |---|---|
 | W20.0 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.0 exit 0 (26/26, re-verified post-tag); push w20-wave-0 |
 | W20.1 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.1 exit 0 (25/25, re-verified post-tag); push w20-wave-1 |
-| W20.2 | — (pending) |
+| W20.2 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.2 exit 0 (24/24, re-verified post-tag); push w20-wave-2 |
 | W20.3 | — (pending) |
 | W20.4 | — (pending) |
 | W20.5 | — (pending) |
