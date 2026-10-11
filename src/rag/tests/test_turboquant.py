@@ -198,7 +198,7 @@ def test_code_serialization_roundtrip(tmp_path):
     assert codes.nbytes() == codes.idx_lo.nbytes + codes.idx_hi.nbytes + 4
     assert codes.nbytes() == (512 * 3 + 7) // 8 + (512 * 4 + 7) // 8 + 4
 
-    direct = q.dequant(codes)
+    direct = q.dequant(codes, device=DEVICE)
 
     # dict round-trip (the snapshot.py embedding contract)
     via_dict = TQCodes.from_arrays(codes.to_arrays())
@@ -210,7 +210,7 @@ def test_code_serialization_roundtrip(tmp_path):
     assert float(via_dict.norm) == float(codes.norm)
     assert np.array_equal(via_dict.idx_lo, codes.idx_lo)
     assert np.array_equal(via_dict.idx_hi, codes.idx_hi)
-    assert torch.equal(q.dequant(via_dict), direct)
+    assert torch.equal(q.dequant(via_dict, device=DEVICE), direct)
 
     # npz round-trip: exactly the path a chunk snapshot writes and reads
     path = str(tmp_path / "unit_codes.npz")
@@ -221,7 +221,7 @@ def test_code_serialization_roundtrip(tmp_path):
     assert float(loaded.norm) == float(codes.norm)
     assert np.array_equal(loaded.idx_lo, codes.idx_lo)
     assert np.array_equal(loaded.idx_hi, codes.idx_hi)
-    assert torch.equal(q.dequant(loaded), direct)
+    assert torch.equal(q.dequant(loaded, device=DEVICE), direct)
 
 
 # --- gate 6: full-chunk size gate (spec §3.3/§5) — the full-scale test ------ #
@@ -258,18 +258,18 @@ def test_full_chunk_size_gate():
 # --- gate 7: zero-norm edge --------------------------------------------------- #
 def test_zero_norm_unit():
     q = _quantizer(bits=3.5, d=D, seed=1)
-    codes = q.quant(torch.zeros(D))
+    codes = q.quant(torch.zeros(D, device=DEVICE))
     assert float(codes.norm) == 0.0
     # degenerate codes are well-formed all-zero packed streams
     assert codes.idx_lo.shape == ((512 * 3 + 7) // 8,)
     assert codes.idx_hi.shape == ((512 * 4 + 7) // 8,)
     assert not codes.idx_lo.any() and not codes.idx_hi.any()
 
-    out = q.dequant(codes)
+    out = q.dequant(codes, device=DEVICE)
     assert out.dtype == torch.float32
-    assert torch.equal(out, torch.zeros(D))
-    out16 = q.dequant(codes, dtype=torch.float16)
-    assert torch.equal(out16, torch.zeros(D, dtype=torch.float16))
+    assert torch.equal(out, torch.zeros(D, device=DEVICE))
+    out16 = q.dequant(codes, dtype=torch.float16, device=DEVICE)
+    assert torch.equal(out16, torch.zeros(D, dtype=torch.float16, device=DEVICE))
 
 
 # --- gate 8: D3 frame consistency ---------------------------------------------- #
@@ -292,7 +292,7 @@ def test_d3_frame_consistency():
     assert float(c1.norm) == float(c2.norm)
     assert np.array_equal(c1.idx_lo, c2.idx_lo)
     assert np.array_equal(c1.idx_hi, c2.idx_hi)
-    assert torch.equal(q1.dequant(c1), q2.dequant(c2))
+    assert torch.equal(q1.dequant(c1, device=DEVICE), q2.dequant(c2, device=DEVICE))
 
 
 # --- gate 9: mismatch rejection ------------------------------------------------- #
@@ -301,13 +301,13 @@ def test_mismatch_rejected():
     codes = q.quant(_unit_vectors(D, 1, seed=123)[0])
 
     with pytest.raises(ValueError):    # different D3 seed (frame drift)
-        _quantizer(bits=3.5, d=D, seed=2).dequant(codes)
+        _quantizer(bits=3.5, d=D, seed=2).dequant(codes, device=DEVICE)
     with pytest.raises(ValueError):    # different kind label
-        TurboQuant(kind="custom-b", bits=3.5, d=D, seed=1).dequant(codes)
+        TurboQuant(kind="custom-b", bits=3.5, d=D, seed=1).dequant(codes, device=DEVICE)
     with pytest.raises(ValueError):    # different bit-width split
-        _quantizer(bits=3, d=D, seed=1).dequant(codes)
+        _quantizer(bits=3, d=D, seed=1).dequant(codes, device=DEVICE)
     with pytest.raises(ValueError):    # a real kind (d=32768, seed=202)
-        TurboQuant(kind="conv", bits=3.5).dequant(codes)
+        TurboQuant(kind="conv", bits=3.5).dequant(codes, device=DEVICE)
 
 
 # --- gate 10: fp16 dtype round-trip ---------------------------------------------- #

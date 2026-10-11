@@ -269,12 +269,12 @@ def test_multi_chunk_absolute_sum(rig):
 
     q = resolve_quantizer("S", cache_a.layers[0].s_codes.d, BITS)
     for L in range(N_LAYERS):
-        expect = sum(q.dequant(s.s_codes[L]) for s in abs_snaps) \
-            - 2 * q.dequant(rig["system"].s_codes[L])
-        got = q.dequant(cache_a.layers[L].s_codes)
+        expect = sum(q.dequant(s.s_codes[L], device=DEVICE) for s in abs_snaps) \
+            - 2 * q.dequant(rig["system"].s_codes[L], device=DEVICE)
+        got = q.dequant(cache_a.layers[L].s_codes, device=DEVICE)
         assert _rel_mse(got, expect) < SINGLE_ROUND_GATE
         # the two paths approximate the same target
-        got_v = q.dequant(cache_v.layers[L].s_codes)
+        got_v = q.dequant(cache_v.layers[L].s_codes, device=DEVICE)
         assert _rel_mse(got, got_v) < PATH_EQUIV_BUDGET
 
 

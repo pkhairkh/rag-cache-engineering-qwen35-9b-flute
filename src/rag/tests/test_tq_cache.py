@@ -541,8 +541,8 @@ def test_offline_snapshot_codes_quantizes_held_tensors():
 
     q_s = resolve_quantizer("S", D_UNIT, 3.5)
     q_c = resolve_quantizer("conv", D_UNIT, 3.5)
-    deq_s = q_s.dequant(codes["s"]).reshape(*S_UNIT)
-    deq_c = q_c.dequant(codes["conv"]).reshape(*CONV_UNIT)
+    deq_s = q_s.dequant(codes["s"], device=DEVICE).reshape(*S_UNIT)
+    deq_c = q_c.dequant(codes["conv"], device=DEVICE).reshape(*CONV_UNIT)
     assert _rel_mse(deq_s, s) < REL_MSE_GATE                   # 0.024
     assert _rel_mse(deq_c, x[..., -CONV_KERNEL:]) < REL_MSE_GATE  # 0.020
 
@@ -627,10 +627,10 @@ def test_resolve_quantizer_rejects_non_positive():
 def test_resolve_quantizer_accepts_non_power_of_two(numel):
     q = resolve_quantizer("S", numel)
     assert q.d == numel and q.seed == SEEDS["S"]
-    x = torch.randn(numel, generator=torch.Generator().manual_seed(numel))
+    torch.manual_seed(numel); x = torch.randn(numel, device=DEVICE)
     codes = q.quant(x)
     assert codes.d == numel and codes.seed == SEEDS["S"]
-    assert _rel_mse(q.dequant(codes), x) < 0.35   # tiny-d units quantize loosely
+    assert _rel_mse(q.dequant(codes, device=DEVICE), x) < 0.35   # tiny-d units quantize loosely
 
 
 # --- contract 11: non-power-of-two conv geometry (full-window policy) ---- #
@@ -829,6 +829,6 @@ def test_nonpow2_conv_offline_snapshot():
 
     codes = layer.snapshot_codes()["conv"]
     assert codes.d == CONV_NP2_D and codes.seed == 202
-    v = layer._tq_conv.dequant(codes, dtype=torch.float32)
+    v = layer._tq_conv.dequant(codes, dtype=torch.float32, device=DEVICE)
     stripped = v[: 24576].reshape(*CONV_NP2_UNIT)     # the pad strip
     assert _rel_mse(stripped, raw) < REL_MSE_GATE     # measured 0.016

@@ -42,6 +42,10 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import torch
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _OUT_DIR = os.environ.get("EVALS_OUT", os.path.join(_HERE, "evals_out"))
 
@@ -305,7 +309,8 @@ def measure_recall(disk_dir=None, out_dir: str = _OUT_DIR,
             class Stub:
                 def __init__(self):
                     g = torch.Generator().manual_seed(21)
-                    self.dirs = torch.randn(5, 128, generator=g)
+                    # Generator-pinned creation on CPU, then move to DEVICE
+                    self.dirs = torch.randn(5, 128, generator=g).to(DEVICE)
                     self.dirs = self.dirs / self.dirs.norm(dim=-1, keepdim=True)
 
                 def __call__(self, input_ids, past_key_values, use_cache=True):
@@ -315,9 +320,10 @@ def measure_recall(disk_dir=None, out_dir: str = _OUT_DIR,
                     for L in (0, 2):
                         cur = past_key_values.layers[L].recurrent_states[0]
                         if cur is None:
-                            cur = torch.zeros(S_SHAPE, dtype=torch.float16)
+                            cur = torch.zeros(S_SHAPE, dtype=torch.float16, device=DEVICE)
                         g = torch.Generator().manual_seed(key + 17 * L)
-                        add = 0.05 * torch.randn(S_SHAPE, generator=g).half()
+                        # Generator-pinned creation on CPU, then move to DEVICE
+                        add = 0.05 * torch.randn(S_SHAPE, generator=g).half().to(DEVICE)
                         if L == 0:
                             add = add + (4.0 * self.dirs[t]
                                          .reshape(S_SHAPE)).half()
@@ -325,14 +331,14 @@ def measure_recall(disk_dir=None, out_dir: str = _OUT_DIR,
                             (cur.float() + add.float()).half(), L)
                         past_key_values.update_conv_state(
                             torch.randn(1, CONV_D, input_ids.shape[-1],
-                                        generator=g).half(), L,
+                                        generator=g).half().to(DEVICE), L,
                             conv_kernel_size=4)
                     m1 = past_key_values.read_m1()
                     if m1 is None:
-                        m1 = torch.zeros(M_SHAPE, dtype=torch.float16)
+                        m1 = torch.zeros(M_SHAPE, dtype=torch.float16, device=DEVICE)
                     past_key_values.update_m1(
                         (m1.float() + 0.02 * torch.randn(
-                            M_SHAPE, generator=g).float()).half())
+                            M_SHAPE, generator=g).float().half().to(DEVICE)))
                     return None
 
             model = Stub()
@@ -403,10 +409,11 @@ def measure_e2e(disk_dir=None, out_dir: str = _OUT_DIR,
             class Stub:
                 def __init__(self):
                     g = torch.Generator().manual_seed(31)
-                    self.dirs = torch.randn(N_TOPICS, 128, generator=g)
+                    # Generator-pinned creation on CPU, then move to DEVICE
+                    self.dirs = torch.randn(N_TOPICS, 128, generator=g).to(DEVICE)
                     self.dirs = self.dirs / self.dirs.norm(
                         dim=-1, keepdim=True)
-                    self.head = torch.randn(128, N_TOPICS, generator=g)
+                    self.head = torch.randn(128, N_TOPICS, generator=g).to(DEVICE)
 
                 def __call__(self, input_ids, past_key_values, use_cache=True):
                     key = int(input_ids.flatten()[0])
@@ -414,9 +421,10 @@ def measure_e2e(disk_dir=None, out_dir: str = _OUT_DIR,
                     for L in (0, 2):
                         cur = past_key_values.layers[L].recurrent_states[0]
                         if cur is None:
-                            cur = torch.zeros(S_SHAPE, dtype=torch.float16)
+                            cur = torch.zeros(S_SHAPE, dtype=torch.float16, device=DEVICE)
                         g = torch.Generator().manual_seed(key + 17 * L)
-                        add = 0.05 * torch.randn(S_SHAPE, generator=g).half()
+                        # Generator-pinned creation on CPU, then move to DEVICE
+                        add = 0.05 * torch.randn(S_SHAPE, generator=g).half().to(DEVICE)
                         if L == 0:
                             add = add + (4.0 * self.dirs[t]
                                          .reshape(S_SHAPE)).half()
@@ -424,14 +432,14 @@ def measure_e2e(disk_dir=None, out_dir: str = _OUT_DIR,
                             (cur.float() + add.float()).half(), L)
                         past_key_values.update_conv_state(
                             torch.randn(1, CONV_D, input_ids.shape[-1],
-                                        generator=g).half(), L,
+                                        generator=g).half().to(DEVICE), L,
                             conv_kernel_size=4)
                     m1 = past_key_values.read_m1()
                     if m1 is None:
-                        m1 = torch.zeros(M_SHAPE, dtype=torch.float16)
+                        m1 = torch.zeros(M_SHAPE, dtype=torch.float16, device=DEVICE)
                     past_key_values.update_m1(
                         (m1.float() + 0.02 * torch.randn(
-                            M_SHAPE, generator=g).float()).half())
+                            M_SHAPE, generator=g).float().half().to(DEVICE)))
                     s0 = past_key_values.layers[0].recurrent_states[0]
                     return (s0.float().reshape(-1) @ self.head).reshape(1, 1, -1)
 

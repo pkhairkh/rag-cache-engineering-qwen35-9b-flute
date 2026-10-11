@@ -103,7 +103,7 @@ def rig():
     # the system state and its codes (one quant round, as at ingestion)
     _, s_sys_true = _prefill(None, _tokens(N_SYS, 11))
     sys_codes = q.quant(s_sys_true.reshape(-1))
-    s_sys_recon = q.dequant(sys_codes).reshape(S_SHAPE)
+    s_sys_recon = q.dequant(sys_codes, device=DEVICE).reshape(S_SHAPE)
 
     # the TRUE [sys + doc] trajectory (no quantization anywhere)
     doc_tokens = _tokens(N_DOC, 22)
@@ -120,10 +120,10 @@ def rig():
     doc_codes = layer.s_codes
 
     # the D4 delta + the install sum (sum_turboquant_codes, one requant)
-    delta_vec = q.dequant(doc_codes) - q.dequant(sys_codes)
+    delta_vec = q.dequant(doc_codes, device=DEVICE) - q.dequant(sys_codes, device=DEVICE)
     delta_codes = q.quant(delta_vec)
     summed = sum_turboquant_codes(sys_codes, [delta_codes], kind="S", bits=BITS)
-    s_installed = q.dequant(summed).reshape(S_SHAPE)
+    s_installed = q.dequant(summed, device=DEVICE).reshape(S_SHAPE)
 
     return dict(q=q, sys_codes=sys_codes, s_sys_recon=s_sys_recon,
                 s_sys_true=s_sys_true, doc_tokens=doc_tokens,
@@ -141,7 +141,7 @@ def test_install_read_path_bit_clean(rig):
     layer.s_codes = r["summed"]
     t = layer.recurrent_states[0]
     assert tuple(t.shape) == S_SHAPE and t.dtype == torch.float16
-    assert torch.equal(t, r["q"].dequant(r["summed"],
+    assert torch.equal(t, r["q"].dequant(r["summed"], device=DEVICE,
                                          dtype=torch.float16).reshape(S_SHAPE))
     # quantizer identity across the whole install path (frame, registry)
     assert layer._tq_s is r["q"]

@@ -213,7 +213,7 @@ def test_qjl_flag_parity_and_backward_compat():
     assert c_plain.norm.tobytes() == c_off.norm.tobytes()
     assert c_plain.qjl_signs is None and c_plain.gamma is None
     assert c_off.qjl_signs is None and c_off.gamma is None
-    assert torch.equal(q_plain.dequant(c_plain), q_off.dequant(c_off))
+    assert torch.equal(q_plain.dequant(c_plain, device=DEVICE), q_off.dequant(c_off, device=DEVICE))
 
     # flag ON: fields present; the MSE layer is UNTOUCHED (additive A/B)
     q_on = TurboQuant(kind="custom", bits=3.5, d=256, seed=1, qjl=True)
@@ -234,7 +234,7 @@ def test_qjl_flag_parity_and_backward_compat():
     # dequant carries the compensation, with the exact Alg-2 geometry:
     # ||comp|| == sqrt(pi/2) * gamma (deterministic), and comp points
     # along the original-frame residual (positive inner product)
-    d_off, d_on = q_off.dequant(c_off), q_on.dequant(c_on)
+    d_off, d_on = q_off.dequant(c_off, device=DEVICE), q_on.dequant(c_on, device=DEVICE)
     comp = d_on - d_off
     assert float(comp.abs().max()) > 0.0  # the compensation is nonzero
     assert torch.allclose(
@@ -246,13 +246,13 @@ def test_qjl_flag_parity_and_backward_compat():
 
     # round-trip rel-MSE gate: qjl never meaningfully worse (+5% bound;
     # measured here: 16/16 vectors IMPROVE, mean ratio ~0.64)
-    gg = torch.Generator().manual_seed(5)
     worst, ratios = 0.0, []
-    for _ in range(16):
-        v = torch.randn(256, generator=gg).to(DEVICE)
+    for i in range(16):
+        torch.manual_seed(5 + i)  # incremental seed for each iteration
+        v = torch.randn(256, device=DEVICE)
         v = v / v.norm()
         m_off = float(((v - q_off.roundtrip(v)) ** 2).sum())
-        m_on = float(((v - q_on.dequant(q_on.quant(v))) ** 2).sum())
+        m_on = float(((v - q_on.dequant(q_on.quant(v), device=DEVICE)) ** 2).sum())
         ratios.append(m_on / m_off)
         worst = max(worst, m_on / m_off)
     assert worst <= 1.05, f"qjl round-trip rel-MSE worst ratio {worst:.3f}"
@@ -266,20 +266,20 @@ def test_qjl_flag_parity_and_backward_compat():
     assert np.array_equal(c_rt.qjl_signs, c_on.qjl_signs)
     assert np.float32(c_rt.gamma).tobytes() == c_on.gamma.tobytes()
     assert np.array_equal(c_rt.idx_lo, c_on.idx_lo)
-    assert torch.equal(q_on.dequant(c_rt), d_on)
+    assert torch.equal(q_on.dequant(c_rt, device=DEVICE), d_on)
     arr_off = c_off.to_arrays()
     assert "qjl_signs" not in arr_off and "gamma" not in arr_off
     c_old = TQCodes.from_arrays(dict(arr_off))  # the pre-W9.2 key set
     assert c_old.qjl_signs is None and c_old.gamma is None
-    assert torch.equal(q_off.dequant(c_old), d_off)
+    assert torch.equal(q_off.dequant(c_old, device=DEVICE), d_off)
     # codes are self-describing: a qjl=False instance dequantizes qjl codes
-    assert torch.equal(q_off.dequant(c_on), d_on)
+    assert torch.equal(q_off.dequant(c_on, device=DEVICE), d_on)
 
     # a PARTIAL sketch (exactly one of the pair) is refused loudly
     c_part = TQCodes.from_arrays(dict(arr))
     c_part.gamma = None
     with pytest.raises(ValueError, match="PARTIAL QJL"):
-        q_on.dequant(c_part)
+        q_on.dequant(c_part, device=DEVICE)
 
 
 # ------------------------------------------------- gate 4(b): snapshot -----
@@ -348,9 +348,9 @@ def test_snapshot_use_mmap_parity_and_qjl_codes(tmp_path):
     # dequant through the mmap-loaded codes is bit-identical, and the
     # sha256 integrity digest still gated the load (load_chunk would have
     # raised on mismatch — the round-trip IS the assert)
-    assert torch.equal(qs_on.dequant(mm.s_codes[0]),
-                       qs_on.dequant(eager.s_codes[0]))
-    assert torch.equal(qm.dequant(mm.m1_codes), qm.dequant(eager.m1_codes))
+    assert torch.equal(qs_on.dequant(mm.s_codes[0], device=DEVICE),
+                       qs_on.dequant(eager.s_codes[0], device=DEVICE))
+    assert torch.equal(qm.dequant(mm.m1_codes, device=DEVICE), qm.dequant(eager.m1_codes, device=DEVICE))
 
     ve, vm_v = verify_chunk(p), verify_chunk(p, use_mmap=True)
     for v in (ve, vm_v):

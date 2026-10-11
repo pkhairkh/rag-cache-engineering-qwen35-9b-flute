@@ -5,7 +5,7 @@ flow) — the W7 definition of done.
 Gates (all deterministic; plain asserts; dirs under pytest tmp):
   1.  INSTALL MATH, BIT-EXACT: sum_turboquant_codes(sys, [d1..dn]) is
       BIT-identical (idx streams + norm + frame metadata) to
-      q.quant(q.dequant(sys) + Σ q.dequant(d_i)) — the D4 "ONE requant"
+      q.quant(q.dequant(sys, device=DEVICE) + Σ q.dequant(d_i, device=DEVICE)) — the D4 "ONE requant"
       contract; per-addend (two-round) requantization provably differs;
       the empty-deltas edge is exactly one requant of the system.
   2.  NO CODE-PLUS-CODE OP: neither the turboquant module API nor TQCodes
@@ -260,8 +260,8 @@ def test_install_one_requant_bit_exact():
                for _ in range(3)]
 
     summed = sum_turboquant_codes(sys_codes, d_codes, kind="S", bits=BITS)
-    direct = q.quant(q.dequant(sys_codes) + q.dequant(d_codes[0])
-                     + q.dequant(d_codes[1]) + q.dequant(d_codes[2]))
+    direct = q.quant(q.dequant(sys_codes, device=DEVICE) + q.dequant(d_codes[0], device=DEVICE)
+                     + q.dequant(d_codes[1], device=DEVICE) + q.dequant(d_codes[2], device=DEVICE))
 
     assert _codes_equal(summed, direct)                       # bit-exact
     assert (summed.d, summed.seed, summed.bits_lo, summed.bits_hi,
@@ -272,15 +272,18 @@ def test_install_one_requant_bit_exact():
 
     # per-addend (two-round) requantization is a DIFFERENT code — the one
     # requant is load-bearing, not an implementation detail
-    two_round = q.quant(q.dequant(
-        q.quant(q.dequant(sys_codes) + q.dequant(d_codes[0])))
-        + q.dequant(d_codes[1]))
+    two_round = q.quant(
+        q.dequant(
+            q.quant(q.dequant(sys_codes, device=DEVICE) + q.dequant(d_codes[0], device=DEVICE)),
+            device=DEVICE
+        )
+        + q.dequant(d_codes[1], device=DEVICE))
     assert not np.array_equal(two_round.idx_lo, summed.idx_lo)
     assert not _codes_equal(two_round, summed)
 
     # edge: no deltas -> exactly ONE requant round of the system codes
     empty = sum_turboquant_codes(sys_codes, [], kind="S", bits=BITS)
-    assert _codes_equal(empty, q.quant(q.dequant(sys_codes)))
+    assert _codes_equal(empty, q.quant(q.dequant(sys_codes, device=DEVICE)))
 
 
 # ================================= 2. no code-plus-code op ===================
@@ -388,16 +391,16 @@ def test_install_m1m2_sum_budget(corpus):
     n = len(snaps)
     for L in LINEARS:
         q = resolve_quantizer("S", S_D, BITS)
-        expect = sum(q.dequant(s.s_codes[L]) for s in snaps) \
-            - (n - 1) * q.dequant(corpus.system.s_codes[L])
-        got = q.dequant(cache.layers[L].s_codes)
+        expect = sum(q.dequant(s.s_codes[L], device=DEVICE) for s in snaps) \
+            - (n - 1) * q.dequant(corpus.system.s_codes[L], device=DEVICE)
+        got = q.dequant(cache.layers[L].s_codes, device=DEVICE)
         assert _rel_mse(got, expect) < SINGLE_ROUND_GATE
     for kind, attr in (("M1", "m1_codes"), ("M2", "m2_codes")):
         q = resolve_quantizer(kind, M_D, BITS)
         sys_c = getattr(corpus.system, attr)
-        expect = sum(q.dequant(getattr(s, attr)) for s in snaps) \
-            - (n - 1) * q.dequant(sys_c)
-        got = q.dequant(getattr(cache, attr))
+        expect = sum(q.dequant(getattr(s, attr), device=DEVICE) for s in snaps) \
+            - (n - 1) * q.dequant(sys_c, device=DEVICE)
+        got = q.dequant(getattr(cache, attr), device=DEVICE)
         assert _rel_mse(got, expect) < SINGLE_ROUND_GATE
         assert report[kind] == {"mode": "sum-abs", "n_chunks": n}
         assert getattr(cache, attr) is not None
@@ -437,16 +440,16 @@ def test_query_cache_vector_layout(corpus):
     q_m1 = resolve_quantizer("M1", M_D, BITS)
     q_m2 = resolve_quantizer("M2", M_D, BITS)
     assert np.array_equal(v[0:S_D],
-                          q_s.dequant(cache.layers[0].s_codes).numpy())
+                          q_s.dequant(cache.layers[0].s_codes, device=DEVICE).cpu().numpy())
     assert np.array_equal(v[S_D:2 * S_D],
-                          q_s.dequant(cache.layers[2].s_codes).numpy())
+                          q_s.dequant(cache.layers[2].s_codes, device=DEVICE).cpu().numpy())
     assert np.array_equal(v[2 * S_D:2 * S_D + M_D],
-                          q_m1.dequant(cache.m1_codes).numpy())
+                          q_m1.dequant(cache.m1_codes, device=DEVICE).cpu().numpy())
     assert np.array_equal(v[2 * S_D + M_D:],
-                          q_m2.dequant(cache.m2_codes).numpy())
+                          q_m2.dequant(cache.m2_codes, device=DEVICE).cpu().numpy())
     # non-vacuous: the prefill moved the vector off the system reset point
     assert not np.allclose(
-        v[:S_D], q_s.dequant(corpus.system.s_codes[0]).numpy())
+        v[:S_D], q_s.dequant(corpus.system.s_codes[0], device=DEVICE).cpu().numpy())
 
     # §4 same-space check: the topic-3 query vs topic-3 / topic-0 chunks
     vq = v / np.linalg.norm(v)

@@ -701,7 +701,7 @@ class TurboQuant:
             out = out.to(dtype)
         else:
             q = self._route_for(codes)
-            out = q._dequant_flat(codes, dtype)
+            out = q._dequant_flat(codes, dtype, device=device)
         if device is not None:
             out = out.to(device)
         return out
@@ -739,16 +739,20 @@ class TurboQuant:
         return out
 
     def _dequant_flat(self, codes: TQCodes,
-                      dtype: torch.dtype = torch.float32) -> torch.Tensor:
+                      dtype: torch.dtype = torch.float32,
+                      device: Optional[torch.device] = None) -> torch.Tensor:
         """The legacy (pre-W15) dequant body, VERBATIM — the flat path."""
         self._check_codes(codes)
         if float(codes.norm) == 0.0:
             # zero-norm unit ⇒ the quant-side residual was exactly zero ⇒
             # γ == 0 ⇒ the compensation term is exactly 0 — plain zeros.
-            return torch.zeros(self.d, dtype=dtype)
+            return torch.zeros(self.d, dtype=dtype, device=device)
         out = self._dequant_mse(codes, dtype=torch.float32)
         out = self._qjl_compensation_term(codes, out)
-        return out.to(dtype)
+        out = out.to(dtype)
+        if device is not None:
+            out = out.to(device)
+        return out
 
     def _dequant_mse(self, codes: TQCodes,
                      dtype: torch.dtype = torch.float32) -> torch.Tensor:

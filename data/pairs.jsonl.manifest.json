@@ -1,0 +1,17 @@
+{
+ "total": 33595,
+ "positives": 16076,
+ "per_source": {
+  "mrpc": 3668,
+  "qqp": 5000,
+  "paws": 5000,
+  "snli": 5000,
+  "mnli": 5000,
+  "stsb": 5000,
+  "squad": 5000
+ },
+ "seed": 20261018,
+ "per_source_cap": 5000,
+ "min_chars": 12,
+ "max_chars": 1800
+}

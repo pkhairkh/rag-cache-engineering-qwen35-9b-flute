@@ -101,7 +101,13 @@ def _reset_full_attention(cache) -> None:
     for layer in getattr(cache, "layers", []):
         if isinstance(layer, DynamicLayer) \
                 and not isinstance(layer, TQLinearAttentionLayer):
-            layer.reset()
+            # Only reset if initialized; get device/dtype from existing tensors
+            if layer.is_initialized and hasattr(layer, 'keys') and layer.keys is not None:
+                device = layer.keys.device
+                dtype = layer.keys.dtype
+                layer.keys = torch.zeros(0, device=device, dtype=dtype)
+                layer.values = torch.zeros(0, device=device, dtype=dtype)
+                layer.is_initialized = False
         elif isinstance(layer, TQLinearAttentionLayer):
             layer._m1m2_tokens = 0
 

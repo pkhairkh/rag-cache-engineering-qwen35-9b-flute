@@ -318,7 +318,7 @@ def test_stub_stack_captures_all_24():
     # true final state (measured max over the 24: 0.0324)
     q_s = resolve_quantizer("S", S_D)
     for L in LINEAR_IDX:
-        dequant = q_s.dequant(snap.s_codes[L]).to(layers[L].last_s.device)
+        dequant = q_s.dequant(snap.s_codes[L], device=DEVICE).to(layers[L].last_s.device)
         rel = _rel_mse(dequant, layers[L].last_s)
         assert rel < REL_MSE_GATE, f"layer {L}: rel-MSE {rel:.4f}"
 
@@ -338,14 +338,14 @@ def test_round_trip_budget_three_sampled_layers():
     q_s = resolve_quantizer("S", S_D)
     # one layer per hook region: hooks 1, 4 and 8's capture groups
     for L in (2, 13, 29):
-        dq = q_s.dequant(snap.s_codes[L]).to(layers[L].last_s.device)
+        dq = q_s.dequant(snap.s_codes[L], device=DEVICE).to(layers[L].last_s.device)
         assert dq.dtype == torch.float32 and dq.numel() == S_D
         rel = _rel_mse(dq, layers[L].last_s)
         assert rel < REL_MSE_GATE, f"layer {L}: rel-MSE {rel:.4f}"
         # and the codes ARE single-round: equal to quantizing the true
         # state again, byte-for-byte
         recode = q_s.quant(layers[L].last_s.reshape(-1))
-        assert torch.equal(dq, q_s.dequant(recode))
+        assert torch.equal(dq, q_s.dequant(recode, device=DEVICE))
 
 
 # =============================================== 5. capture_vector ==========
@@ -360,7 +360,7 @@ def test_capture_vector_layout():
     cache.update_m2(torch.randn(*M_UNIT, generator=g, dtype=torch.float32).to(DEVICE))
     snap = hooks.capture()
 
-    v = snap.capture_vector()
+    v = snap.capture_vector(device=DEVICE)
     assert v.dim() == 1
     assert v.dtype == torch.float32
     # length = sum of captured S dims + M1 dim + M2 dim
@@ -371,16 +371,16 @@ def test_capture_vector_layout():
     q_m1 = resolve_quantizer("M1", M_D)
     q_m2 = resolve_quantizer("M2", M_D)
     expected = torch.cat(
-        [q_s.dequant(snap.s_codes[L]) for L in LINEAR_IDX]
-        + [q_m1.dequant(snap.m1_codes), q_m2.dequant(snap.m2_codes)]).to(v.device)
+        [q_s.dequant(snap.s_codes[L], device=DEVICE) for L in LINEAR_IDX]
+        + [q_m1.dequant(snap.m1_codes, device=DEVICE), q_m2.dequant(snap.m2_codes, device=DEVICE)]).to(v.device)
     assert torch.equal(v, expected)
 
     # segment boundaries: each S segment is exactly its layer's piece
     for i, L in enumerate(LINEAR_IDX[:3]):
         assert torch.equal(v[i * S_D:(i + 1) * S_D],
-                           q_s.dequant(snap.s_codes[L]).to(v.device))
-    assert torch.equal(v[-M_D:], q_m2.dequant(snap.m2_codes).to(v.device))
-    assert torch.equal(v[-2 * M_D:-M_D], q_m1.dequant(snap.m1_codes).to(v.device))
+                           q_s.dequant(snap.s_codes[L], device=DEVICE).to(v.device))
+    assert torch.equal(v[-M_D:], q_m2.dequant(snap.m2_codes, device=DEVICE).to(v.device))
+    assert torch.equal(v[-2 * M_D:-M_D], q_m1.dequant(snap.m1_codes, device=DEVICE).to(v.device))
 
     # the ordering check is non-vacuous: distinct states per layer
     # (independent generators) -> distinct segments
@@ -400,7 +400,7 @@ def test_m1_m2_read_at_capture_time():
     # before any M1/M2 write: absent (None), capture still succeeds
     snap0 = hooks.capture()
     assert snap0.m1_codes is None and snap0.m2_codes is None
-    assert snap0.capture_vector().numel() == 24 * S_D
+    assert snap0.capture_vector(device=DEVICE).numel() == 24 * S_D
 
     g = torch.Generator().manual_seed(778)
     m1 = torch.randn(*M_UNIT, generator=g, dtype=torch.float32).to(DEVICE)
@@ -414,14 +414,14 @@ def test_m1_m2_read_at_capture_time():
     assert snap.m2_codes is cache.m2_codes
     q_m1 = resolve_quantizer("M1", M_D)
     q_m2 = resolve_quantizer("M2", M_D)
-    assert _rel_mse(q_m1.dequant(snap.m1_codes).to(m1.device), m1) < REL_MSE_GATE  # 0.022
-    assert _rel_mse(q_m2.dequant(snap.m2_codes).to(m2.device), m2) < REL_MSE_GATE  # 0.020
+    assert _rel_mse(q_m1.dequant(snap.m1_codes, device=DEVICE).to(m1.device), m1) < REL_MSE_GATE  # 0.022
+    assert _rel_mse(q_m2.dequant(snap.m2_codes, device=DEVICE).to(m2.device), m2) < REL_MSE_GATE  # 0.020
 
     # capture_vector includes their segments
-    v = snap.capture_vector()
+    v = snap.capture_vector(device=DEVICE)
     assert v.numel() == 24 * S_D + 2 * M_D
-    assert torch.equal(v[-M_D:], q_m2.dequant(snap.m2_codes).to(v.device))
-    assert torch.equal(v[-2 * M_D:-M_D], q_m1.dequant(snap.m1_codes).to(v.device))
+    assert torch.equal(v[-M_D:], q_m2.dequant(snap.m2_codes, device=DEVICE).to(v.device))
+    assert torch.equal(v[-2 * M_D:-M_D], q_m1.dequant(snap.m1_codes, device=DEVICE).to(v.device))
 
     # read at CAPTURE time: an m1 rewrite between forwards is picked up
     # by the next capture without any hook re-firing
@@ -430,7 +430,7 @@ def test_m1_m2_read_at_capture_time():
     snap2 = hooks.capture()
     assert snap2.m1_codes is cache.m1_codes
     assert snap2.m1_codes is not snap.m1_codes
-    assert _rel_mse(q_m1.dequant(snap2.m1_codes).to(m1.device), m1) > 0.5  # stale ref gone
+    assert _rel_mse(q_m1.dequant(snap2.m1_codes, device=DEVICE).to(m1.device), m1) > 0.5  # stale ref gone
 
 
 # =============================================== 7. incomplete capture ======
@@ -524,11 +524,11 @@ def test_refire_latest_wins():
     for L in (0, 8, 22):
         # snap2 reflects the LATEST codes: pass-2 states (measured max
         # over all 24: 0.0436 — S is re-quantized fresh every pass)
-        dq2 = q_s.dequant(snap2.s_codes[L]).to(layers[L].last_s.device)
+        dq2 = q_s.dequant(snap2.s_codes[L], device=DEVICE).to(layers[L].last_s.device)
         assert _rel_mse(dq2, layers[L].last_s) < REL_MSE_GATE
         # snap1's codes are the pass-1 objects: distinct codes, stale
         # against the pass-2 state (independent randoms -> rel-MSE ~ 2)
-        dq1 = q_s.dequant(snap1.s_codes[L]).to(layers[L].last_s.device)
+        dq1 = q_s.dequant(snap1.s_codes[L], device=DEVICE).to(layers[L].last_s.device)
         assert snap1.s_codes[L] is not snap2.s_codes[L]
         assert not torch.equal(dq1, dq2)
         assert _rel_mse(dq1, layers[L].last_s) > 0.5
@@ -553,9 +553,12 @@ def test_real_model_integration():
     hooks.attach(m.layers)
     hooks.bind(cache)
 
-    ids = torch.randint(0, 128, (1, 6),
-                        generator=torch.Generator(device=DEVICE).manual_seed(22),
-                        device=DEVICE)
+    torch.manual_seed(22)
+    ids = torch.randint(0, 128, (1, 6), device=DEVICE)
+    torch.manual_seed(22)
+    ids = torch.randint(0, 128, (1, 6), device=DEVICE)
+    torch.manual_seed(22)
+    ids = torch.randint(0, 128, (1, 6), device=DEVICE)
     with torch.no_grad():
         out = m(input_ids=ids, past_key_values=cache, use_cache=True)
     assert tuple(out.last_hidden_state.shape) == (1, 6, 64)
@@ -584,12 +587,12 @@ def test_real_model_integration():
     assert float(snap.m2_codes.norm) == 0.0
 
     # the §4 vector through the real codes: 2 S + M1 + M2 segments
-    v = snap.capture_vector()
+    v = snap.capture_vector(device=DEVICE)
     assert v.dim() == 1 and v.dtype == torch.float32
     assert v.numel() == 2 * 1024 + 512 + 512 == 3072
-    assert torch.equal(v[-512:], torch.zeros(512))       # M2 zero-norm
-    assert torch.equal(v[-1024:-512], torch.zeros(512))  # M1 zero-norm
+    assert torch.equal(v[-512:], torch.zeros(512, device=DEVICE))       # M2 zero-norm
+    assert torch.equal(v[-1024:-512], torch.zeros(512, device=DEVICE))  # M1 zero-norm
     q_s = resolve_quantizer("S", 1024)
-    assert torch.equal(v[:1024], q_s.dequant(snap.s_codes[0]))
-    assert torch.equal(v[1024:2048], q_s.dequant(snap.s_codes[2]))
+    assert torch.equal(v[:1024], q_s.dequant(snap.s_codes[0], device=DEVICE))
+    assert torch.equal(v[1024:2048], q_s.dequant(snap.s_codes[2], device=DEVICE))
     assert torch.isfinite(v).all()

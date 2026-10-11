@@ -88,7 +88,7 @@ def quantizers():
 
 @pytest.fixture(scope="module")
 def window():
-    return _channel_window(SEED)
+    return _channel_window(SEED).to(DEVICE)
 
 
 # ============================================ 1. fidelity ==================
@@ -97,8 +97,8 @@ def test_split_beats_flat_at_same_budget(quantizers, window):
     write-path distortion on channel-structured windows."""
     q_flat, q_split = quantizers
     x = window
-    r_flat = _rel_mse(q_flat.dequant(q_flat.quant(x)), x)
-    r_split = _rel_mse(q_split.dequant(q_split.quant(x)), x)
+    r_flat = _rel_mse(q_flat.dequant(q_flat.quant(x), device=DEVICE), x)
+    r_split = _rel_mse(q_split.dequant(q_split.quant(x), device=DEVICE), x)
     assert r_split <= FIDELITY_GATE, (
         f"split rel-MSE {r_split:.4f} > {FIDELITY_GATE} — the paper recipe "
         f"is not delivering its fidelity")
@@ -141,7 +141,7 @@ def test_codes_arrays_roundtrip(quantizers, window):
     assert float(c2.norm_hi) == float(c.norm_hi)
     assert np.array_equal(c2.idx_lo, c.idx_lo)
     assert np.array_equal(c2.idx_hi, c.idx_hi)
-    assert _rel_mse(q_split.dequant(c2), window) < FIDELITY_GATE
+    assert _rel_mse(q_split.dequant(c2, device=DEVICE), window) < FIDELITY_GATE
 
 
 def test_snapshot_roundtrip_and_digest(quantizers, window, tmp_path):
@@ -161,7 +161,7 @@ def test_snapshot_roundtrip_and_digest(quantizers, window, tmp_path):
     assert np.array_equal(c2.idx_hi, c.idx_hi)
     assert np.array_equal(c2.mask, c.mask)
     assert float(c2.norm_hi) == float(c.norm_hi)
-    assert _rel_mse(q_split.dequant(c2), window) < FIDELITY_GATE
+    assert _rel_mse(q_split.dequant(c2, device=DEVICE), window) < FIDELITY_GATE
     # digest: a tampered mask must change it (the load-time verify path)
     c_tampered = TQCodes.from_arrays(c.to_arrays())
     c_tampered.mask = c_tampered.mask.copy()
@@ -195,8 +195,8 @@ def test_split_quantizer_reads_legacy_codes(quantizers, window):
     exactly (the flat twin) — old snapshots keep working."""
     q_flat, q_split = quantizers
     c_flat = q_flat.quant(window)
-    x_flat = q_flat.dequant(c_flat)
-    x_via_split = q_split.dequant(c_flat)
+    x_flat = q_flat.dequant(c_flat, device=DEVICE)
+    x_via_split = q_split.dequant(c_flat, device=DEVICE)
     assert torch.allclose(x_flat, x_via_split, atol=0, rtol=0), (
         "the split quantizer must decode legacy codes BIT-IDENTICALLY")
 
@@ -207,8 +207,8 @@ def test_flat_quantizer_reads_split_codes(quantizers, window):
     the split twin."""
     q_flat, q_split = quantizers
     c_split = q_split.quant(window)
-    x_split = q_split.dequant(c_split)
-    x_via_flat = q_flat.dequant(c_split)
+    x_split = q_split.dequant(c_split, device=DEVICE)
+    x_via_flat = q_flat.dequant(c_split, device=DEVICE)
     assert torch.equal(x_split, x_via_flat), (
         "a flat quantizer must decode outlier codes BIT-IDENTICALLY "
         "(the split twin route)")
@@ -282,7 +282,7 @@ def test_install_carries_split_conv_verbatim(tmp_path):
     assert tuple(w.shape) == (1, N_CH, TAPS)
     q_read = resolve_quantizer("conv", installed.d, bits,
                                group=installed.group or 1)
-    dequant = q_read.dequant(installed).to(w.device)
+    dequant = q_read.dequant(installed, device=DEVICE).to(w.device)
     assert _rel_mse(w.float(), dequant.float()) < 1e-6
 
 
@@ -299,10 +299,10 @@ def test_integer_bits_ignore_group():
     (no fractional budget to allocate — nothing to split)."""
     q = TurboQuant(kind="custom", bits=4, d=D, seed=202, group=TAPS)
     assert not q.split
-    x = _channel_window(SEED + 5)
+    x = _channel_window(SEED + 5).to(DEVICE)
     c = q.quant(x)
     assert c.partition == "half" and c.group is None
-    assert _rel_mse(q.dequant(c), x) < REL_MSE_GATE
+    assert _rel_mse(q.dequant(c, device=DEVICE), x) < REL_MSE_GATE
 
 
 def test_effective_bits_and_mask_consistency(quantizers, window):

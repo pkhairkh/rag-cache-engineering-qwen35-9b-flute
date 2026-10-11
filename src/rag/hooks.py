@@ -175,7 +175,7 @@ def _codes_bits(codes: TQCodes) -> float:
     return float(codes.bits_lo) + (codes.n_hi / codes.d)
 
 
-def _dequant_codes(kind: str, codes: TQCodes) -> torch.Tensor:
+def _dequant_codes(kind: str, codes: TQCodes, device=None) -> torch.Tensor:
     """Dequantize one unit through the KIND's quantizer (the D3-seeded
     frame, at whatever scale the codes carry), fp32, shape (d,).
 
@@ -183,7 +183,7 @@ def _dequant_codes(kind: str, codes: TQCodes) -> torch.Tensor:
     on the codes — resolved from there (legacy "half" units: group=1)."""
     group = int(codes.group) if getattr(codes, "group", None) is not None else 1
     quantizer = resolve_quantizer(kind, codes.d, _codes_bits(codes), group=group)
-    return quantizer.dequant(codes, dtype=torch.float32)
+    return quantizer.dequant(codes, dtype=torch.float32, device=device)
 
 
 # --------------------------------------------------------- the snapshot --
@@ -201,7 +201,7 @@ class CacheSnapshot:
     m1_codes: Optional[TQCodes]
     m2_codes: Optional[TQCodes]
 
-    def capture_vector(self) -> torch.Tensor:
+    def capture_vector(self, device=None) -> torch.Tensor:
         """The §4 retrieval vector: concat(dequant(S) for S layers
         ascending, dequant(M1), dequant(M2)) — a 1-D fp32 tensor.
 
@@ -217,13 +217,13 @@ class CacheSnapshot:
                 raise ValueError(
                     f"CacheSnapshot.capture_vector: no S codes for layer "
                     f"{layer_idx} — the snapshot is incomplete")
-            parts.append(_dequant_codes("S", codes))
+            parts.append(_dequant_codes("S", codes, device=device))
         for kind, codes in (("M1", self.m1_codes), ("M2", self.m2_codes)):
             if codes is not None:
-                parts.append(_dequant_codes(kind, codes))
+                parts.append(_dequant_codes(kind, codes, device=device))
         if not parts:
-            return torch.zeros(0, dtype=torch.float32)
-        return torch.cat(parts).to(torch.float32)
+            return torch.zeros(0, dtype=torch.float32, device=device)
+        return torch.cat(parts).to(torch.float32).to(device) if device else torch.cat(parts).to(torch.float32)
 
 
 # ----------------------------------------------------------- the hooks ---

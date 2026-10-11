@@ -143,7 +143,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.in_proj = nn.Linear(d_model, d_model, bias=False)
         self.in_proj.weight.data.copy_(
             0.2 * torch.randn(d_model, d_model, generator=gen))
-        self.A_log = nn.Parameter(torch.zeros(()))
+        self.A_log = nn.Parameter(torch.zeros(d_model, device=DEVICE))
         self.dt_bias = nn.Parameter(torch.full((d_model,), 0.1))
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:

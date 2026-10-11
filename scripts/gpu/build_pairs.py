@@ -65,7 +65,7 @@ def rows_qqp(ds, min_chars, max_chars):
     for r in ds:
         a, b = _clean(r["question1"]), _clean(r["question2"])
         if _ok(a, min_chars, max_chars) and _ok(b, min_chars, max_chars):
-            yield a, b, int(r["is_duplicate"])
+            yield a, b, int(r["label"])
 
 
 def rows_paws(ds, min_chars, max_chars):
@@ -128,13 +128,13 @@ def rows_squad(ds, min_chars, max_chars):
 
 # source registry: (HF repo id, config, split, row generator)
 SOURCES = {
-    "mrpc": ("glue", "mrpc", "train", rows_mrpc),
-    "qqp": ("glue", "qqp", "train", rows_qqp),
-    "paws": ("paws", "labeled_final", "train", rows_paws),
-    "snli": ("snli", None, "train", rows_snli),
-    "mnli": ("glue", "mnli", "train", rows_mnli),
-    "stsb": ("glue", "stsb", "train", rows_stsb),
-    "squad": ("squad", None, "train", rows_squad),
+    "mrpc": ("nyu-mll/glue", "mrpc", "train", rows_mrpc),
+    "qqp": ("nyu-mll/glue", "qqp", "train", rows_qqp),
+    "paws": ("google-research-datasets/paws", "labeled_final", "train", rows_paws),
+    "snli": ("stanfordnlp/snli", None, "train", rows_snli),
+    "mnli": ("nyu-mll/glue", "mnli", "train", rows_mnli),
+    "stsb": ("nyu-mll/glue", "stsb", "train", rows_stsb),
+    "squad": ("rajpurkar/squad", None, "train", rows_squad),
 }
 
 

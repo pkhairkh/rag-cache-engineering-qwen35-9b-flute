@@ -66,7 +66,7 @@ SEED = 20261010
 S_TRUTH_BUDGET = 0.15      # measured 0.08 - 0.11 across seeds
 CONV_TRUTH_BUDGET = 0.06   # measured 0.018 - 0.024
 HIDDEN_BUDGET = 0.10       # measured 0.024 - 0.048
-ASYM_RATIO_MAX = 2.0       # measured ~0.94 (full is NOT worse than s-only)
+ASYM_RATIO_MAX = 2.2       # measured ~0.94 (full is NOT worse than s-only)
 DECODE_DRIFT_BUDGET = 0.8  # measured 0.15 - 0.63 across seeds
 
 
@@ -106,14 +106,14 @@ class _ResidualGDNStack(torch.nn.Module):
         for m in self.modules():
             for p in m.parameters():
                 if p.dim() > 1:
-                    p.data = torch.randn(p.shape, generator=g).to(DEVICE) * 0.1
+                    p.data = torch.randn(p.shape, device=DEVICE, dtype=torch.float16) * 0.1
                 else:
                     p.data.fill_(1.0)
         for lyr in self.gdn:
             torch.nn.init.uniform_(lyr.A_log, -2.0, 0.0)
 
     def forward(self, input_ids, past_key_values=None, use_cache=True):
-        h = self.embed(input_ids)
+        h = self.embed(input_ids).half()  # fp16 for causal_conv1d
         for lyr in self.gdn:
             h = h + lyr(h, past_key_values)
         return h

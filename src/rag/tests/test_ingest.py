@@ -364,14 +364,14 @@ def test_delta_protocol_reconstruction_quantized(tmp_path):
     for rec, ct in zip(drv.records, chunks):
         key = _key_of(ct)
         for L in LINEARS:
-            recon = q_s.dequant(rec.delta_s[L]) + q_s.dequant(
-                system.s_codes[L])
+            recon = q_s.dequant(rec.delta_s[L], device=DEVICE) + q_s.dequant(
+                system.s_codes[L], device=DEVICE)
             rel = _rel_mse(recon, model.true_states[(key, L)])
             assert rel < DOUBLE_ROUND_GATE, f"chunk {rec.chunk_idx} L {L}: {rel}"
-        rel1 = _rel_mse(q_m1.dequant(rec.delta_m1)
-                        + q_m1.dequant(system.m1_codes), model.true_m1[key])
-        rel2 = _rel_mse(q_m2.dequant(rec.delta_m2)
-                        + q_m2.dequant(system.m2_codes), model.true_m2[key])
+        rel1 = _rel_mse(q_m1.dequant(rec.delta_m1, device=DEVICE)
+                        + q_m1.dequant(system.m1_codes, device=DEVICE), model.true_m1[key])
+        rel2 = _rel_mse(q_m2.dequant(rec.delta_m2, device=DEVICE)
+                        + q_m2.dequant(system.m2_codes, device=DEVICE), model.true_m2[key])
         assert rel1 < DOUBLE_ROUND_GATE and rel2 < DOUBLE_ROUND_GATE
         assert rec.n_tokens == 5
         assert rec.cache_vector.shape[0] == len(LINEARS) * S_D + 2 * M_D
@@ -398,15 +398,15 @@ def test_delta_protocol_exact_stub(tmp_path):
     for rec, ct in zip(drv.records, chunks):
         key = _key_of(ct)
         for L in LINEARS:
-            recon = q_s.dequant(rec.delta_s[L]) + q_s.dequant(
-                system.s_codes[L])
+            recon = q_s.dequant(rec.delta_s[L], device=DEVICE) + q_s.dequant(
+                system.s_codes[L], device=DEVICE)
             rel = _rel_mse(recon, model.true_states[(key, L)])
             assert rel < SINGLE_ROUND_GATE, f"chunk {rec.chunk_idx} L {L}: {rel}"
-        assert _rel_mse(q_m1.dequant(rec.delta_m1)
-                        + q_m1.dequant(system.m1_codes),
+        assert _rel_mse(q_m1.dequant(rec.delta_m1, device=DEVICE)
+                        + q_m1.dequant(system.m1_codes, device=DEVICE),
                         model.true_m1[key]) < SINGLE_ROUND_GATE
-        assert _rel_mse(q_m2.dequant(rec.delta_m2)
-                        + q_m2.dequant(system.m2_codes),
+        assert _rel_mse(q_m2.dequant(rec.delta_m2, device=DEVICE)
+                        + q_m2.dequant(system.m2_codes, device=DEVICE),
                         model.true_m2[key]) < SINGLE_ROUND_GATE
 
 
@@ -443,19 +443,19 @@ def test_retrieval_vector_order_and_delta_consistency(tmp_path):
     q_s = resolve_quantizer("S", S_D)
     q_m1 = resolve_quantizer("M1", M_D)
     q_m2 = resolve_quantizer("M2", M_D)
-    seg = lambda a, b: torch.from_numpy(np.ascontiguousarray(v[a:b]))
+    seg = lambda a, b: torch.from_numpy(np.ascontiguousarray(v[a:b])).to(DEVICE)
 
     # ORDER, bit-exact: S layers ascending, then M1, then M2
     for k, L in enumerate(sorted(LINEARS)):
         assert torch.equal(seg(k * S_D, (k + 1) * S_D),
-                           q_s.dequant(ind_codes["s"][L])), (k, L)
+                           q_s.dequant(ind_codes["s"][L], device=DEVICE)), (k, L)
     assert torch.equal(seg(len(LINEARS) * S_D, -M_D),
-                       q_m1.dequant(ind_codes["m1"]))
-    assert torch.equal(seg(-M_D, None), q_m2.dequant(ind_codes["m2"]))
+                       q_m1.dequant(ind_codes["m1"], device=DEVICE))
+    assert torch.equal(seg(-M_D, None), q_m2.dequant(ind_codes["m2"], device=DEVICE))
 
     # every S segment == the DELTA reconstruction within the budget
     for k, L in enumerate(sorted(LINEARS)):
-        approx = q_s.dequant(rec.delta_s[L]) + q_s.dequant(system.s_codes[L])
+        approx = q_s.dequant(rec.delta_s[L], device=DEVICE) + q_s.dequant(system.s_codes[L], device=DEVICE)
         rel = _rel_mse(seg(k * S_D, (k + 1) * S_D), approx)
         assert rel < SINGLE_ROUND_GATE, f"L {L}: {rel}"
 

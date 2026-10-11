@@ -153,8 +153,8 @@ def _attach_m1m2(layer, gates=None) -> M1M2:
 def _loop_inputs():
     """The online-loop inputs: 2 chunks of 6 tokens + 2 single-token
     decode steps (one shared generator -> identical across runs)."""
-    g = torch.Generator(device=DEVICE).manual_seed(12)
-    return [torch.randn(1, T, 64, generator=g).to(DEVICE)
+    torch.manual_seed(12)
+    return [torch.randn(1, T, 64, device=DEVICE)
             for T in (6, 6, 1, 1)]
 
 
@@ -282,8 +282,8 @@ def test_b_full_model_flag_parity_and_wiring_structure():
     # bit-identical outputs, cache route (default use_cache=True — the
     # internal plain DynamicCache has no read_m1, so the block is skipped)
     # and cache-free alike:
-    ids = torch.randint(0, 128, (2, 6), device=DEVICE,
-                        generator=torch.Generator(device=DEVICE).manual_seed(22))
+    torch.manual_seed(22)
+    ids = torch.randint(0, 128, (2, 6), device=DEVICE)
     with torch.no_grad():
         out_off = model_off(input_ids=ids).last_hidden_state
         out_on = model_on(input_ids=ids).last_hidden_state
@@ -504,9 +504,9 @@ def test_d6_composability_through_the_quantized_store():
     with torch.no_grad():
         mod.write_gate_k.fill_(0.5)
         mod.write_gate_v.fill_(0.7)
-    g = torch.Generator(device=DEVICE).manual_seed(777)
-    kA = torch.randn(1, H, 5, D, generator=g).to(DEVICE); vA = torch.randn(1, H, 5, D, generator=g).to(DEVICE)
-    kB = torch.randn(1, H, 5, D, generator=g).to(DEVICE); vB = torch.randn(1, H, 5, D, generator=g).to(DEVICE)
+    torch.manual_seed(777)
+    kA = torch.randn(1, H, 5, D, device=DEVICE); vA = torch.randn(1, H, 5, D, device=DEVICE)
+    kB = torch.randn(1, H, 5, D, device=DEVICE); vB = torch.randn(1, H, 5, D, device=DEVICE)
 
     # the §3.2 first forward: a cache with no codes reads back ZEROS
     fresh = TQCache(layer_types=[])
