@@ -321,3 +321,31 @@ G20.P1 arbitrates); the sibling test files' np.array_equal sites
 prefactor (last-ulp drift vs legacy host float64 — the parity gate
 covers it). Wave DoD: Tier-D 43/43 post-tag; attestation truthful.
 Next: W20.5 — fht_forward_large / fht_backward_large (K2 begins).
+
+## W20.5 — fht_forward_large / fht_backward_large, K2 begins (CLOSED 2026-10-11)
+
+The multi-block butterfly for K = 2^19…2^22 is authored:
+`include/flute/fht_large.cuh` (the math contract: 13 tile-local
+stages at the half-tile line — the PROPOSAL's canonical 13/6/9, the
+ledger's off-by-one resolved and recorded; sign conventions cited;
+the NO-ATOMICS ownership contracts); `src/kernel_tq.cu` (born, 941
+lines: pass 1 tile-local via kernel_fht.cu's own fht_block primitive
+— the pairing discipline by construction, cp.async staging; pass 2
+cross stages one-launch-per-stage; the adjoint with signs at first
+load + rsqrtf(K) at the final store, transit stages reused
+orientation-free; 5 kernels all __launch_bounds__(1024), zero
+atomics; the CANARY/TRAP negative-control scaffolding, default OFF);
+`bindings.cpp` + `setup.py` (the pair bound, kernel_tq.cu always
+built, the variant-build guidance); `fht.py` (the three-band
+eligibility table: ≤16,384 single-block VERBATIM — **git-verified
+byte-identical via the auditor's new git_diff_empty kind**; the
+pow2 large band when the extension is built; everything else
+reference/loud-refusal; the 24,576 conv window untouched via the
+segments machinery).
+
+Compile + run defer to the A10G box (nvcc ABSENT on this box —
+recorded): the box's provision step builds kernel_tq.cu with
+FLUTE_CUDA_ARCHES=86, then G20.P2 (W20.6) is the differential
+authority. Tier-G: G20.P2's twins land in W20.6 (this wave closed on
+Tier-D only — noted in the ledger). Attestation truthful. Next:
+W20.6 — the debug twins + canary/trap builds + the K2 gates.

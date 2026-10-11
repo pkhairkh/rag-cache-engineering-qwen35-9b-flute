@@ -229,6 +229,24 @@ def check_ledger(spec):
     return True, ""
 
 
+def check_git_diff_empty(spec):
+    # spec: {"kind": "git_diff_empty", "target": "<path>",
+    #        "from": "<rev>", "to": "<rev-or-HEAD>"}
+    # PASS iff `git diff <from>..<to> -- <path>` output is empty (the
+    # byte-identical guarantee, e.g. kernel_fht.cu vs w20-wave-4).
+    path = spec["target"]
+    rev_from = spec["from"]
+    rev_to = spec.get("to", "HEAD")
+    rc, out, _err = _run(["git", "diff", f"{rev_from}..{rev_to}", "--", path])
+    if rc is None:
+        return False, "git not runnable"
+    if rc != 0:
+        return False, f"git diff rc={rc}"
+    if out.strip():
+        return False, f"diff not empty ({len(out.splitlines())} lines)"
+    return True, ""
+
+
 CHECK_KINDS = {
     "exists": check_exists,
     "grep": check_grep,
@@ -238,6 +256,7 @@ CHECK_KINDS = {
     "git_tag": check_git_tag,
     "git_log": check_git_log,
     "ledger": check_ledger,
+    "git_diff_empty": check_git_diff_empty,
 }
 
 
@@ -507,7 +526,67 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.4.7 —"},
         {"kind": "git_tag", "target": "w20-wave-4"},
     ],
-    # W20.5 … W20.12 — appended by each wave's close-out task.
+    # W20.5 — fht_forward_large / fht_backward_large (appended at W20.5.6)
+    "W20.5": [
+        # W20.5.1 — the fht_large math contract header
+        {"kind": "exists", "target":
+         "src/flute_extended/include/flute/fht_large.cuh"},
+        {"kind": "grep", "target":
+         "src/flute_extended/include/flute/fht_large.cuh",
+         "pattern": "16384"},
+        {"kind": "grep", "target":
+         "src/flute_extended/include/flute/fht_large.cuh",
+         "pattern": "no atomics"},
+        {"kind": "grep", "target":
+         "src/flute_extended/include/flute/fht_large.cuh",
+         "pattern": "cross"},
+        {"kind": "grep", "target":
+         "src/flute_extended/include/flute/fht_large.cuh",
+         "pattern": "fht_large_stages"},
+        # W20.5.2 — kernel_tq.cu born: fht_forward_large
+        {"kind": "exists", "target": "src/flute_extended/src/kernel_tq.cu"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "cp\\.async"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "__launch_bounds__"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "cudaFuncSetAttribute"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "fht_forward_large"},
+        # W20.5.3 — fht_backward_large (adjoint)
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "fht_backward_large"},
+        # The determinism contract, module-wide (5.2+5.3)
+        {"kind": "absent", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "atomic"},
+        # W20.5.4 — bindings + build registration
+        {"kind": "grep", "target": "src/flute_extended/src/bindings.cpp",
+         "pattern": "fht_forward_large|fht_backward_large"},
+        {"kind": "grep", "target": "src/flute_extended/setup.py",
+         "pattern": "kernel_tq"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "FLUTE_TQ_CANARY|FLUTE_TQ_TRAP"},
+        # W20.5.5 — fht.py eligibility
+        {"kind": "grep", "target": "src/flute_extended/fht.py",
+         "pattern": "fht_forward_large|fht_backward_large"},
+        {"kind": "grep", "target": "src/flute_extended/fht.py",
+         "pattern": "16384"},
+        {"kind": "py_compile", "target": "src/flute_extended/fht.py"},
+        # The byte-identical guarantee: the <=16,384 kernel untouched
+        {"kind": "git_diff_empty", "target":
+         "src/flute_extended/src/kernel_fht.cu",
+         "from": "w20-wave-4", "to": "HEAD"},
+        # W20.5.6 — wave close: ledger + git facts
+        {"kind": "ledger", "target": "W20.5"},
+        {"kind": "git_log", "target": "W20.5.1 —"},
+        {"kind": "git_log", "target": "W20.5.2 —"},
+        {"kind": "git_log", "target": "W20.5.3 —"},
+        {"kind": "git_log", "target": "W20.5.4 —"},
+        {"kind": "git_log", "target": "W20.5.5 —"},
+        {"kind": "git_log", "target": "W20.5.6 —"},
+        {"kind": "git_tag", "target": "w20-wave-5"},
+    ],
+    # W20.6 … W20.12 — appended by each wave's close-out task.
 }
 
 

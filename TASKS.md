@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: IN EXECUTION — 5/13 waves closed (W20.0–W20.4).
+Status: IN EXECUTION — 6/13 waves closed (W20.0–W20.5).
 
 ---
 
@@ -21,7 +21,7 @@ Status: IN EXECUTION — 5/13 waves closed (W20.0–W20.4).
 | W20.2 | K1 | TQCodes device contract + codebook mirror | 3 | — | CLOSED |
 | W20.3 | K1 | turboquant.py torch rewrite (the core) | 6 | — | CLOSED |
 | W20.4 | K1 | wiring + serving sweep + K1 gates | 7 | G20.P1 | CLOSED |
-| W20.5 | K2 | fht_forward_large / fht_backward_large | 6 | — | OPEN |
+| W20.5 | K2 | fht_forward_large / fht_backward_large | 6 | — | CLOSED |
 | W20.6 | K2 | debug twins + canary/trap builds | 4 | G20.P2, G20.6 | OPEN |
 | W20.7 | K3 | tq_quant_batched (the fused encode) | 5 | — | OPEN |
 | W20.8 | K3 | tq_dequant_batched + dispatcher | 4 | G20.P3, G20.1, G20.2, G20.4 | OPEN |
@@ -853,7 +853,7 @@ COMMIT: "W20.5.5 — fht.py routes K>16,384 to fht_large (existing kernel
 verbatim)"
 
 #### W20.5.6 — wave close W20.5
-- [ ] done
+- [x] done
 ROLE orchestrator · standard close-out.
 Tier-D: 5.1–5.5 sets; the kernel_fht.cu empty-diff; the no-atomics
 grep; (conditional) the compile record.
@@ -1384,7 +1384,7 @@ truthful (PROMPT.md §1.4):
 | W20.2 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.2 exit 0 (24/24, re-verified post-tag); push w20-wave-2 |
 | W20.3 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.3 exit 0 (24/24, re-verified post-tag; incl. the module-wide numpy-zero audit line); push w20-wave-3 |
 | W20.4 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.4 exit 0 (43/43, re-verified post-tag); push w20-wave-4 |
-| W20.5 | — (pending) |
+| W20.5 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.5 exit 0 (27/27, re-verified post-tag; incl. the kernel_fht.cu byte-identical git fact via the new git_diff_empty kind); compile deferred to the A10G box (nvcc ABSENT, recorded); push w20-wave-5 |
 | W20.6 | — (pending) |
 | W20.7 | — (pending) |
 | W20.8 | — (pending) |
