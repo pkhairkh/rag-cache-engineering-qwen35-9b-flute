@@ -8,11 +8,85 @@ layers, NOT per-layer (spec §2.2: "TWO for the whole model"):
 
   read  (spec §2.2):  softmax(q @ M1ᵀ) @ M2  — folded into the layer's
                       output path by the W3.2 wiring (modeling.py).
-  write (spec §2.2):  gated ADDITIVE per-token scatter — slot = position
-                      mod mem_size. delta_M1/M2 are therefore
-                      path-independent and chunk deltas sum losslessly at
-                      install (PROPOSAL D4 / SPEC §6: install sums
-                      DEQUANTIZED M1/M2 deltas, never the codes).
+  write (spec §2.2):  gated ADDITIVE per-token scatter. delta_M1/M2 are
+                      path-independent per CALL and chunk deltas sum
+                      losslessly at install (PROPOSAL D4 / SPEC §6:
+                      install sums DEQUANTIZED M1/M2 deltas, never the
+                      codes).
+
+W21 — THE ADDRESS (the position-lock, decomposed): the v1 write chose
+the slot by POSITION (slot = p mod mem_size), which made a pair-side's
+state delta simply its (key/value) SEQUENCE: at T < mem_size every slot
+holds exactly one token, so the §7 / §4 state-cosine between two sides
+is the POSITION-ALIGNED key correlation — a surface-form lock, not a
+content similarity. The box's W20.15 instruments predicted the ceiling
+(cos_pos riding a stable ~+0.36 common-direction pedestal, spread
+~0.12-0.13, no trend; the low-lexical-overlap buckets flat) and the
+W20.15 close note carried exactly this wave. Every reference design for
+key-value memories addresses by CONTENT, never by position —
+Product-Key Memory (Lample et al. 2019, arXiv:1907.05242: the slot is
+chosen by key-prototype similarity), Memorizing Transformers (Wu et
+al. 2022, arXiv:2203.08913: kNN retrieval into a (key, value) store by
+the key itself), the fast-weight/linear-attention lineage the model's
+own 24 S-states follow (the delta-rule write is content-addressed by
+k). The v1 position-addressed scatter is the odd one out; W21 moves
+the WRITE ADDRESS to the key's content and keeps everything else.
+
+THE W21 WRITE (default `write_addr="content"`):
+
+  1. CENTER (default `center_write=True`): k̃ = k − mean_t k (per
+     (batch, head), over the call's tokens; v likewise). The v1 box run
+     measured a stable ~+0.36 cosine between RANDOM cross pairs — the
+     well-known representation-anisotropy pedestal (the keys' shared
+     "typical direction"; the canonical fix is centering/whitening, Su
+     et al. 2021, "Whitening Sentence Representations for Better
+     Semantics"). The W19 delta-loss already removes the SYSTEM state's
+     common component; this removes the TOKEN-key common component at
+     the source, train and serve identically (it is inside the write).
+     A centered bag has zero slot-sum BY CONSTRUCTION, so the state
+     cosine becomes a CONTENT covariance, not a length × pedestal
+     artifact. Side effect (deliberate): a T=1 (decode) call centers to
+     the zero vector and writes nothing — the memory freezes at
+     prefill end, which is what the retrieval state should be (the v1
+     counter hack only stopped decode overwriting slot 0).
+  2. ADDRESS: slot = simhash(k̃) — the sign pattern of the
+     Hadamard-mixed centered key (Charikar 2002 simhash over a FIXED,
+     mathematically-deterministic Sylvester Hadamard — no learned
+     prototypes, no RNG, bit-identical on every box). `addr_blocks`
+     (κ, default 4) independent sign-blocks give each token κ slots:
+     the collision probability of two keys with cosine c is
+     1 − (1 − p(c)^b)^κ with p(c) = 1 − arccos(c)/π, b = log2(mem/κ) —
+     near-identical contextual tokens collide with high probability,
+     unrelated ones almost never. The state cosine over the resulting
+     content-bags is a token-pair kernel: shared CONTENT matches
+     anywhere in the two texts (position-free), which is exactly the
+     spec §7 objective ("similar texts -> similar states, retrieval by
+     content overlap") and what the v1 position lock could not
+     express at any gate setting.
+  3. GATED ADD (unchanged shape): m_new = m + g[L, h] · scatter(k̃) —
+     ONE branch-free gated add per call; the write gates stay the only
+     trained weights.
+
+The write gates are now PER-(LAYER, HEAD) — (num_linear_layers,
+num_heads) each. The v1 per-layer scalar could only reweight layers;
+the flattened state cosine weights heads by ‖k̃_h‖², and a 2-5×
+cross-head scale spread (the natural variation of the per-head key
+deviations) is a 4-25× weight imbalance the layer scalar cannot touch.
+Per-head gates are the granularity the memory literature uses
+(Memorizing Transformers' read gate is per-dimension); they remain
+"the gates" — the M1M2 module's only parameters, 3 vectors of
+(L·H, L·H, L) floats. read_gate stays per-LAYER (it scales the layer's
+read output, one scalar per output path). Gates .npz artifacts carry
+the shapes; a v1 (L,) artifact is REFUSED loudly by load_gates (the
+addressing changed the semantics — a v1-trained gate file is
+meaningless under content addressing and must be retrained).
+
+`write_addr="positional"` restores the v1 slot rule EXACTLY (the same
+token-major scatter code path, bit-identical, kept as the A/B and the
+pinned reference the W3.3 tests assert); `center_write=False` restores
+raw (uncentered) keys/values. The two knobs are orthogonal on purpose
+— the driver's held-out ladder sweeps the four corners plus the
+κ ladder, all offline on the captured k/v (no re-prefill per config).
 
 CRITICAL ARCHITECTURAL FACT: M1/M2 are RUNTIME CACHE STATE, not weights.
 They start zero, accumulate during prefill, and are snapshotted /
@@ -27,45 +101,58 @@ spec §7 / PROPOSAL Phase 4 train "the M1/M2 read/write gates".
 
 Zero-init (PROPOSAL P3): the write gates start at 0.0 — M1/M2 start as
 no-ops and the untrained model's behavior is bit-unchanged (write
-returns the state bit-identical; read of zero memories returns exact
-zeros). The write is deliberately ONE branch-free gated add
-(`m + g · Σ_t k_t`): a `if gate == 0: skip` short-circuit would zero the
-LOCAL Jacobian ∂m_new/∂g = Σ_t k_t exactly where P3's fine-tune has to
-start opening the gates. W19 caveat (measured on the box, proven in
-m1m2_finetune's docstring): the P3 point is nonetheless an EXACT SADDLE
-of the §7 contrastive objective — at g=0 every pair-side replays to the
-SAME (zero) state, so the LOSS-level gradient dL/dg = <dL/dm, Δ> is
-identically zero and the gates never open from there BY THEMSELVES; the
-trainer (GatesTrainConfig.gate_init) opens them explicitly before step
-0. The P3 deployment default stays — untrained ingest is a no-op.
+returns the state bit-identical in BOTH addressing modes; read of zero
+memories returns exact zeros). The write is deliberately ONE
+branch-free gated add (`m + g · Σ_t k̃_t`): a `if gate == 0: skip`
+short-circuit would zero the LOCAL Jacobian ∂m_new/∂g = Σ_t k̃_t
+exactly where P3's fine-tune has to start opening the gates. W19
+caveat (measured on the box, proven in m1m2_finetune's docstring): the
+P3 point is nonetheless an EXACT SADDLE of the §7 contrastive
+objective — at g=0 every pair-side replays to the SAME (zero) state,
+so the LOSS-level gradient dL/dg = <dL/dm, Δ> is identically zero and
+the gates never open from there BY THEMSELVES; the trainer
+(GatesTrainConfig.gate_init) opens them explicitly before step 0. The
+P3 deployment default stays — untrained ingest is a no-op.
 
 Online loop (SPEC §3.2, PROPOSAL D4): `m1m2_from_cache` reads the
-cache's m1/m2 codes, falling back to `init_state()` zeros when the cache
-has none (the first forward sees zeros; the writes open the state);
-`push_to_cache` quantize-on-writes through `cache.update_m1/update_m2`
-and hands back the dequantized round-trip — the state the NEXT forward
-must see (the codes are the persisted truth; the cache never holds
-fp16).
+cache's m1/m2 codes, falling back to `init_state()` zeros when the
+cache has none (the first forward sees zeros; the writes open the
+state); `push_to_cache` quantize-on-writes through
+`cache.update_m1/update_m2` and hands back the dequantized round-trip
+— the state the NEXT forward must see (the codes are the persisted
+truth; the cache never holds fp16).
 
-Numerics: the softmax path runs in fp32 (scores scaled by 1/√D over the
-mem dim, per the read contract); everything else keeps the input dtype —
-read returns q.dtype, write returns the STATE's (m1/m2) dtype. k/v are
-cast up only when their dtype is wider than the state's; the gated add
-accumulates in the promoted dtype and casts back, so uniform-dtype calls
-(the tests, the production fp16 path) do no hidden rounding beyond the
-native dtype.
+Determinism contract (W21): the slot is a pure function of the input
+k bits — center (fp32) -> fixed Sylvester Hadamard mixing (fp32) ->
+sign bits -> integer slot. The capture/replay pair recomputes it from
+the SAME captured k (bit-identical inputs, same device, same shapes)
+so the W18 exact-gradient replay stays exact: write_deltas reproduces
+the forward's scatter bit-for-bit (shared code). The mixing matrix is
+built from the Sylvester recursion (±1 entries, exact in any dtype) —
+NOT a seeded RNG — so every box derives the same matrix; it is a plain
+attribute, never a registered buffer (it must not enter state_dict or
+the gates artifact; geometry pins it).
+
+Numerics: the softmax read path runs in fp32 (scores scaled by 1/√D
+over the mem dim, per the read contract); the write's centering and
+mixing run in fp32 (the scatter promotes with the state's dtype and
+casts back, so uniform-dtype calls do no hidden rounding beyond the
+native dtype). k/v are cast up only when their dtype is wider than the
+state's; the gated add accumulates in the promoted dtype and casts
+back.
 
 Composability notes (spec §2.2 "Summing is lossless"): the additive
-write is exact in real arithmetic for any regrouping of the multiset of
-(position→token) pairs. In floating point it is BIT-exact whenever the
-per-slot token groupings match — which covers the W3.3 contracts:
-sequential writes at positions [0,1] then [2,3] vs one [0,1,2,3] call
-(each slot lands once), and the two-token slot collision
-`m1[h, 0] = g·(k0 + k1)` (the per-slot token sum is formed BEFORE the
-single gated add). Re-grouping the same multiset differently across
-calls (many tokens in one slot, split differently) is exact only up to
-fp re-association (~1 ulp), which the D4 install path absorbs by
-requantizing the dequantized SUM once (never summing codes).
+write is exact in real arithmetic for any regrouping of the CALL's
+multiset of (token -> slot) pairs, and per-CALL deltas (the D4 install
+unit) are deterministic functions of that call's k/v in BOTH addressing
+modes — chunk deltas sum losslessly at install exactly as before.
+Within one call, the v1 positional mode is BIT-exact under regrouping
+(per-slot sums formed before the single gated add); the content mode
+re-groups tokens by content hash instead of position — the same
+per-slot-sum property holds (index_add over the call's tokens), and
+the per-call centering means merging two CALLS into one longer call
+changes each call's own center (call-granular, documented — install
+sums CALL deltas, never merged calls).
 
 This module imports torch only at module top (NO transformers) —
 `TQCache` is imported lazily inside the cache helpers; `import _paths`
@@ -74,7 +161,10 @@ first (house sys.path anchor, see src/rag/_paths.py).
 Refs: SPECIFICATION.md §2.2 (the memories), §3.2 (online loop),
 §5 (M1/M2 codes in the snapshot), §6 (install sums dequantized deltas),
 §7 (the fine-tune trains the gates); PROPOSAL.md P3 (zero-init write
-gates), D4 (the delta protocol), Phase 3/4.
+gates), D4 (the delta protocol), Phase 3/4; W21 (this wave — the
+content address + centering + per-head gates); Lample et al. 2019
+(arXiv:1907.05242), Wu et al. 2022 (arXiv:2203.08913), Su et al. 2021
+(whitening/centering), Charikar 2002 (simhash).
 """
 from __future__ import annotations
 
@@ -91,6 +181,8 @@ if TYPE_CHECKING:  # never executed at runtime — keeps the module transformers
 
 __all__ = ["M1M2", "m1m2_from_cache", "push_to_cache"]
 
+_ADDR_MODES = ("content", "positional")
+
 
 def _pos_int(name: str, value) -> int:
     """Loud positive-int config validation."""
@@ -103,22 +195,54 @@ def _pos_int(name: str, value) -> int:
     return value
 
 
+def _next_pow2(n: int) -> int:
+    """Smallest power of two >= n (n >= 1)."""
+    return 1 << (n - 1).bit_length()
+
+
+def _sylvester_hadamard(n: int) -> torch.Tensor:
+    """The (n, n) Sylvester Hadamard matrix, n a power of two, EXACT ±1
+    entries (deterministic on every box — no RNG, no version drift)."""
+    if n < 1 or n != _next_pow2(n):
+        raise ValueError(f"_sylvester_hadamard: n must be a power of two, got {n}")
+    h = torch.ones(1, 1, dtype=torch.float32)
+    while h.shape[0] < n:
+        h = torch.cat([torch.cat([h, h], dim=1),
+                       torch.cat([h, -h], dim=1)], dim=0)
+    return h
+
+
 class M1M2(nn.Module):
     """The two global memories (SPECIFICATION.md §2.2).
 
     The WEIGHTS here are the GATES ONLY (spec §7 / PROPOSAL Phase 4
-    fine-tune trains exactly these, as per-layer scalars):
+    fine-tunes exactly these):
 
-      * ``write_gate_k`` / ``write_gate_v`` — (num_linear_layers,) each,
-        ZERO-init (PROPOSAL P3: M1/M2 start as no-ops — the untrained
-        model's behavior is bit-unchanged; the fine-tune opens them).
-      * ``read_gate`` — (num_linear_layers,), ONE-init (reads of the zero
-        memories are exact zeros anyway, so P3's bit-unchanged property
-        holds from both the read and the write side).
+      * ``write_gate_k`` / ``write_gate_v`` — (num_linear_layers,
+        num_heads) each, ZERO-init (PROPOSAL P3: M1/M2 start as no-ops
+        — the untrained model's behavior is bit-unchanged in both
+        addressing modes; the fine-tune opens them). Per-(layer, head)
+        since W21: the flattened state cosine weights heads by
+        |k̃_h|^2 and only a per-head gate can rebalance them.
+      * ``read_gate`` — (num_linear_layers,), ONE-init (reads of the
+        zero memories are exact zeros anyway, so P3's bit-unchanged
+        property holds from both the read and the write side).
+
+    Addressing knobs (plain attributes, settable post-init for the
+    driver's A/B + held-out ladder; validated at every write):
+
+      * ``write_addr`` — "content" (W21 default: slot = simhash of the
+        centered key) or "positional" (the v1 slot = p mod mem_size,
+        bit-identical v1 semantics).
+      * ``center_write`` — True (W21 default: write k − mean_t k, the
+        anisotropy-pedestal removal) or False (raw keys/values, v1).
+      * ``addr_blocks`` — κ, the number of independent sign-blocks
+        (each token writes κ slots; 4 by default at mem 1024 ->
+        b = 8 sign bits per block).
 
     There are NO m1/m2 buffers on this module: the memories are RUNTIME
-    CACHE STATE — zero at start, accumulating during prefill, quantized /
-    snapshotted / installed through the TQCache (spec §3.2/§5; see
+    CACHE STATE — zero at start, accumulating during prefill, quantized
+    / snapshotted / installed through the TQCache (spec §3.2/§5; see
     `m1m2_from_cache` / `push_to_cache`).
 
     Geometry: the spec writes the memories as (1, 32, mem_size, 128) —
@@ -128,21 +252,52 @@ class M1M2(nn.Module):
     """
 
     def __init__(self, num_heads: int = 32, head_dim: int = 128,
-                 mem_size: int = 128, num_linear_layers: int = 24):
+                 mem_size: int = 128, num_linear_layers: int = 24,
+                 write_addr: str = "content", center_write: bool = True,
+                 addr_blocks: int = 4):
         num_heads = _pos_int("num_heads", num_heads)
         head_dim = _pos_int("head_dim", head_dim)
         mem_size = _pos_int("mem_size", mem_size)
         num_linear_layers = _pos_int("num_linear_layers", num_linear_layers)
+        if not isinstance(write_addr, str) or write_addr not in _ADDR_MODES:
+            raise ValueError(
+                f"M1M2: write_addr must be one of {_ADDR_MODES}, got "
+                f"{write_addr!r}")
+        if not isinstance(center_write, bool):
+            raise TypeError(
+                f"M1M2: center_write must be a bool, got "
+                f"{type(center_write).__name__} ({center_write!r})")
+        addr_blocks = _pos_int("addr_blocks", addr_blocks)
+        if addr_blocks > 8:
+            raise ValueError(
+                f"M1M2: addr_blocks must be <= 8 (the sign-block budget; "
+                f"the ladder tops out at 8), got {addr_blocks}")
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.mem_size = mem_size
         self.num_linear_layers = num_linear_layers
+        self.write_addr = write_addr
+        self.center_write = center_write
+        self.addr_blocks = addr_blocks
         self._sqrt_d = math.sqrt(head_dim)
         # GATES — the only weights (the §7 fine-tune trains these).
-        self.write_gate_k = nn.Parameter(torch.zeros(num_linear_layers))
-        self.write_gate_v = nn.Parameter(torch.zeros(num_linear_layers))
+        self.write_gate_k = nn.Parameter(
+            torch.zeros(num_linear_layers, num_heads))
+        self.write_gate_v = nn.Parameter(
+            torch.zeros(num_linear_layers, num_heads))
         self.read_gate = nn.Parameter(torch.ones(num_linear_layers))
+        # The fixed sign-mixing for the content address: the first
+        # head_dim rows of the Sylvester Hadamard at width
+        # next_pow2(head_dim) — a plain attribute, NEVER a registered
+        # buffer (it must not enter state_dict / the gates artifact;
+        # the geometry pins it bit-exactly on every box). Per-device
+        # copies cache lazily in _mix_dev.
+        dp = _next_pow2(head_dim)
+        self._mix_full = _sylvester_hadamard(dp)[:head_dim, :].contiguous()
+        self._mix_dev = {}
+        # fail fast on impossible address geometry (loud, at init too)
+        self._addr_geometry()
 
     # ------------------------------------------------------------ geometry --
     def state_shape(self) -> torch.Size:
@@ -164,7 +319,79 @@ class M1M2(nn.Module):
     def extra_repr(self) -> str:
         return (f"num_heads={self.num_heads}, head_dim={self.head_dim}, "
                 f"mem_size={self.mem_size}, "
-                f"num_linear_layers={self.num_linear_layers}")
+                f"num_linear_layers={self.num_linear_layers}, "
+                f"write_addr={self.write_addr!r}, "
+                f"center_write={self.center_write}, "
+                f"addr_blocks={self.addr_blocks}")
+
+    def _addr_geometry(self) -> Tuple[int, int, int]:
+        """Validate the addressing config and derive (blocks, stride,
+        bits): stride = mem // blocks (the per-block slot range), bits =
+        sign bits per block (capped by the stride's log2 and by the
+        mixing width // blocks). Loud on impossible configs."""
+        if not isinstance(self.write_addr, str) \
+                or self.write_addr not in _ADDR_MODES:
+            raise ValueError(
+                f"M1M2: write_addr must be one of {_ADDR_MODES}, got "
+                f"{self.write_addr!r}")
+        if not isinstance(self.center_write, bool):
+            raise TypeError(
+                f"M1M2: center_write must be a bool, got "
+                f"{type(self.center_write).__name__}")
+        blocks = _pos_int("addr_blocks", self.addr_blocks)
+        if blocks > 8:
+            raise ValueError(
+                f"M1M2: addr_blocks must be <= 8, got {blocks}")
+        dp = _next_pow2(self.head_dim)
+        if blocks > dp:
+            raise ValueError(
+                f"M1M2: addr_blocks {blocks} needs >= {blocks} mixed "
+                f"coordinates, head_dim {self.head_dim} gives {dp} — "
+                f"reduce addr_blocks or raise head_dim")
+        stride = max(1, self.mem_size // blocks)
+        bits = max(1, min(stride.bit_length() - 1, dp // blocks))
+        return blocks, stride, bits
+
+    def _get_mix(self, device) -> torch.Tensor:
+        """The (head_dim, next_pow2(head_dim)) sign-mixing on `device`
+        (cached per device; the CPU master is the pinned ±1 truth)."""
+        key = str(device)
+        cached = self._mix_dev.get(key)
+        if cached is None:
+            cached = self._mix_full.to(device)
+            self._mix_dev[key] = cached
+        return cached
+
+    def _centered(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, H, T, D) -> fp32, per-(b, h) token-mean removed when
+        center_write (the anisotropy-pedestal removal, W21); the raw
+        fp32 cast otherwise."""
+        xc = x.to(torch.float32)
+        if self.center_write:
+            xc = xc - xc.mean(dim=2, keepdim=True)
+        return xc
+
+    def _content_slots(self, kc: torch.Tensor) -> torch.Tensor:
+        """(B, H, T, D) centered fp32 keys -> (B, H, T, K) slot indices.
+
+        The W21 content address: y = kc @ Hadamard (fixed ±1 mixing);
+        block j reads the sign bits of y[..., j*b:(j+1)*b] as an
+        integer bucket; slot_j = (j*stride + bucket) mod mem_size. A
+        pure deterministic function of the key bits (simhash — two keys
+        with cosine c share a block's bucket with probability
+        1 - (1 - p^b)^K, p = 1 - arccos(c)/pi)."""
+        blocks, stride, bits = self._addr_geometry()
+        B, H, T, _D = kc.shape
+        y = torch.matmul(kc, self._get_mix(kc.device))     # (B, H, T, dp)
+        weights = (1 << torch.arange(bits, device=kc.device,
+                                     dtype=torch.int64))   # (bits,)
+        slots = torch.empty(B, H, T, blocks, dtype=torch.int64,
+                            device=kc.device)
+        for j in range(blocks):
+            bits_t = (y[..., j * bits:(j + 1) * bits] > 0).to(torch.int64)
+            bucket = (bits_t * weights).sum(dim=-1)        # (B, H, T)
+            slots[..., j] = (j * stride + bucket) % self.mem_size
+        return slots
 
     # ---------------------------------------------------------- validation --
     def _check_layer_idx(self, op: str, layer_idx) -> None:
@@ -217,7 +444,13 @@ class M1M2(nn.Module):
         q.dtype. Softmax over the mem dim, scores scaled by 1/√D, softmax
         computed in fp32 for stability (scores cast to float; the result
         comes back to q.dtype). With zero memories the read returns exact
-        zeros (softmax(uniform) @ 0 = 0) — the P3 no-op property.
+        zeros (softmax(uniform) @ 0 = 0) — the P3 no-op property. W21
+        note: with content-addressed M1 the slots hold content clusters
+        (sums of similar-context keys), so the softmax matches a query
+        against CONTENT, the Memorizing-Transformers retrieval semantics;
+        with a centered M2 the retrieved value is that cluster's centered
+        deviation — the q's own common direction dots to ~0 against the
+        zero-slot-mean state, so the read self-centers.
         """
         self._check_layer_idx("read", layer_idx)
         self._check_qkv("read", "q", q)
@@ -241,26 +474,34 @@ class M1M2(nn.Module):
               m2: torch.Tensor, layer_idx: int,
               positions: Optional[torch.Tensor] = None
               ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Gated ADDITIVE per-token write — path-independent deltas (spec
-        §2.2, PROPOSAL D4): for the token at position p
-        (slot = p mod mem_size),
+        """Gated ADDITIVE per-token write — path-independent per-call
+        deltas (spec §2.2, PROPOSAL D4).
 
-            m1_new[h, slot, :] += write_gate_k[layer_idx] * k[b, h, t, :]
-            m2_new[h, slot, :] += write_gate_v[layer_idx] * v[b, h, t, :]
+        W21 CONTENT mode (default): per (b, h), per token t,
+        k̃_t = k_t − mean_t k (center_write) and its slot is
+        simhash(k̃_t) (addr_blocks independent sign-blocks of the
+        Hadamard mixing); the scatter sums per slot, then ONE gated add
 
-        (realized as ONE gated add over the per-slot token SUM — g·Σ_t k_t,
-        the same sum in exact arithmetic — so the two-token slot collision
-        is bit-exactly g·(k0 + k1)).
+            m1_new[h, s, :] += write_gate_k[layer_idx, h] * Σ_{t→s} k̃_t
+            m2_new[h, s, :] += write_gate_v[layer_idx, h] * Σ_{t→s} ṽ_t
 
-        k/v: (B, H, T, D); positions: (T,) integer tensor (default
-        arange(T)); returns (m1_new, m2_new), each (H, mem, D) in the
-        STATE's dtype. MUST NOT mutate m1/m2 in place — returns fresh
-        tensors (functional; the wiring quantizes and stores them via the
-        cache). Zero gates ⇒ the states come back bit-identical (P3
-        no-op), and the LOCAL gradient w.r.t. a zero gate still flows (the
-        gated add is branch-free — ∂m_new/∂g = Σ_t k_t ≠ 0); NOTE (W19):
-        the §7 InfoNCE sits at an exact saddle at g=0 (dL/dm = 0 on the
-        identical states), so the TRAINER opens the gates via
+        — the delta is a function of the call's OWN tokens only (the
+        D4 per-call unit). A T=1 call centers to zero and writes
+        nothing (decode freezes the memory — deliberate).
+
+        POSITIONAL mode (`write_addr="positional"`, the v1 A/B): slot =
+        p mod mem_size, the bit-exact v1 token-major scatter.
+
+        k/v: (B, H, T, D); positions: (T,) integer tensor (validated
+        in both modes; USED only by the positional mode); returns
+        (m1_new, m2_new), each (H, mem, D) in the STATE's dtype. MUST
+        NOT mutate m1/m2 in place — returns fresh tensors (functional;
+        the wiring quantizes and stores them via the cache). Zero gates
+        ⇒ the states come back bit-identical (P3 no-op, both modes),
+        and the LOCAL gradient w.r.t. a zero gate still flows (the
+        gated add is branch-free — ∂m_new/∂g = Σ_t k̃_t ≠ 0); NOTE
+        (W19): the §7 InfoNCE sits at an exact saddle at g=0 (dL/dm = 0
+        on the identical states), so the TRAINER opens the gates via
         GatesTrainConfig.gate_init — see m1m2_finetune's docstring.
         """
         self._check_layer_idx("write", layer_idx)
@@ -279,11 +520,21 @@ class M1M2(nn.Module):
                 f"{k.device} / {v.device} / {m1.device} / {m2.device}")
         B, H, T, D = tuple(k.shape)
         pos = self._resolve_positions(positions, T, k.device)
-        slots = torch.remainder(pos, self.mem_size)    # (T,) slot = p mod mem
-        m1_new = self._gated_scatter(k, m1, self.write_gate_k[layer_idx],
-                                     slots, B, "k")
-        m2_new = self._gated_scatter(v, m2, self.write_gate_v[layer_idx],
-                                     slots, B, "v")
+        self._addr_geometry()                       # loud on bad knobs
+        if self.write_addr == "content":
+            kc = self._centered(k)
+            vc = self._centered(v)
+            slots = self._content_slots(kc)         # keys address BOTH
+            m1_new = self._gated_scatter_content(
+                kc, m1, self.write_gate_k[layer_idx], slots)
+            m2_new = self._gated_scatter_content(
+                vc, m2, self.write_gate_v[layer_idx], slots)
+        else:
+            slots = torch.remainder(pos, self.mem_size)    # (T,) slot=p mod mem
+            m1_new = self._gated_scatter(k, m1, self.write_gate_k[layer_idx],
+                                         slots, B, "k")
+            m2_new = self._gated_scatter(v, m2, self.write_gate_v[layer_idx],
+                                         slots, B, "v")
         return m1_new, m2_new
 
     def write_deltas(self, k: torch.Tensor, v: torch.Tensor,
@@ -293,14 +544,17 @@ class M1M2(nn.Module):
                      ) -> Tuple[torch.Tensor, torch.Tensor]:
         """(Δ1, Δ2) — the RAW per-call deltas, state-independent (the §2.2
         additive property: m_new = m + g·Δ with Δ the pure scatter of
-        k/v). W18: the memory-safe replay's backward recomputes these ONE
-        CALL AT A TIME instead of retaining the 24-boundary-state chain —
-        bit-identical to the deltas the write path itself adds (the same
-        _scatter_delta, shared code, no drift).
+        the centered/raw k/v). W18: the memory-safe replay's backward
+        recomputes these ONE CALL AT A TIME instead of retaining the
+        24-boundary-state chain — bit-identical to the deltas the write
+        path itself adds (the same scatter code, shared, no drift; the
+        content mode recomputes the SAME deterministic slots from the
+        same captured k — the exactness contract holds).
 
         `state` (any state-shaped tensor, e.g. the m_init) fixes the
         promotion dtype + device of the returned deltas; positions
-        resolve exactly as in write()."""
+        resolve exactly as in write() (used by the positional mode
+        only)."""
         self._check_layer_idx("write_deltas", layer_idx)
         self._check_qkv("write_deltas", "k", k)
         self._check_qkv("write_deltas", "v", v)
@@ -313,9 +567,17 @@ class M1M2(nn.Module):
         ref = state if state is not None else k
         B, H, T, D = tuple(k.shape)
         pos = self._resolve_positions(positions, T, k.device)
-        slots = torch.remainder(pos, self.mem_size)
-        d1 = self._scatter_delta(k, slots, B, ref)
-        d2 = self._scatter_delta(v, slots, B, ref)
+        self._addr_geometry()                       # loud on bad knobs
+        if self.write_addr == "content":
+            kc = self._centered(k)
+            vc = self._centered(v)
+            slots = self._content_slots(kc)
+            d1 = self._scatter_delta_content(kc, slots, ref)
+            d2 = self._scatter_delta_content(vc, slots, ref)
+        else:
+            slots = torch.remainder(pos, self.mem_size)
+            d1 = self._scatter_delta(k, slots, B, ref)
+            d2 = self._scatter_delta(v, slots, B, ref)
         return d1, d2
 
     def _resolve_positions(self, positions, T: int,
@@ -324,7 +586,11 @@ class M1M2(nn.Module):
         default arange(T); loud validation otherwise. W20.4.4: the
         min-position guard is the tensor-space (positions >= 0).all()
         check — gather-free, no host-scalar read; the one host value on
-        the failure path is the raise's own message edge."""
+        the failure path is the raise's own message edge. W21: the
+        CONTENT mode ignores the positions for addressing (the slot is
+        the key's content hash) — the validation still runs (the v1
+        contract, and the wiring keeps passing real positions).
+        """
         if positions is None:
             return torch.arange(T, device=device)
         if not isinstance(positions, torch.Tensor):
@@ -355,10 +621,11 @@ class M1M2(nn.Module):
 
     def _scatter_delta(self, x: torch.Tensor, slots: torch.Tensor, B: int,
                        state: torch.Tensor) -> torch.Tensor:
-        """delta (H, mem, D) in promote(x, state) — the additive scatter
-        (token-major index_add, NO python loop). Shared by the gated
-        write and the W18 write_deltas (the replay backward's recompute
-        is the SAME code, hence bit-identical)."""
+        """delta (H, mem, D) in promote(x, state) — the v1 POSITIONAL
+        additive scatter (token-major index_add, NO python loop).
+        Bit-identical to the pre-W21 write path (the pinned reference).
+        Shared by the gated write and the W18 write_deltas (the replay
+        backward's recompute is the SAME code, hence bit-identical)."""
         H, D = self.num_heads, self.head_dim
         T = x.shape[2]
         dtype = torch.promote_types(x.dtype, state.dtype)
@@ -372,7 +639,9 @@ class M1M2(nn.Module):
     def _gated_scatter(self, x: torch.Tensor, state: torch.Tensor,
                        gate: torch.Tensor, slots: torch.Tensor, B: int,
                        name: str) -> torch.Tensor:
-        """state + gate · scatter(x) — the additive write for one memory.
+        """state + gate · scatter(x) — the v1 POSITIONAL additive write
+        for one memory (gate now the (H,) per-head row; a uniform row
+        reproduces the v1 per-layer scalar bit-exactly).
 
         delta[s] = Σ_{tokens at slot s} x[b, :, t, :] (the shared
         _scatter_delta), then ONE gated add. Collision order within a
@@ -382,7 +651,42 @@ class M1M2(nn.Module):
         dtype = torch.promote_types(x.dtype, state.dtype)
         delta = self._scatter_delta(x, slots, B, state)
         # one branch-free gated add — gradients flow at gate == 0 (P3)
-        return (state.to(dtype) + gate * delta).to(state.dtype)
+        return (state.to(dtype)
+                + gate.to(dtype).view(-1, 1, 1) * delta).to(state.dtype)
+
+    def _scatter_delta_content(self, xc: torch.Tensor, slots: torch.Tensor,
+                               state: torch.Tensor) -> torch.Tensor:
+        """delta (H, mem, D) in promote(xc, state) — the W21 CONTENT
+        scatter: per (head, block) index_add into the (H·mem, D) flat
+        layout (head_offset + slot), the per-slot token sums formed by
+        index_add exactly as in the positional path. Bit-identical
+        between write and write_deltas (shared code — the W18
+        exactness contract)."""
+        B, H, T, D = xc.shape
+        blocks = slots.shape[-1]
+        dtype = torch.promote_types(xc.dtype, state.dtype)
+        src = xc.reshape(B * H * T, D).to(dtype)
+        head_off = (torch.arange(H, device=xc.device,
+                                 dtype=slots.dtype)
+                    * self.mem_size).view(1, H, 1)
+        delta = torch.zeros(H * self.mem_size, D, dtype=dtype,
+                            device=xc.device)
+        for j in range(blocks):
+            idx = (slots[..., j] + head_off).reshape(-1)   # (B·H·T,)
+            delta = torch.index_add(delta, 0, idx, src)
+        return delta.view(H, self.mem_size, D)
+
+    def _gated_scatter_content(self, xc: torch.Tensor, state: torch.Tensor,
+                               gate: torch.Tensor,
+                               slots: torch.Tensor) -> torch.Tensor:
+        """state + gate · scatter(xc) — the W21 CONTENT additive write
+        for one memory (xc the CENTERED fp32 operand, gate the (H,)
+        per-head row). One branch-free gated add (P3 gradients flow at
+        gate == 0)."""
+        delta = self._scatter_delta_content(xc, slots, state)
+        dtype = delta.dtype
+        return (state.to(dtype)
+                + gate.to(dtype).view(-1, 1, 1) * delta).to(state.dtype)
 
     # ------------------------------------------------------------- forward --
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
