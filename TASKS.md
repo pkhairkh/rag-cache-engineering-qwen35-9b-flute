@@ -1264,7 +1264,7 @@ same batched entries; faiss receives GPU-produced vectors once at its
 boundary.
 
 #### W20.10.1 — the install requant as one batched pass
-- [ ] done
+- [x] done
 ROLE task-writer · READ `install.py` (4.2's torch path),
 `tq_cache.py` (the install hooks), `PROPOSAL.md §3.6` · WRITE
 `src/rag/install.py`, `src/rag/tq_cache.py` (if the hook needs the
@@ -1282,7 +1282,7 @@ COMMIT: "W20.10.1 — the install requant batched (one chain over 26
 units)"
 
 #### W20.10.2 — the index frame vectors batched (index.py:372/473/510)
-- [ ] done
+- [x] done
 ROLE task-writer · READ `index.py:360-520` (4.3's torch builds),
 `PROPOSAL.md §3.6` · WRITE `src/rag/index.py`
 BRIEF: the retrieval-frame vector builds (dequant + concat +
@@ -1300,7 +1300,7 @@ COMMIT: "W20.10.2 — the frame vectors batched (faiss fed once at the
 boundary)"
 
 #### W20.10.3 — the eval harness batched
-- [ ] done
+- [x] done
 ROLE task-writer · READ `evals.py` (4.4's torch stats + the ×5
 sites), `m1m2.py` (the :345 region, post-4.4) · WRITE `src/rag/evals.py`
 BRIEF: the five eval sites call the batched entries (round trips via
