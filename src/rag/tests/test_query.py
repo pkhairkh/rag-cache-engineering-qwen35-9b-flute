@@ -44,12 +44,6 @@ Gates (all deterministic; plain asserts; dirs under pytest tmp):
       BIT-equal to the cache's own dequant; the topic-t query vector has
       cos ~ 0.996 with a topic-t chunk vector and ~ 0 with a topic-w one
       (§4 "same space").
-  7b. W23 PREFILL ANSWER MODE (context_token_ids): the answer state is
-      rebuilt by PREFILLING the chunks' text (steps 5-6 skipped —
-      context_prefill replaces load_codes/install in the §9 ledger; no
-      disk access at all), the greedy argmax is the CONTEXT-built
-      state's topic, multi-context composes sequentially (majority
-      topic wins), and contexts without retrieved_ids refuse loudly.
   8.  LOUD REFUSALS: answer_query with neither cache nor cache_factory,
       with a loader that has no .disk_dir, and with a retrieved id whose
       npz is not on disk, all raise ValueError with the culprit named.
@@ -632,84 +626,6 @@ def test_answer_reads_installed_cache(corpus):
     assert float(lg_c[CORRECT_TOPIC]) > float(lg_w[CORRECT_TOPIC])
     assert float(lg_w[WRONG_TOPIC]) > float(lg_c[WRONG_TOPIC])
     assert float(lg_c[CORRECT_TOPIC]) - float(lg_w[CORRECT_TOPIC]) > 100.0
-
-
-# ================================= 6e. W23 prefill answer mode ================
-def _chunk_ctx(cid: int) -> torch.Tensor:
-    """The chunk's ingest token triple as a (1, 3) context tensor (the
-    corpus fixture's chunk encoding — prefill-mode contexts are exactly
-    the chunks' ingest token streams)."""
-    return torch.tensor(
-        [[100 + 7 * cid, 101 + 7 * cid, 102 + 7 * cid]], device=DEVICE)
-
-
-def test_prefill_mode_single_context(corpus):
-    """W23: context_token_ids rebuilds the answer state from the chunk's
-    TEXT — a fresh reseeded cache + the sequential context prefill (steps
-    5-6, the codes load + install, never run: the timings carry
-    context_prefill, NOT load_codes/install; the report is the prefill
-    mode), and the answer reads the CONTEXT-built S state (the greedy
-    argmax is the context chunk's topic; the W12 token confidences flow
-    through the new mode)."""
-    res = answer_query(corpus.model, QUERY_IDS, corpus.system,
-                       loader=corpus.loader, cache_factory=_make_cache,
-                       retrieved_ids=[CORRECT_CHUNK],
-                       context_token_ids=[_chunk_ctx(CORRECT_CHUNK)],
-                       max_new_tokens=2)
-    assert res.oracle is True
-    assert res.retrieved_ids == [CORRECT_CHUNK]
-    assert res.cos_scores == []
-    assert set(res.timings) == {"prefill_snapshot", "context_prefill",
-                                "answer_prefill", "decode"}
-    assert all(isinstance(v, float) and v > 0.0
-               for v in res.timings.values())
-    assert res.install_report == {"mode": "prefill", "n_chunks": 1,
-                                  "context_tokens": 3}
-    # the answer provably reads the context-built state: the matched
-    # filter fires on the context chunk's topic (MARKER 6.0 vs NOISE 0.05)
-    assert len(res.new_token_ids) == 2
-    assert res.new_token_ids[0] == CORRECT_TOPIC
-    assert len(res.token_confs) == 2           # the W12 metric flows
-
-
-def test_prefill_mode_multi_context_composes(corpus):
-    """W23 sequential composition: 3 contexts prefilled in ASCENDING chunk
-    order (7=t2, 9=t4, 12=t2) — the matched filter sums the markers, so
-    the majority topic (2, from two markers) wins the argmax over the
-    single topic-4 marker. The install-sum path cannot express this
-    ordering (its algebra superposes); the prefill composes."""
-    ids = [7, 9, 12]                            # ascending, 2x topic 2 + 1x topic 4
-    res = answer_query(corpus.model, QUERY_IDS, corpus.system,
-                       loader=corpus.loader, cache_factory=_make_cache,
-                       retrieved_ids=ids,
-                       context_token_ids=[_chunk_ctx(c) for c in ids],
-                       max_new_tokens=1)
-    assert res.install_report["n_chunks"] == 3
-    assert res.install_report["context_tokens"] == 9
-    assert res.new_token_ids[0] == CORRECT_TOPIC       # 2 markers of topic 2
-
-
-def test_prefill_mode_needs_no_disk(corpus):
-    """W23: prefill mode never touches the chunk npz store — a loader
-    WITHOUT .disk_dir is fine (the install path refuses that exact case,
-    loud-refusal (b); the context text replaces the codes read)."""
-    res = answer_query(corpus.model, QUERY_IDS, corpus.system,
-                       cache=_make_cache(), loader=object(),
-                       retrieved_ids=[CORRECT_CHUNK],
-                       context_token_ids=[_chunk_ctx(CORRECT_CHUNK)],
-                       max_new_tokens=1)
-    assert res.new_token_ids[0] == CORRECT_TOPIC
-    assert res.install_report["mode"] == "prefill"
-
-
-def test_prefill_mode_requires_retrieved_ids(corpus):
-    """W23 loud refusal: context_token_ids without retrieved_ids (the
-    caller's retrieval produced the ids the contexts are for — a context
-    without its ids is a caller error, never a silent guess)."""
-    with pytest.raises(ValueError, match="context_token_ids"):
-        answer_query(corpus.model, QUERY_IDS, corpus.system,
-                     loader=corpus.loader, cache_factory=_make_cache,
-                     context_token_ids=[_chunk_ctx(CORRECT_CHUNK)])
 
 
 # ================================= 8. loud refusals ==========================

@@ -29,43 +29,6 @@ from query import answer_query, query_cache_vector  # noqa: E402
 from tq_cache import TQCache  # noqa: E402
 
 
-def _context_token_ids(corpus_path: str, chunk_ids, tokenizer, dev):
-    """W23: the retrieved chunks' TEXT as 2-D (1, T) token tensors,
-    ascending chunk id — the ingest stream order, the state distribution
-    the delta rule saw when the codes were captured. Chunk i = line i of
-    documents.jsonl (the ingest convention, field 'text' or 'content').
-    A missing corpus file or missing lines fail LOUDLY (a wrong-corpus
-    file is a caller error, never a silently empty context)."""
-    want = sorted({int(c) for c in chunk_ids})
-    if not want:
-        return []
-    if not os.path.exists(corpus_path):
-        raise SystemExit(
-            f"run_query: --answer-mode prefill needs the corpus file "
-            f"{corpus_path!r} (--corpus) — the SAME documents.jsonl the "
-            f"corpus was ingested from (chunk i = line i)")
-    want_set = set(want)
-    texts = {}
-    with open(corpus_path) as f:
-        for i, line in enumerate(f):
-            if i > want[-1]:
-                break
-            if i in want_set:
-                doc = json.loads(line)
-                texts[i] = doc.get("text", doc.get("content", ""))
-    missing = [i for i in want if i not in texts]
-    if missing:
-        raise SystemExit(
-            f"run_query: corpus {corpus_path!r} has no line(s) {missing} "
-            f"for chunk id(s) {missing} — chunk i = line i (the ingest "
-            f"order); pass the SAME file the corpus was ingested from")
-    # add_special_tokens=False: the chunks' ingest encoding regime (the
-    # context must live in the same token regime as the ingestion)
-    return [torch.tensor(
-        [tokenizer.encode(texts[i], add_special_tokens=False)],
-        dtype=torch.long, device=dev) for i in want]
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--artifacts-dir", default=DEFAULTS["artifacts_dir"])
@@ -102,20 +65,6 @@ def main() -> int:
                          "softmax). Retrieval-quality knob, A/B it with "
                          "eval_retrieval.py; pass the SAME k to ingest "
                          "and query for read consistency")
-    ap.add_argument("--answer-mode", choices=("prefill", "install"),
-                    default="prefill",
-                    help="W23: how the answer context is built. 'prefill' "
-                         "(default) re-runs the retrieved chunks' TEXT "
-                         "through a fresh reseeded cache — the proven "
-                         "context build (the W14/W15 true-doc control, "
-                         "conf 0.895; a delta-rule state is NON-ADDITIVE, "
-                         "so the codes-sum superposes chunks instead of "
-                         "composing them). 'install' keeps the spec §6 "
-                         "codes-sum (the A/B)")
-    ap.add_argument("--corpus", default=DEFAULTS["corpus"],
-                    help="documents.jsonl for --answer-mode prefill (the "
-                         "ingest source; chunk i = line i; field 'text' "
-                         "or 'content')")
     ap.add_argument("--no-answer-m1m2", action="store_true",
                     help="W23: skip the M1/M2 read/write block during the "
                          "ANSWER phase only (the true-doc control's "
@@ -125,7 +74,7 @@ def main() -> int:
                          "measured A/B, not an assumption")
     ap.add_argument("--no-m1m2", action="store_true",
                     help="W17: load without the wiring (only valid for a "
-                         "corpus ingested --no-m1m2)")
+                         "corpus ingested --no-m1m2")
     args = ap.parse_args()
 
     print("=" * 60)
@@ -223,19 +172,10 @@ def main() -> int:
         print(f"    Top {args.top_k}: {[int(x) for x in ids]} "
               f"scores {[f'{s:.4f}' for s in scores]}")
 
-        # W23: the answer context build. 'prefill' (default): the
-        # retrieved chunks' TEXT through a fresh reseeded cache (the
-        # proven path). 'install': the spec §6 codes-sum (the A/B).
-        ctx_ids = None
-        if args.answer_mode == "prefill":
-            ctx_ids = _context_token_ids(args.corpus,
-                                         [int(x) for x in ids],
-                                         tokenizer, dev)
-            print(f"    [W23] answer mode prefill: {len(ctx_ids)} chunk "
-                  f"text(s), {sum(int(c.shape[-1]) for c in ctx_ids)} "
-                  f"context tokens")
-        else:
-            print("    [W23] answer mode install (the §6 codes-sum A/B)")
+        # W24: the answer context is built by the §6 INSTALL ONLY (the
+        # retrieved chunks' codes, summed on the system reset point).
+        # The W23 text-reprefill branch is REMOVED — it bypassed the
+        # installed codes (the venture's core mechanism).
 
         # W23: the answer-phase M1/M2 A/B — disabled AFTER the retrieval
         # prefill above (the query vector keeps the M1/M2 codes),
@@ -253,8 +193,7 @@ def main() -> int:
                 loader=loader,
                 cache_factory=cache_factory,
                 retrieved_ids=[int(x) for x in ids],
-                max_new_tokens=args.max_new_tokens,
-                context_token_ids=ctx_ids)
+                max_new_tokens=args.max_new_tokens)
         finally:
             if m1m2_mod is not None:
                 m1m2_mod.enabled = True

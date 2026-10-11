@@ -10,24 +10,20 @@
     [5] load the top-3 chunks' TurboQuant codes from disk (~18 MiB)
     [6] install: sum the S/M1/M2 deltas on top of the system codes
         (dequant-sum-requant once — rag/install.py); conv = last chunk
-    [6'] W23 PREFILL MODE (`context_token_ids`): steps 5-6 are replaced
-        by TEXT — the retrieved chunks' tokens are prefilled through a
-        fresh reseeded cache (sequential, ascending chunk id, the ingest
-        stream order), then the full-attn reset, then step [7] as usual.
-        THE REASON (measured, not argued): the GDN delta rule is
-        NON-ADDITIVE — S_t = (I − β k kᵀ)·S_{t−1} + β k vᵀ with decay, so
-        a summed install superposes n chunks' associations (plus the
-        (1−n)·sys term) instead of composing them; the box measured the
-        codes-sum answer as garbage while the SAME machinery answering
-        over a text-prefilled state measured conf 0.895 (the W14/W15
-        true-doc control) — the CacheBlend/Block-Attention lineage's own
-        finding, that reused chunk caches still need the text (or a
-        recompute fraction) for coherent generation. The install path
-        stays as the A/B (`--answer-mode install`).
     [7] answer: prefill the query AGAIN over the installed cache (spec §6's
         answer step — the delta rule continues from the installed state);
         the full-attn layers run fresh (spec §2.4)
     [8] decode: greedy loop via the model's forward (use_cache=True)
+
+W24 — THE REPREFILL PATH IS REMOVED (by order): W23's [6'] "prefill
+    answer mode" re-prefilled the retrieved chunks' TEXT at query time
+    through a fresh cache and made that the DEFAULT — a workaround that
+    bypassed the installed codes, i.e. defeated the venture's core
+    mechanism (ingest once, answer from installed cache state). It is
+gone: the install path (steps 5-6) is the ONLY answer context build,
+and the full-attn reset is the transformers-native `layer.reset()` —
+the EXACT call the W14/W15 true-doc control (conf 0.895) used, not a
+hand-rolled placeholder.
 
 Oracle mode: `retrieved_ids` passed explicitly skips steps 3–4 (the P6
 e2e oracle-install variant — isolates retrieval quality from generation
@@ -105,29 +101,31 @@ def query_cache_vector(cache: TQCache, system: SystemState) -> torch.Tensor:
 
 
 def _reset_full_attention(cache) -> None:
-    """W16: drop the full-attention KV + the M1/M2 write positions so the
+    """Drop the full-attention KV + the M1/M2 write positions so the
     ANSWER prefill (step 7) starts the non-linear state fresh (spec §2.4/
     §6-7: "the full-attn layers run fresh").
 
-    THE BUG THIS FIXES: steps [2] and [7] prefill the query on the SAME
-    cache — the full-attn layers APPEND, so without this reset the answer
-    prefill sees the query TWICE in the KV (query, query, ...) and every
-    decoded token attends to the duplicated question. The true-doc control
-    (the W14/W15 gold standard, conf 0.895) always ran full-attn fresh —
-    the production flow must match it. The linear TQ layers are untouched
-    (they hold the installed codes); the M1/M2 token counters restart at
-    zero (the answer prefill re-reads the query from position 0)."""
-    from transformers.cache_utils import DynamicLayer
+    W24: full-attention layers are reset through the transformers-native
+    `DynamicLayer.reset()` — the EXACT call the W14/W15 true-doc control
+    (conf 0.895, scripts/gpu/bisect_install.py::true_doc_flow) used. The
+    pre-W24 hand-rolled replacement (`keys = torch.zeros(0)` — a 1-D
+    placeholder where the real tensors are 4-D — plus a manual
+    `is_initialized = False`) was an unproven deviation from the control's
+    proven path; it is retired.
+
+    THE BUG THIS FUNCTION FIXES: steps [2] and [7] prefill the query on the
+    SAME cache — the full-attn layers APPEND, so without this reset the
+    answer prefill sees the query TWICE in the KV (query, query, ...) and
+    every decoded token attends to the duplicated question. The linear TQ
+    layers are untouched (they hold the installed codes); the M1/M2 token
+    counters restart at zero (the answer prefill re-reads the query from
+    position 0)."""
+    from transformers.cache_utils import (DynamicLayer,
+                                          LinearAttentionCacheLayerMixin)
     for layer in getattr(cache, "layers", []):
         if isinstance(layer, DynamicLayer) \
-                and not isinstance(layer, TQLinearAttentionLayer):
-            # Only reset if initialized; get device/dtype from existing tensors
-            if layer.is_initialized and hasattr(layer, 'keys') and layer.keys is not None:
-                device = layer.keys.device
-                dtype = layer.keys.dtype
-                layer.keys = torch.zeros(0, device=device, dtype=dtype)
-                layer.values = torch.zeros(0, device=device, dtype=dtype)
-                layer.is_initialized = False
+                and not isinstance(layer, LinearAttentionCacheLayerMixin):
+            layer.reset()          # the control's exact call (W24)
         elif isinstance(layer, TQLinearAttentionLayer):
             layer._m1m2_tokens = 0
 
@@ -145,7 +143,6 @@ def answer_query(
     retrieved_ids: Optional[Sequence[int]] = None,   # oracle mode
     max_new_tokens: int = 0,
     decode_fn: Optional[Callable] = None,
-    context_token_ids: Optional[Sequence[torch.Tensor]] = None,  # W23
 ) -> QueryResult:
     """Run the §6 flow. `cache` (or cache_factory) must produce a cache the
     MODEL accepts (production: TQCache(config=model.config); tests:
@@ -153,14 +150,11 @@ def answer_query(
     max_new_tokens)` implements step 8 for exotic heads — default: a plain
     greedy loop over model(input_ids=next_id, past_key_values=cache).
 
-    W23 `context_token_ids` (the PREFILL answer mode — one 2-D token
-    tensor per retrieved chunk, ascending corpus order): the answer
-    state is built by PREFILLING the chunks' text on a fresh reseeded
-    cache (the proven context build — the flow docstring's [6']); the
-    codes install (steps 5-6) is skipped. Requires `retrieved_ids`
-    (the caller's retrieval produced the ids it is passing contexts
-    for). `None` (the default) keeps the §6 install flow verbatim —
-    bit-identical, the A/B."""
+    W24: the answer context is built by the install ONLY (steps 5-6 —
+    the retrieved chunks' CODES, summed on the system reset point). The
+    W23 text-reprefill branch is REMOVED (it bypassed the installed
+    codes — the venture's core mechanism).
+    """
     res = QueryResult()
     res.oracle = retrieved_ids is not None
     if cache is None:
@@ -169,11 +163,6 @@ def answer_query(
                 "answer_query: pass cache= or cache_factory= (production: "
                 "TQCache(config=model.config); tests: layer_types)")
         cache = cache_factory()
-    if context_token_ids is not None and retrieved_ids is None:
-        raise ValueError(
-            "answer_query: context_token_ids requires retrieved_ids — the "
-            "caller's retrieval produced the ids; pass them (one context "
-            "tensor per id, ascending corpus order)")
 
     t = {}
 
@@ -208,64 +197,30 @@ def answer_query(
     else:
         res.retrieved_ids = [int(i) for i in retrieved_ids]
 
-    if context_token_ids is not None:
-        # [6'] W23 — THE PREFILL CONTEXT BUILD (the proven path; the
-        # drivers' --answer-mode prefill default). The GDN delta rule is
-        # non-additive: a codes-sum superposes the chunks instead of
-        # composing them (the (1-n)·sys algebra in sum_absolute_codes is
-        # exact ARITHMETIC on the codes, not a valid STATE composition).
-        # Prefilling the chunks' text rebuilds the true sequential state —
-        # the W14/W15 true-doc control measured conf 0.895 on exactly
-        # this machinery, where the summed install answered garbage.
-        t0 = time.perf_counter()
-        if cache_factory is not None:
-            # a FRESH cache: the answer state must be system -> contexts
-            # -> query (a cache that already ran the [2] query prefill
-            # would carry the query twice — rebuild instead)
-            cache = cache_factory()
-        # (cache= without a factory: the caller's cache is reused — the
-        # reseed below wipes its linear state back to the system point,
-        # making it semantically fresh)
-        reseed_cache(cache, system)
-        ctx_tokens = 0
-        with torch.no_grad():
-            for ctx in context_token_ids:
-                model(input_ids=ctx, past_key_values=cache, use_cache=True)
-                ctx_tokens += int(ctx.shape[-1])
-        t["context_prefill"] = time.perf_counter() - t0
-        res.install_report = {
-            "mode": "prefill", "n_chunks": len(context_token_ids),
-            "context_tokens": ctx_tokens}
-        # the docs ride the LINEAR state; the full-attn KV they
-        # accumulated is dropped — spec §2.4/§6-7 (fresh full-attn for
-        # the answer; the same reset the install path takes, AFTER the
-        # context build, BEFORE step [7])
-        _reset_full_attention(cache)
-    else:
-        # [5] load the retrieved chunks' codes from disk
-        t0 = time.perf_counter()
-        disk_dir = getattr(loader, "disk_dir", None)
-        if disk_dir is None:
-            raise ValueError(
-                "answer_query: loader must expose .disk_dir (ChunkVectorLoader)")
-        snaps = []
-        for cid in retrieved_ids:
-            path = os.path.join(disk_dir, "snapshots",
-                                f"chunk_{int(cid):05d}.npz")
-            if not os.path.exists(path):
-                raise ValueError(f"answer_query: {path} not found")
-            snaps.append(snap_mod.load_chunk(path))
-        t["load_codes"] = time.perf_counter() - t0
+    # [5] load the retrieved chunks' codes from disk
+    t0 = time.perf_counter()
+    disk_dir = getattr(loader, "disk_dir", None)
+    if disk_dir is None:
+        raise ValueError(
+            "answer_query: loader must expose .disk_dir (ChunkVectorLoader)")
+    snaps = []
+    for cid in retrieved_ids:
+        path = os.path.join(disk_dir, "snapshots",
+                            f"chunk_{int(cid):05d}.npz")
+        if not os.path.exists(path):
+            raise ValueError(f"answer_query: {path} not found")
+        snaps.append(snap_mod.load_chunk(path))
+    t["load_codes"] = time.perf_counter() - t0
 
-        # [6] install (dequant-sum-requant; conv = last chunk)
-        t0 = time.perf_counter()
-        res.install_report = install_snapshot(cache, system, snaps)
-        t["install"] = time.perf_counter() - t0
+    # [6] install (dequant-sum-requant; conv = last chunk)
+    t0 = time.perf_counter()
+    res.install_report = install_snapshot(cache, system, snaps)
+    t["install"] = time.perf_counter() - t0
 
-        # W16: the full-attn layers run FRESH for the answer prefill (spec
-        # §2.4/§6-7) — see _reset_full_attention. Must run AFTER the install
-        # (which only touches the linear TQ layers) and BEFORE step [7].
-        _reset_full_attention(cache)
+    # W16: the full-attn layers run FRESH for the answer prefill (spec
+    # §2.4/§6-7) — see _reset_full_attention. Must run AFTER the install
+    # (which only touches the linear TQ layers) and BEFORE step [7].
+    _reset_full_attention(cache)
 
     # [7] answer: prefill the query over the installed cache
     t0 = time.perf_counter()

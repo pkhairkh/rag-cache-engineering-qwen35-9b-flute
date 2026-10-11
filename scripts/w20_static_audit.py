@@ -1159,56 +1159,32 @@ CHECKS = {
         {"kind": "git_tag", "target": "w22-proven-memory"},
     ],
 
-    # W23 — the generation-repair wave: the proven prefill context build
-    # (the install-by-sum stays the A/B), the 2-D ids fix, the answer-time
-    # m1m2 A/B
+    # W23 — SUPERSEDED BY W24 (the reprefill path removed by order);
+    # the surviving W23 surface: the 2-D ids fix, the answer-time m1m2
+    # A/B, the gen gate printout
     "W23": [
-        # W23.1 — query.py: the prefill answer mode
-        {"kind": "grep", "target": "src/rag/query.py",
-         "pattern": r"context_token_ids: Optional\[Sequence\[torch\.Tensor\]\] = None"},
-        {"kind": "grep", "target": "src/rag/query.py",
-         "pattern": r"context_token_ids requires retrieved_ids"},
-        {"kind": "grep", "target": "src/rag/query.py",
-         "pattern": r"t\[\"context_prefill\"\]"},
-        {"kind": "grep", "target": "src/rag/query.py",
-         "pattern": r"\"mode\": \"prefill\""},
-        {"kind": "grep", "target": "src/rag/query.py",
-         "pattern": "THE PREFILL CONTEXT BUILD"},
-        {"kind": "grep", "target": "src/rag/query.py",
-         "pattern": "NON-ADDITIVE"},
+        # W23.1 — query.py: the prefill answer mode was ADDED here and is
+        # REMOVED by W24 (the pins below assert the REMOVAL — see "W24")
         {"kind": "py_compile", "target": "src/rag/query.py"},
-        # W23.2 — the m1m2 answer-time A/B (enabled)
+        # W23.2 — the m1m2 answer-time A/B (enabled) — SURVIVES W24
         {"kind": "grep", "target": "src/rag/m1m2.py",
          "pattern": r"self\.enabled = True"},
         {"kind": "grep", "target": "src/scripts/modeling.py",
          "pattern": r"getattr\(_m1m2, \"enabled\", True\)"},
         {"kind": "py_compile", "target": "src/rag/m1m2.py"},
         {"kind": "py_compile", "target": "src/scripts/modeling.py"},
-        # W23.3 — run_query.py: the 2-D fix + the driver knobs
-        {"kind": "grep", "target": "scripts/gpu/run_query.py",
-         "pattern": r"--answer-mode"},
+        # W23.3 — run_query.py: the 2-D fix + the surviving knobs
         {"kind": "grep", "target": "scripts/gpu/run_query.py",
          "pattern": r"--no-answer-m1m2"},
-        {"kind": "grep", "target": "scripts/gpu/run_query.py",
-         "pattern": r"--corpus"},
-        {"kind": "grep", "target": "scripts/gpu/run_query.py",
-         "pattern": r"def _context_token_ids"},
         {"kind": "grep", "target": "scripts/gpu/run_query.py",
          "pattern": r"dtype=torch\.long, device=dev\)"},
         {"kind": "grep", "target": "scripts/gpu/run_query.py",
          "pattern": r"gen gate"},
         {"kind": "py_compile", "target": "scripts/gpu/run_query.py"},
-        # W23.4 — the box-run regression gates (AUTHORED, PENDING)
-        {"kind": "grep", "target": "src/rag/tests/test_query.py",
-         "pattern": "test_prefill_mode_single_context"},
-        {"kind": "grep", "target": "src/rag/tests/test_query.py",
-         "pattern": "test_prefill_mode_multi_context_composes"},
-        {"kind": "grep", "target": "src/rag/tests/test_query.py",
-         "pattern": "test_prefill_mode_needs_no_disk"},
-        {"kind": "grep", "target": "src/rag/tests/test_query.py",
-         "pattern": "test_prefill_mode_requires_retrieved_ids"},
+        # W23.4 — the prefill-mode tests were REMOVED with the path (W24)
         {"kind": "py_compile", "target": "src/rag/tests/test_query.py"},
-        # W23.5 — the wave close: docs
+        # W23.5 — the wave close: docs (historical records — the W24 note
+        # in each file supersedes the reprefill DEFAULT)
         {"kind": "grep", "target": "HANDOVER.md",
          "pattern": r"## W23"},
         {"kind": "grep", "target": "TASKS.md",
@@ -1222,6 +1198,43 @@ CHECKS = {
         {"kind": "git_log", "target": "W23.4 —"},
         {"kind": "git_log", "target": "W23.5 —"},
         {"kind": "git_tag", "target": "w23-prefill-answer"},
+    ],
+
+    # W24 — the reprefill path REMOVED (by order): the install is the
+    # ONLY answer context build; the full-attn reset is the control's
+    # transformers-native layer.reset()
+    "W24": [
+        # W24.1 — query.py: the [6'] branch is GONE
+        {"kind": "absent", "target": "src/rag/query.py",
+         "pattern": "context_token_ids"},
+        {"kind": "absent", "target": "src/rag/query.py",
+         "pattern": "t\\[\"context_prefill\"\\]"},
+        {"kind": "absent", "target": "src/rag/query.py",
+         "pattern": "\"mode\": \"prefill\""},
+        # the install steps 5-6 remain THE answer context build
+        {"kind": "grep", "target": "src/rag/query.py",
+         "pattern": r"install_snapshot\(cache, system, snaps\)"},
+        # W24.2 — the reset is the control's exact call
+        {"kind": "grep", "target": "src/rag/query.py",
+         "pattern": r"layer\.reset\(\)"},
+        {"kind": "absent", "target": "src/rag/query.py",
+         "pattern": "torch\\.zeros\\(0, device=device"},
+        {"kind": "py_compile", "target": "src/rag/query.py"},
+        # W24.3 — run_query.py: the reprefill driver surface is GONE
+        {"kind": "absent", "target": "scripts/gpu/run_query.py",
+         "pattern": "answer-mode"},
+        {"kind": "absent", "target": "scripts/gpu/run_query.py",
+         "pattern": "--corpus"},
+        {"kind": "absent", "target": "scripts/gpu/run_query.py",
+         "pattern": "_context_token_ids"},
+        {"kind": "py_compile", "target": "scripts/gpu/run_query.py"},
+        # W24.4 — the prefill-mode tests are GONE with the path
+        {"kind": "absent", "target": "src/rag/tests/test_query.py",
+         "pattern": "test_prefill_mode"},
+        {"kind": "absent", "target": "src/rag/tests/test_query.py",
+         "pattern": "_chunk_ctx"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_query.py"},
+        {"kind": "git_log", "target": "W24.1 —"},
     ],
 }
 
