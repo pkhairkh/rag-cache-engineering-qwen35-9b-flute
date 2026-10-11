@@ -35,6 +35,20 @@ the zero that kills it. Gates here:
      is pure in its inputs).
   6. INSTRUMENTATION: every history entry carries the gate-grad absmax
      (the box's explicit ask) + the capture/replay/backward phase times.
+  7. W20.14 — THE ROLL BUG: cosine_spread's v1 "negatives" were the
+     true-pair cosine vector rolled by one — a permutation, whose mean
+     is IDENTICAL, so cos(pos) == cos(neg) exactly at every step for
+     ANY model (the box's 300-step run: spread 0.0000, 0.615/0.615 ...
+     0.4801/0.4801 — the metric, not the learning). The fixed metric
+     reports the OFF-DIAGONAL of the same B x B matrix the loss trains
+     on; a rigged batch (true pairs share directions, cross pairs
+     independent) must show pos ~ 1, neg ~ 0, spread ~ 1 — v1 reported
+     neg == pos == 1.0 there.
+  8. W20.14 — THE HISTORY FIELDS: pool (the refresh-cycle position —
+     the loss-oscillation explainer) + spread/off_max/diag_min ride
+     every entry; the train_layers mask (the H6 knob) leaves masked
+     layers BIT-ANCHORED (zero grad + weight_decay 0) while the
+     unmasked layer moves.
 """
 from __future__ import annotations
 
@@ -425,3 +439,82 @@ def test_w19f_6_history_carries_grad_and_phase_fields():
         assert h["capture_s"] >= 0.0 and h["replay_s"] >= 0.0
         assert h["backward_s"] >= 0.0
     model.zero_grad(set_to_none=True)
+
+
+# ========= 7. W20.14 — the metric that can finally see =========
+def test_w19f_7_cosine_spread_measures_the_in_batch_negatives():
+    """W20.14 — the roll-bug regression (the box's spread 0.0000 at
+    every step): v1 reported the "negatives" as the true-pair cosine
+    vector ROLLED by one — a permutation, whose mean is IDENTICAL, so
+    cos(pos) == cos(neg) exactly at every step for ANY model. On a
+    rigged batch (true pairs share their direction, cross pairs are
+    independent) the fixed metric must report pos ~ 1, neg ~ 0,
+    spread ~ 1 — the old code reported neg == pos == 1.0 here."""
+    gen = torch.Generator().manual_seed(21)
+    b, d = 6, 64
+    base = torch.randn(b, d, generator=gen).to(DEVICE)
+    m1_a, m1_b = base.clone(), base.clone()      # true pairs identical
+    m2_a, m2_b = -base.clone(), -base.clone()    # sign flip keeps sim = cos
+    pos, neg = ft.cosine_spread(m1_a, m2_a, m1_b, m2_b)
+    assert pos == pytest.approx(1.0, abs=1e-5), \
+        "identical true pairs must score cos 1"
+    assert neg == pytest.approx(0.0, abs=0.15), \
+        f"in-batch negatives must NOT copy pos (the v1 roll bug: " \
+        f"neg {neg:.4f} == pos — a permutation's mean is the same mean)"
+    assert pos - neg > 0.8, "the discrimination signal must be visible"
+
+    stats = ft._pair_sim_stats(m1_a, m2_a, m1_b, m2_b)
+    for key in ("cos_pos", "cos_neg", "spread", "off_max", "diag_min"):
+        assert key in stats and isinstance(stats[key], float), \
+            f"_pair_sim_stats must carry {key}"
+    assert stats["diag_min"] == pytest.approx(1.0, abs=1e-5)
+    assert stats["off_max"] < 0.6, \
+        "no cross pair may score like a true pair (hardest neg stays low)"
+
+
+def test_w19f_8_history_carries_the_w2014_fields():
+    """The W20.14 instrumentation rides every history entry: the pool
+    phase (the refresh-cycle position — the loss-oscillation explainer)
+    + the _pair_sim_stats fields (the discrimination the loss
+    optimizes, finally measurable); the train_layers mask (the H6
+    knob) leaves masked layers BIT-ANCHORED while the unmasked layer
+    keeps learning."""
+    gen = torch.Generator().manual_seed(22)
+    module = M1M2(num_heads=H, head_dim=D, mem_size=MEM,
+                  num_linear_layers=NLAY).to(DEVICE)
+    sides = _synth_calls(gen, n_pairs=4)
+    m1_i = module.init_state(dtype=torch.float32, device=DEVICE)
+    m2_i = module.init_state(dtype=torch.float32, device=DEVICE)
+
+    cfg = _patched_train(module, sides, m1_i, m2_i,
+                         max_steps=3, batch_pairs=4, lr=1e-3,
+                         refresh_every=2, delta_loss=True)
+    assert len(cfg.history) == 3
+    for h in cfg.history:
+        for key in ("cos_pos", "cos_neg", "spread", "off_max",
+                    "diag_min", "pool"):
+            assert key in h, f"history misses the W20.14 field {key}"
+        assert h["pool"] in (1, 2), \
+            "pool must be the 1-based refresh-cycle position"
+
+    # the layer mask (the H6 knob): train ONLY layer 0 — layers 1/2
+    # must stay bit-anchored at the gate_init fill while layer 0 moves
+    with torch.no_grad():
+        module.write_gate_k.fill_(0.1)
+        module.write_gate_v.fill_(0.1)
+    before = module.write_gate_k.detach().clone()
+    cfg = _patched_train(module, sides, m1_i, m2_i,
+                         max_steps=5, batch_pairs=4, lr=5e-2,
+                         refresh_every=1, delta_loss=True,
+                         train_layers=[0])
+    after = module.write_gate_k.detach()
+    assert torch.equal(after[1:], before[1:]), \
+        "masked layers must not move (zero grad + weight_decay 0)"
+    assert float((after[0] - before[0]).abs()) > 1e-6, \
+        "the unmasked layer must keep learning"
+
+    # an out-of-range subset is a loud refusal, never a silent clamp
+    with pytest.raises(ValueError):
+        _patched_train(module, sides, m1_i, m2_i,
+                       max_steps=1, batch_pairs=4, lr=1e-3,
+                       train_layers=[0, NLAY])
