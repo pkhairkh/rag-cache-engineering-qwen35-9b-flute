@@ -766,7 +766,26 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.10.4 —"},
         {"kind": "git_tag", "target": "w20-wave-10"},
     ],
-    # W20.11 … W20.12 — appended by each wave's close-out task.
+    # W20.11 — the trainer levers (appended at W20.11.3)
+    "W20.11": [
+        {"kind": "grep", "target": "scripts/gpu/finetune_m1m2.py",
+         "pattern": "refresh"},
+        {"kind": "py_compile", "target": "scripts/gpu/finetune_m1m2.py"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": "pin_memory|non_blocking"},
+        {"kind": "py_compile", "target": "src/rag/m1m2_finetune.py"},
+        {"kind": "grep", "target": "scripts/gpu/w20_gates.py",
+         "pattern": "gate_g20_3"},
+        {"kind": "grep", "target": "scripts/gpu/w20_gates.py",
+         "pattern": "G20.2"},
+        {"kind": "py_compile", "target": "scripts/gpu/w20_gates.py"},
+        {"kind": "ledger", "target": "W20.11"},
+        {"kind": "git_log", "target": "W20.11.1 —"},
+        {"kind": "git_log", "target": "W20.11.2 —"},
+        {"kind": "git_log", "target": "W20.11.3 —"},
+        {"kind": "git_tag", "target": "w20-wave-11"},
+    ],
+    # W20.12 — appended by the closure wave.
 }
 
 

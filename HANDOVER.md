@@ -473,3 +473,21 @@ cross-backend decode allclose 1e-5; the W16 verbatim install's
 digest equality within the backend). 8 of 9 gates authored (G20.3
 remains — W20.11). Wave DoD: Tier-D 17/17 post-tag; attestation
 truthful. Next: W20.11 — the trainer levers (K5).
+
+## W20.11 — K5 COMPLETE: the trainer levers, all 9 gates authored (CLOSED 2026-10-11)
+
+Refresh 8 is a first-class A/B regime (the tight staleness bound
+lr×7 documented in the help + the config + HANDOVER's confirmation
+sequence step 6; default 4 stays quality-first); the capture loop's
+loader is pinned (host-pinned token-id tensors, non-blocking H2D
+inside the capture loop, the next pool's ids pre-fetched during the
+current refresh cycle — transport, not math: bit-identical values).
+
+The LAST two gates are authored — **9/9 AUTHORED, all PENDING the
+box**: G20.2 FULL (two 300-step runs at refresh 4/8; the step
+thresholds + the loop-clock 10-min end-to-end; honest box cost ≈
+25+ min green) and G20.3 (the W19 convergence shape re-run on the
+kernel path: the loss leaving ln(8) at step 0, gk/gv_absmax > 0, the
+held-out spread — the exact history keys pinned in the registry).
+Wave DoD: Tier-D 12/12 post-tag; attestation truthful. Next: W20.12
+— closure (the handover + the final all-DoD audit + the tag).

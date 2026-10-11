@@ -43,10 +43,18 @@ history -- full confirmation after K4/K5 per TASKS.md §4); G20.5
 INDEX -> EVAL -> QUERY chain as subprocesses of the protocol's own
 scripts on the kernel path, the npz digest stability across two true
 RE-INGEST runs, the cross-backend decode differential, and the W16
-verbatim install digest). The remaining gate (G20.3) is a
-NOT-AUTHORED stub -- its wave (W20.11) extends GATE_RUNNERS; invoking
-a stub prints "G20.<id>: NOT-AUTHORED-YET (authored in <wave> per
-TASKS.md §4)" and the harness exits 2.
+verbatim install digest); G20.2 FULL + G20.3 (W20.11: the K5 close-out
+-- G20.2's refresh-8 and 300-step legs, recorded-not-evaluated through
+phase-1, are now EVALUATED: two 300-step finetune_m1m2.py runs at the
+DEFAULT refresh 4 and the A/B refresh 8, thresholds step <= 2 s /
+<= 1 s / 300 steps <= 10 min end-to-end read off the phase-timer
+histories; G20.3 re-runs the W19 convergence gauges on the kernel
+path -- loss leaves ln(8) at step 0, gk/gv_absmax > 0, the held-out
+spread positive -- off the short run's history JSON). ALL 9 registry
+rows are AUTHORED: `--gates all` runs every one of them (a registry
+row without a runner would be a stub -- none today; invoking one
+prints "G20.<id>: NOT-AUTHORED-YET (authored in <wave> per
+TASKS.md §4)" and the harness exits 2).
 """
 from __future__ import annotations
 
@@ -54,13 +62,14 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import re
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch  # the ONLY import before the CUDA assert (no repo module)
 
@@ -165,7 +174,7 @@ GATE_REGISTRY: Dict[str, Dict[str, str]] = {
               "authored_in": "W20.8 (phase-1) / W20.11 (full)",
               "status": "AUTHORED"},
     "G20.3": {"contract": "W19 convergence (re-run on the kernel path)",
-              "authored_in": "W20.11", "status": "NOT-AUTHORED"},
+              "authored_in": "W20.11", "status": "AUTHORED"},
     "G20.4": {"contract": "the parity contract (levels 1-2)",
               "authored_in": "W20.8", "status": "AUTHORED"},
     "G20.5": {"contract": "protocol integrity",
@@ -1254,27 +1263,33 @@ def gate_g20_p3(device: Dict[str, Any]) -> Dict[str, Any]:
                         summary)
 
 
-# --------------------------------------------------- G20.1 / G20.2 --------
-# The PHASE-1 performance gates (§4 rows G20.1/G20.2; TASKS W20.8.3:
-# "the capture-cycle + step-time phase timers read from a
-# finetune_m1m2.py short-run history (thresholds per §4; full
+# ----------------------------------------------- G20.1 / G20.2 / G20.3 ---
+# The performance + convergence gates (§4 rows G20.1/G20.2/G20.3;
+# TASKS W20.8.3: "the capture-cycle + step-time phase timers read
+# from a finetune_m1m2.py short-run history (thresholds per §4; full
 # confirmation after K4/K5)"): a SHORT finetune run
 # (scripts/gpu/finetune_m1m2.py --self-test --max-steps 8
 # --refresh-every 4 --batch-pairs 8 = 2 capture cycles over 16
 # prefills/cycle) in a SUBPROCESS on this box (cwd = repo root, the
 # G20.P1 suite-subprocess discipline); the phase timers (capture_s /
-# replay_s / backward_s, cumulative per history entry) read from the
-# run's *_history.json.
+# replay_s / backward_s, cumulative per history entry) and the W19
+# convergence fields (loss / gk_absmax / gv_absmax / cos_pos /
+# cos_neg) read from the run's *_history.json.
 #
-# PHASE-1 SEMANTICS (marked in every report): G20.1 gates capture
-# <= 10 s/cycle and TQ <= 5 ms/prefill; G20.2 gates step <= 2 s. The
-# refresh-8 leg (step <= 1 s) and the 300-step run (<= 10 min) are
-# W20.11's FULL G20.2 (K5's trainer levers) -- recorded
-# not-evaluated-in-phase-1 in the metrics, never silently passed. The
-# short run rides --self-test synthetic pairs (96-token members, the
-# file's own mechanics-smoke mode -- corpus-independent, no pairs file
-# needed at gate time); full confirmation after K4/K5 at production
-# geometry.
+# PHASE SEMANTICS (marked in every report): G20.1 stays PHASE-1
+# (gates capture <= 10 s/cycle + TQ <= 5 ms/prefill off the short
+# run + the in-process kernel-pair timing; full confirmation after
+# K4/K5). G20.2 is PHASE-2/FULL since W20.11 (K5's trainer levers in
+# place): the refresh-8 leg (step <= 1 s) and the 300-step run
+# (<= 10 min) -- recorded-not-evaluated-in-phase-1 through
+# W20.8/W20.10 -- are now EVALUATED, via TWO 300-step subprocess runs
+# (the DEFAULT refresh 4 and the A/B refresh 8). G20.3 (W20.11)
+# re-runs the W19 convergence gauges on the kernel path off the
+# short run's history (the checks are step-0/early-gauge properties).
+# All the runs ride --self-test synthetic pairs (96-token members,
+# the file's own mechanics-smoke mode -- corpus-independent, no
+# pairs file needed at gate time); the 300-step runs are the
+# production step count (the driver's own default).
 #
 # THE TQ-SHARE MEASUREMENT (documented limitation): the history's phase
 # timers do NOT isolate TurboQuant from the model forward inside
@@ -1292,60 +1307,82 @@ _FINETUNE_REFRESH_EVERY = 4        # §4 G20.1's own invocation row
 _FINETUNE_BATCH_PAIRS = 8          # 16 prefills/cycle (§6's arithmetic)
 _FINETUNE_TIMEOUT_S = 1800.0       # model load + 8 steps, generous
 _FINETUNE_STDOUT_TAIL = 20         # the W19 phase lines, for the report
-# one short run per harness process, shared transparently by the two
-# phase-1 gates (they read the SAME protocol invocation, §4 G20.1's
-# "--refresh-every 4" row); standalone invocations get a fresh run.
-_FINETUNE_SHORT_CACHE: Dict[str, Any] = {}
+# W20.11 (G20.2 FULL): the §4 300-step legs at the production step
+# count -- TWO invocations, the DEFAULT refresh 4 (the step <= 2 s +
+# end-to-end legs) and the A/B refresh 8 (K5's trainer lever, the
+# step <= 1 s leg). BOX WALL-CLOCK COST (honest): each run is model
+# load + up to the 10-min loop budget, so a green full G20.2 spends
+# ~25+ min on the A10G (and reruns nothing -- the short-run cache
+# never serves a 300-step leg); the timeout is 4x the budget so a
+# RED run reports its real overshoot instead of a timeout.
+_FINETUNE_FULL_STEPS = 300         # §4 G20.2: "300 steps <= 10 min"
+_FINETUNE_FULL_REFRESH_A = 4       # the default regime (step <= 2 s)
+_FINETUNE_FULL_REFRESH_B = 8       # the A/B regime (step <= 1 s)
+_FINETUNE_FULL_TIMEOUT_S = 2400.0  # 4x the 10-min budget (above)
+# one run per SIGNATURE (steps x refresh) per harness process: the
+# short run (8 x 4) is shared transparently by G20.1, G20.5's TRAIN
+# stage and G20.3's convergence read (the SAME protocol invocation,
+# §4 G20.1's "--refresh-every 4" row); the two 300-step full runs
+# (300 x 4, 300 x 8) are their own invocations, each run once by the
+# full G20.2. Standalone invocations always get a fresh run.
+_FINETUNE_RUN_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
-def _run_finetune_short(gate_id: str) -> Dict[str, Any]:
-    """The short finetune subprocess + the parsed history: runs
-    scripts/gpu/finetune_m1m2.py (--self-test, 8 steps, refresh 4,
-    batch 8) with the gates artifact under the DEFAULT report dir
-    (gitignored by design), then reads the run's *_history.json (the
-    phase timers' home). Returns the record (cmd/returncode/stdout
-    tail/history/history_path/duration_s/reused) -- the caller turns a
-    missing history into a loud FAIL, never a skip."""
-    cached = _FINETUNE_SHORT_CACHE.get("record")
+def _run_finetune(gate_id: str, max_steps: int, refresh_every: int,
+                  timeout_s: float, prefix: str) -> Dict[str, Any]:
+    """The finetune subprocess + the parsed history, generalized over
+    the invocation signature (the phase-1 short run AND W20.11's
+    300-step full runs): runs scripts/gpu/finetune_m1m2.py (--self-test,
+    the given --max-steps / --refresh-every, batch 8) with the gates
+    artifact under the DEFAULT report dir (gitignored by design), then
+    reads the run's *_history.json (the phase timers' and the W19
+    convergence fields' home). Cached per signature (steps x refresh)
+    for the harness process; standalone invocations get a fresh run.
+    Returns the record (cmd/returncode/stdout tail/history/
+    history_path/duration_s/reused/max_steps/refresh_every) -- the
+    caller turns a missing history into a loud FAIL, never a skip."""
+    key = f"steps{max_steps}_refresh{refresh_every}"
+    cached = _FINETUNE_RUN_CACHE.get(key)
     if cached is not None:
-        reused = dict(cached)
+        reused = dict(cached["record"])
         reused["reused"] = True
-        reused["first_run_by"] = _FINETUNE_SHORT_CACHE["gate_id"]
-        print(f"[{gate_id}]   reusing the short run recorded by "
+        reused["first_run_by"] = cached["gate_id"]
+        print(f"[{gate_id}]   reusing the run recorded by "
               f"{reused['first_run_by']} (same invocation: --self-test "
-              f"{_FINETUNE_SHORT_STEPS} steps at refresh "
-              f"{_FINETUNE_REFRESH_EVERY})")
+              f"{max_steps} steps at refresh {refresh_every})")
         return reused
     DEFAULT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
     stem = gate_id.lower().replace(".", "_")
-    gates_out = DEFAULT_REPORT_DIR / f"finetune_short_{stem}.npz"
-    hist_path = DEFAULT_REPORT_DIR / f"finetune_short_{stem}_history.json"
+    gates_out = DEFAULT_REPORT_DIR / f"finetune_{prefix}_{stem}.npz"
+    hist_path = DEFAULT_REPORT_DIR / f"finetune_{prefix}_{stem}_history.json"
     cmd = [sys.executable, str(_FINETUNE_SCRIPT),
            "--self-test", "--device", "cuda",
-           "--max-steps", str(_FINETUNE_SHORT_STEPS),
-           "--refresh-every", str(_FINETUNE_REFRESH_EVERY),
+           "--max-steps", str(max_steps),
+           "--refresh-every", str(refresh_every),
            "--batch-pairs", str(_FINETUNE_BATCH_PAIRS),
            "--gates-out", str(gates_out)]
     print(f"[{gate_id}]   $ {' '.join(cmd)}  (cwd {REPO_ROOT}, timeout "
-          f"{_FINETUNE_TIMEOUT_S:.0f} s)")
+          f"{timeout_s:.0f} s)")
     t0 = time.monotonic()
     try:
         proc = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True,
-                              text=True, timeout=_FINETUNE_TIMEOUT_S)
+                              text=True, timeout=timeout_s)
         rc, out, err = int(proc.returncode), proc.stdout or "", \
             proc.stderr or ""
     except subprocess.TimeoutExpired:
         return {"cmd": cmd, "returncode": None, "stdout_tail": None,
-                "stderr": f"TIMEOUT after {_FINETUNE_TIMEOUT_S:.0f} s",
+                "stderr": f"TIMEOUT after {timeout_s:.0f} s",
                 "history": None, "history_path": str(hist_path),
                 "duration_s": round(time.monotonic() - t0, 1),
-                "reused": False}
+                "reused": False, "max_steps": max_steps,
+                "refresh_every": refresh_every}
     except OSError as exc:
         return {"cmd": cmd, "returncode": None, "stdout_tail": None,
                 "stderr": f"launch failure: {exc!r}", "history": None,
                 "history_path": str(hist_path),
                 "duration_s": round(time.monotonic() - t0, 1),
-                "reused": False}
+                "reused": False, "max_steps": max_steps,
+                "refresh_every": refresh_every}
     tail = "\n".join(out.splitlines()[-_FINETUNE_STDOUT_TAIL:])
     history = None
     if hist_path.is_file():
@@ -1359,11 +1396,31 @@ def _run_finetune_short(gate_id: str) -> Dict[str, Any]:
               "stderr": err.strip()[:2000],
               "history": history, "history_path": str(hist_path),
               "duration_s": round(time.monotonic() - t0, 1),
-              "reused": False}
+              "reused": False, "max_steps": max_steps,
+              "refresh_every": refresh_every}
     if history is not None:
-        _FINETUNE_SHORT_CACHE["gate_id"] = gate_id
-        _FINETUNE_SHORT_CACHE["record"] = record
+        _FINETUNE_RUN_CACHE[key] = {"gate_id": gate_id, "record": record}
     return record
+
+
+def _run_finetune_short(gate_id: str) -> Dict[str, Any]:
+    """The phase-1 short run (8 steps, 2 capture cycles at refresh 4) --
+    the shared-cache entry point G20.1, G20.5's TRAIN stage and G20.3's
+    convergence read use (the same invocation, one subprocess)."""
+    return _run_finetune(gate_id, _FINETUNE_SHORT_STEPS,
+                         _FINETUNE_REFRESH_EVERY, _FINETUNE_TIMEOUT_S,
+                         "short")
+
+
+def _run_finetune_full(gate_id: str, refresh_every: int) -> Dict[str, Any]:
+    """W20.11's 300-step full run (the §4 G20.2 FULL legs): its own
+    subprocess invocation at the given refresh regime (4 = the default,
+    8 = K5's A/B trainer lever). Wall-clock cost per run: model load +
+    up to the 10-min loop budget (timeout 4x, so a red run's real
+    overshoot is reported rather than a timeout)."""
+    return _run_finetune(gate_id, _FINETUNE_FULL_STEPS, refresh_every,
+                         _FINETUNE_FULL_TIMEOUT_S,
+                         f"full_r{refresh_every}")
 
 
 def _finetune_phase_metrics(history: List[Dict[str, Any]]
@@ -1376,7 +1433,10 @@ def _finetune_phase_metrics(history: List[Dict[str, Any]]
     the per-step series is the per-entry delta sum (capture + replay +
     backward). The amortized step mean is the §4 "step" (the W19 log
     line's own convention -- every refresh_every-th step carries a
-    capture); the max is recorded beside it."""
+    capture); the max is recorded beside it. loop_end_to_end_s is the
+    three cumulative timers' final sum -- the loop's own wall clock
+    (§4 G20.2's 300-step end-to-end leg; model load excluded, the
+    subprocess duration_s recorded beside it in the run record)."""
     steps = len(history)
     rec: Dict[str, Any] = {"steps": steps}
     if not steps:
@@ -1393,6 +1453,7 @@ def _finetune_phase_metrics(history: List[Dict[str, Any]]
         "capture_s_total": cap[-1],
         "capture_per_cycle_s": (cap[-1] / cycles) if cycles else None,
         "replay_s_total": rep[-1], "backward_s_total": bwd[-1],
+        "loop_end_to_end_s": cap[-1] + rep[-1] + bwd[-1],
         "step_mean_s": (sum(step_s) / steps),
         "step_max_s": max(step_s),
     })
@@ -1529,26 +1590,220 @@ def gate_g20_1(device: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def gate_g20_2(device: Dict[str, Any]) -> Dict[str, Any]:
-    """G20.2 -- the step time + the 300-step run, PHASE-1 (TASKS.md §4
-    row 5: "step <= 2 s after K3; <= 1 s at refresh 8; 300 steps
-    <= 10 min"): the step-time leg reads the finetune_m1m2.py
-    short-run history's phase timers (the amortized per-step capture +
-    replay + backward, the W19 log line's own convention). The
-    refresh-8 and 300-step legs are W20.11's FULL G20.2 (K5's trainer
-    levers) -- recorded not-evaluated-in-phase-1, never silently
-    passed. Full confirmation after K4/K5. A10G box only."""
+    """G20.2 -- the step time + the 300-step run, FULL (TASKS.md §4 row:
+    "step <= 2 s after K3; <= 1 s at refresh 8; 300 steps <= 10 min").
+    W20.11's close-out (K5's trainer levers in place): the legs
+    phase-1 recorded-not-evaluated are now EVALUATED -- TWO 300-step
+    finetune_m1m2.py subprocesses at the production step count:
+      - the DEFAULT refresh 4: the step <= 2 s leg AND the 300-step
+        end-to-end <= 10 min leg (the binding one at <= 2 s/step);
+      - the A/B refresh 8 (K5's trainer lever): the step <= 1 s leg
+        (and the same 10-min end-to-end -- HANDOVER W19 §6: "G20.2's
+        refresh-8 targets: step <= 1 s, 300 steps <= 10 min
+        end-to-end").
+    The step time is the amortized per-step capture + replay +
+    backward from each run's phase-timer history (the W19 log line's
+    own convention); the 300-step end-to-end is the final history
+    entry's cumulative phase total (loop_end_to_end_s -- the loop's
+    own clock, model load excluded; each subprocess's wall duration_s
+    is recorded beside it). The full set ALWAYS runs (no --full
+    opt-out: the wave is closed and the §4 row prices the full legs;
+    the phase-1 short-run shape is superseded -- the short-run cache
+    stays for G20.1/G20.5/G20.3 and never serves a 300-step leg).
+    BOX COST (honest): two model loads + two 300-step loops, ~25+ min
+    on the A10G when green. A10G box only."""
     th = THRESHOLDS["G20.2"]
     _no_suite = {"invoked": False, "exit_code": None, "failures": None,
                  "summary_line": None}
+    wall_budget_s = 60.0 * float(th["run_300_steps_max_min"])
 
-    print("[G20.2] 1/3 -- the short finetune (finetune_m1m2.py "
-          "--self-test, 8 steps at refresh 4)")
-    run = _run_finetune_short("G20.2")
+    print(f"[G20.2] 1/4 -- the 300-step finetune at the DEFAULT refresh "
+          f"{_FINETUNE_FULL_REFRESH_A} (finetune_m1m2.py --self-test "
+          f"--max-steps {_FINETUNE_FULL_STEPS}; the step <= "
+          f"{float(th['step_max_s']):.0f} s + end-to-end legs)")
+    run4 = _run_finetune_full("G20.2", _FINETUNE_FULL_REFRESH_A)
+    history4 = run4.get("history")
+    if not history4:
+        print()
+        print("*" * 72)
+        print("G20.2 FAIL: the 300-step finetune (refresh "
+              f"{_FINETUNE_FULL_REFRESH_A}) produced no history "
+              f"(returncode {run4.get('returncode')})")
+        print("  The run needs the model artifacts on this A10G box "
+              "(env/W20_GPU_PROTOCOL.md).")
+        print(f"  history expected at: {run4.get('history_path')}")
+        tail = run4.get("stdout_tail") or run4.get("stderr") or ""
+        for line in tail.splitlines()[-8:]:
+            print(f"    | {line}")
+        print("*" * 72)
+        return _gate_result(
+            "G20.2", "FAIL", device, th,
+            metrics={"phase": "PHASE-2/FULL", "run_refresh4": run4,
+                     "error": "no history from the 300-step finetune "
+                              f"(refresh {_FINETUNE_FULL_REFRESH_A})"},
+            suite=_no_suite,
+            summary="300-step finetune failed -- model artifacts "
+                    "present? (env/W20_GPU_PROTOCOL.md)")
+    phase4 = _finetune_phase_metrics(history4)
+    print(f"[G20.2]   {phase4['steps']} steps: step mean "
+          f"{phase4['step_mean_s']:.2f} s, max {phase4['step_max_s']:.2f} s; "
+          f"loop end-to-end {phase4['loop_end_to_end_s'] / 60.0:.1f} min "
+          f"(subprocess wall {run4['duration_s'] / 60.0:.1f} min incl. "
+          f"model load)")
+
+    print(f"[G20.2] 2/4 -- the A/B 300-step finetune at refresh "
+          f"{_FINETUNE_FULL_REFRESH_B} (K5's trainer lever; the step <= "
+          f"{float(th['step_max_s_refresh8'])} s leg)")
+    run8 = _run_finetune_full("G20.2", _FINETUNE_FULL_REFRESH_B)
+    history8 = run8.get("history")
+    if not history8:
+        print()
+        print("*" * 72)
+        print("G20.2 FAIL: the 300-step finetune (refresh "
+              f"{_FINETUNE_FULL_REFRESH_B}) produced no history "
+              f"(returncode {run8.get('returncode')})")
+        print("  The run needs the model artifacts on this A10G box "
+              "(env/W20_GPU_PROTOCOL.md).")
+        print(f"  history expected at: {run8.get('history_path')}")
+        tail = run8.get("stdout_tail") or run8.get("stderr") or ""
+        for line in tail.splitlines()[-8:]:
+            print(f"    | {line}")
+        print("*" * 72)
+        return _gate_result(
+            "G20.2", "FAIL", device, th,
+            metrics={"phase": "PHASE-2/FULL", "run_refresh4": run4,
+                     "phase_timers_refresh4": phase4,
+                     "run_refresh8": run8,
+                     "error": "no history from the 300-step finetune "
+                              f"(refresh {_FINETUNE_FULL_REFRESH_B})"},
+            suite=_no_suite,
+            summary="300-step finetune failed -- model artifacts "
+                    "present? (env/W20_GPU_PROTOCOL.md)")
+    phase8 = _finetune_phase_metrics(history8)
+    print(f"[G20.2]   {phase8['steps']} steps: step mean "
+          f"{phase8['step_mean_s']:.2f} s, max {phase8['step_max_s']:.2f} s; "
+          f"loop end-to-end {phase8['loop_end_to_end_s'] / 60.0:.1f} min "
+          f"(subprocess wall {run8['duration_s'] / 60.0:.1f} min incl. "
+          f"model load)")
+
+    print("[G20.2] 3/4 -- the §4 legs, EVALUATED (PHASE-2/FULL)")
+    step4_ok = phase4["step_mean_s"] <= float(th["step_max_s"])
+    step8_ok = phase8["step_mean_s"] <= float(th["step_max_s_refresh8"])
+    wall4_ok = phase4["loop_end_to_end_s"] <= wall_budget_s
+    wall8_ok = phase8["loop_end_to_end_s"] <= wall_budget_s
+    print(f"[G20.2]   step <= {float(th['step_max_s']):.0f} s (refresh "
+          f"{_FINETUNE_FULL_REFRESH_A}): {phase4['step_mean_s']:.2f} s "
+          f"mean -- {'within' if step4_ok else 'OVER'} budget")
+    print(f"[G20.2]   step <= {float(th['step_max_s_refresh8'])} s "
+          f"(refresh {_FINETUNE_FULL_REFRESH_B}): "
+          f"{phase8['step_mean_s']:.2f} s mean -- "
+          f"{'within' if step8_ok else 'OVER'} budget")
+    print(f"[G20.2]   300 steps <= "
+          f"{float(th['run_300_steps_max_min']):.0f} min end-to-end (the "
+          f"phase-timer histories): {phase4['loop_end_to_end_s'] / 60.0:.1f}"
+          f" min (refresh {_FINETUNE_FULL_REFRESH_A}) / "
+          f"{phase8['loop_end_to_end_s'] / 60.0:.1f} min (refresh "
+          f"{_FINETUNE_FULL_REFRESH_B}) -- "
+          f"{'within' if (wall4_ok and wall8_ok) else 'OVER'} budget")
+
+    print("[G20.2] 4/4 -- the verdict (PHASE-2/FULL)")
+    checks = {
+        "run_300_refresh4_completed": bool(
+            phase4.get("steps", 0) >= _FINETUNE_FULL_STEPS),
+        "run_300_refresh8_completed": bool(
+            phase8.get("steps", 0) >= _FINETUNE_FULL_STEPS),
+        "step_time_within_budget_refresh4": bool(step4_ok),
+        "step_time_within_budget_refresh8": bool(step8_ok),
+        "run_300_steps_within_budget_refresh4": bool(wall4_ok),
+        "run_300_steps_within_budget_refresh8": bool(wall8_ok),
+    }
+    metrics = {
+        "phase": "PHASE-2/FULL (W20.11: the refresh-8 and 300-step legs "
+                 "EVALUATED -- the phase-1 not-evaluated recording is "
+                 "superseded; the runs ride --self-test synthetic pairs "
+                 "at the production step count)",
+        "run_refresh4": run4, "phase_timers_refresh4": phase4,
+        "run_refresh8": run8, "phase_timers_refresh8": phase8,
+        "checks": checks,
+    }
+    status = "PASS" if all(checks.values()) else "FAIL"
+    summary = (f"PHASE-2/FULL: step {phase4['step_mean_s']:.2f} s mean at "
+               f"refresh {_FINETUNE_FULL_REFRESH_A} (<= "
+               f"{float(th['step_max_s']):.0f}) / "
+               f"{phase8['step_mean_s']:.2f} s at refresh "
+               f"{_FINETUNE_FULL_REFRESH_B} (<= "
+               f"{float(th['step_max_s_refresh8'])}); 300 steps "
+               f"{phase4['loop_end_to_end_s'] / 60.0:.1f}/"
+               f"{phase8['loop_end_to_end_s'] / 60.0:.1f} min (<= "
+               f"{float(th['run_300_steps_max_min']):.0f})")
+    print(f"[G20.2] done -- {status}")
+    return _gate_result("G20.2", status, device, th, metrics, _no_suite,
+                        summary)
+
+
+# ------------------------------------------------------------ G20.3 -------
+# The W19 convergence re-run (§4 row G20.3; TASKS W20.11.3: "G20.3:
+# the W19 convergence gates -- loss leaves ln(8) at step 0,
+# gk/gv_absmax > 0, held-out spread positive"): the three gauges read
+# off the SHORT finetune run's history JSON -- the shared cache's own
+# run (the same --self-test 8-step invocation G20.1/G20.5 ride; the
+# checks are step-0/early-gauge properties, so the short-run flags
+# suffice for the convergence SHAPE). The exact history keys
+# (m1m2_finetune.py's W19 instrumentation): "loss", "gk_absmax",
+# "gv_absmax", "cos_pos", "cos_neg".
+_LN8_MOVE_EPS = 1e-4   # the W19 suite's own saddle tolerance
+                       # (test_w19_finetune.py: pytest.approx(ln(B),
+                       # abs=1e-4)); the exact saddle sits AT ln(B)
+
+
+def _heldout_spread_from_stdout(tail: str) -> Optional[float]:
+    """The driver's [5] held-out line, parsed for the record: the run's
+    ACTUAL held-out discrimination gap over the val pairs ("... gap
+    +0.1234 (the discrimination signal ...") -- supporting evidence
+    only; the history JSON's delta-aware spread is the checked source.
+    None when the line is absent (a truncated tail, or no val pairs)."""
+    m = re.search(r"gap ([+-]?\d+\.\d+)", tail)
+    return float(m.group(1)) if m else None
+
+
+def gate_g20_3(device: Dict[str, Any]) -> Dict[str, Any]:
+    """G20.3 -- the W19 convergence re-run on the kernel path (TASKS.md
+    §4 row: "loss leaves ln(8) at step 0; gk/gv_absmax > 0; held-out
+    spread positive"): the three gauges off the short finetune run's
+    history JSON --
+      1. loss LEAVES ln(8) at step 0: history[0]["loss"] off the
+         InfoNCE's uniform floor ln(B) at B = the run's batch_pairs
+         (= 8: ln(8) = 2.0794, the P3 zero-init EXACT saddle, HANDOVER
+         W19 §1; any movement = the gate_init escape worked, the W19
+         saddle-fix proof). Movement > 1e-4 -- the W19 suite's own
+         approx tolerance for the saddle value (a smaller delta is
+         float noise AT the saddle, not off it).
+      2. gk/gv_absmax > 0: the gate-grad instrumentation fields
+         (write_gate_k/v .grad.abs().max(), recorded pre-clip; 0.0 =
+         the gradient path is dead) -- checked over EVERY entry (the
+         run minima; W19: "|g| should be > 0 from step 0"), the
+         step-0 values + maxima recorded.
+      3. held-out spread positive: the DELTA-aware spread the history
+         carries per entry, cos_pos - cos_neg (true-pair vs
+         shifted-pair cosine over the delta states -- the centered
+         retrieval frame's geometry). The W19 gauge is "cos(pos) vs
+         cos(neg) should SEPARATE within ~25 steps"; the short run's
+         FINAL entry is the early read (first/max recorded, and the
+         driver's [5] held-out stdout gap beside them -- recorded,
+         not checked). A10G box only."""
+    th = THRESHOLDS["G20.3"]
+    _no_suite = {"invoked": False, "exit_code": None, "failures": None,
+                 "summary_line": None}
+    ln_floor = math.log(_FINETUNE_BATCH_PAIRS)   # ln(8): the saddle
+
+    print("[G20.3] 1/3 -- the short finetune (the convergence SHAPE; "
+          "finetune_m1m2.py --self-test, the shared short-run cache)")
+    run = _run_finetune_short("G20.3")
     history = run.get("history")
     if not history:
         print()
         print("*" * 72)
-        print("G20.2 FAIL: the short finetune produced no history "
+        print("G20.3 FAIL: the short finetune produced no history "
               f"(returncode {run.get('returncode')})")
         print("  The run needs the model artifacts on this A10G box "
               "(env/W20_GPU_PROTOCOL.md).")
@@ -1558,54 +1813,98 @@ def gate_g20_2(device: Dict[str, Any]) -> Dict[str, Any]:
             print(f"    | {line}")
         print("*" * 72)
         return _gate_result(
-            "G20.2", "FAIL", device, th,
-            metrics={"phase": "PHASE-1", "finetune": run,
+            "G20.3", "FAIL", device, th,
+            metrics={"phase": "FULL (W20.11)", "finetune": run,
                      "error": "no history from the short finetune run"},
             suite=_no_suite,
             summary="short finetune failed -- model artifacts present? "
                     "(env/W20_GPU_PROTOCOL.md)")
-    phase = _finetune_phase_metrics(history)
-    print(f"[G20.2]   {phase['steps']} steps: step mean "
-          f"{phase['step_mean_s']:.2f} s, max "
-          f"{phase['step_max_s']:.2f} s (threshold "
-          f"{float(th['step_max_s']):.0f} s; refresh "
-          f"{_FINETUNE_REFRESH_EVERY})")
+    first = history[0]
+    missing = [k for k in ("loss", "gk_absmax", "gv_absmax", "cos_pos",
+                           "cos_neg") if k not in first]
+    if missing:
+        print()
+        print("*" * 72)
+        print("G20.3 FAIL: the history entries lack the W19 "
+              f"instrumentation fields: {', '.join(missing)}")
+        print("  (m1m2_finetune.py since W19 writes loss/gk_absmax/"
+              "gv_absmax/cos_pos/cos_neg per entry -- a stale checkout?)")
+        print("*" * 72)
+        return _gate_result(
+            "G20.3", "FAIL", device, th,
+            metrics={"phase": "FULL (W20.11)", "finetune": run,
+                     "error": f"history lacks the W19 fields: {missing}"},
+            suite=_no_suite,
+            summary="history lacks the W19 instrumentation fields")
 
-    print("[G20.2] 2/3 -- the W20.11 legs (NOT evaluated in phase-1 -- "
-          "recorded, never silently passed)")
-    print(f"[G20.2]   refresh-8 step <= {float(th['step_max_s_refresh8'])}"
-          " s: not evaluated (K5's trainer levers, W20.11's full G20.2)")
-    print(f"[G20.2]   300 steps <= "
-          f"{float(th['run_300_steps_max_min'])} min: not evaluated "
-          "(W20.11's full G20.2; the phase-1 run is "
-          f"{_FINETUNE_SHORT_STEPS} steps)")
+    loss0 = float(first["loss"])
+    gk0, gv0 = float(first["gk_absmax"]), float(first["gv_absmax"])
+    gk_all = [float(e["gk_absmax"]) for e in history]
+    gv_all = [float(e["gv_absmax"]) for e in history]
+    spreads = [float(e["cos_pos"]) - float(e["cos_neg"])
+               for e in history]
+    stdout_gap = _heldout_spread_from_stdout(run.get("stdout_tail") or "")
 
-    print("[G20.2] 3/3 -- the verdict (PHASE-1)")
-    step_ok = (phase["step_mean_s"] is not None
-               and phase["step_mean_s"] <= float(th["step_max_s"]))
-    checks = {"short_run_completed": True,
-              "step_time_within_budget": bool(step_ok)}
+    print(f"[G20.3] 2/3 -- the three W19 gauges off the history JSON "
+          f"({len(history)} entries)")
+    moved = abs(loss0 - ln_floor)
+    left_txt = ("LEFT the saddle" if moved > _LN8_MOVE_EPS
+                else "AT the saddle -- the W19 escape FAILED")
+    print(f"[G20.3]   loss[0] {loss0:.4f} vs "
+          f"ln({_FINETUNE_BATCH_PAIRS}) = {ln_floor:.4f}: "
+          f"moved {moved:.2e} ({left_txt})")
+    print(f"[G20.3]   gk/gv_absmax: step-0 {gk0:.2e}/{gv0:.2e}, run min "
+          f"{min(gk_all):.2e}/{min(gv_all):.2e} "
+          "(0.0 = the gradient path is dead)")
+    gap_txt = ("" if stdout_gap is None else
+               f"; [5] held-out gap {stdout_gap:+.4f} "
+               "(stdout, recorded -- not checked)")
+    print(f"[G20.3]   delta spread cos_pos - cos_neg: first "
+          f"{spreads[0]:+.4f}, final {spreads[-1]:+.4f}, max "
+          f"{max(spreads):+.4f} (positive = the discrimination "
+          f"signal){gap_txt}")
+
+    print("[G20.3] 3/3 -- the verdict")
+    checks = {
+        "loss_leaves_ln8_step0": bool(moved > _LN8_MOVE_EPS),
+        "gk_gv_absmax_positive": bool(min(gk_all) > 0.0
+                                      and min(gv_all) > 0.0),
+        "heldout_spread_positive": bool(spreads[-1] > 0.0),
+    }
+    conv: Dict[str, Any] = {
+        "ln_uniform_floor": ln_floor,
+        "ln_uniform_floor_note": "ln(B) at the run's B = "
+                                 f"{_FINETUNE_BATCH_PAIRS} (the InfoNCE "
+                                 "saddle value, HANDOVER W19 §1)",
+        "loss_step0": loss0,
+        "loss_step0_move": moved,
+        "move_eps": _LN8_MOVE_EPS,
+        "gk_absmax_step0": gk0, "gv_absmax_step0": gv0,
+        "gk_absmax_min": min(gk_all), "gv_absmax_min": min(gv_all),
+        "gk_absmax_max": max(gk_all), "gv_absmax_max": max(gv_all),
+        "spread_first": spreads[0], "spread_final": spreads[-1],
+        "spread_max": max(spreads),
+        "heldout_gap_stdout": stdout_gap,
+        "heldout_gap_note": "the driver's [5] held-out line (val "
+                            "pairs) -- recorded, not checked (the "
+                            "history JSON's delta-aware spread is the "
+                            "checked source)",
+        "checked_source": "the run's *_history.json fields "
+                          "loss/gk_absmax/gv_absmax/cos_pos/cos_neg",
+    }
     metrics = {
-        "phase": "PHASE-1 (full confirmation after K4/K5 per "
-                 "TASKS.md §4; the short run rides --self-test "
-                 "synthetic pairs, 96-token members)",
-        "finetune": run, "phase_timers": phase, "checks": checks,
-        "not_evaluated_phase1": {
-            "step_max_s_refresh8": float(th["step_max_s_refresh8"]),
-            "step_max_s_refresh8_note": "K5's trainer levers -- "
-                                        "W20.11's full G20.2",
-            "run_300_steps_max_min": float(th["run_300_steps_max_min"]),
-            "run_300_steps_note": "W20.11's full G20.2 (the phase-1 "
-                                  f"run is {_FINETUNE_SHORT_STEPS} steps)",
-        },
+        "phase": "FULL (W20.11 -- the W19 convergence re-run on the "
+                 "kernel path; the short-run flags suffice: the three "
+                 "checks are step-0/early-gauge properties)",
+        "finetune": run, "convergence": conv, "checks": checks,
     }
     status = "PASS" if all(checks.values()) else "FAIL"
-    summary = (f"PHASE-1: step {phase['step_mean_s']:.2f} s mean "
-               f"(max {phase['step_max_s']:.2f}) <= "
-               f"{float(th['step_max_s']):.0f} s; refresh-8 and "
-               "300-step legs not evaluated (W20.11 full)")
-    print(f"[G20.2] done -- {status}")
-    return _gate_result("G20.2", status, device, th, metrics, _no_suite,
+    summary = (f"loss[0] {loss0:.4f} (off ln(8)={ln_floor:.4f} by "
+               f"{moved:.1e}); |g| step-0 {gk0:.2e}/{gv0:.2e} (run min "
+               f"{min(gk_all):.2e}/{min(gv_all):.2e}); delta spread "
+               f"final {spreads[-1]:+.4f}")
+    print(f"[G20.3] done -- {status}")
+    return _gate_result("G20.3", status, device, th, metrics, _no_suite,
                         summary)
 
 
@@ -2566,17 +2865,18 @@ def gate_g20_5(device: Dict[str, Any]) -> Dict[str, Any]:
 
 # The runner table: G20.P1 (W20.4) + W20.6's pair (G20.P2 + G20.6) +
 # W20.8's four (G20.P3 parity, G20.1/G20.2 phase-1 timers, G20.4 the
-# parity contract) + W20.10's G20.5 (protocol integrity); each
-# authoring wave appends its gates per the §4
-# registry (W20.9 folds qjl into G20.P3; W20.10: G20.5; W20.11:
-# G20.2 full + G20.3). A gate in GATE_REGISTRY but not here is
-# a NOT-AUTHORED stub.
+# parity contract) + W20.10's G20.5 (protocol integrity) + W20.11's
+# close-out (G20.2 FULL + G20.3 -- the LAST stub falls: 9/9 AUTHORED,
+# `--gates all` runs every registry row); each authoring wave appends
+# its gates per the §4 registry (W20.9 folds qjl into G20.P3). A gate
+# in GATE_REGISTRY but not here is a NOT-AUTHORED stub (none today).
 GATE_RUNNERS: Dict[str, Any] = {
     "G20.P1": gate_g20_p1,
     "G20.P2": gate_g20_p2,
     "G20.P3": gate_g20_p3,
     "G20.1": gate_g20_1,
     "G20.2": gate_g20_2,
+    "G20.3": gate_g20_3,
     "G20.4": gate_g20_4,
     "G20.5": gate_g20_5,
     "G20.6": gate_g20_6,

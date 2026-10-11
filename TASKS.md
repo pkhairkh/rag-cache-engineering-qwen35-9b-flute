@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: IN EXECUTION — 11/13 waves closed (W20.0–W20.10).
+Status: IN EXECUTION — 12/13 waves closed (W20.0–W20.11).
 
 ---
 
@@ -27,7 +27,7 @@ Status: IN EXECUTION — 11/13 waves closed (W20.0–W20.10).
 | W20.8 | K3 | tq_dequant_batched + dispatcher | 4 | G20.P3, G20.1, G20.2, G20.4 | CLOSED |
 | W20.9 | K4 | QJL kernel chain + tq_l2norm_rows | 4 | — | CLOSED |
 | W20.10 | K4 | serving-side batched passes | 4 | G20.5 | CLOSED |
-| W20.11 | K5 | trainer levers (refresh 8, loader pinning) | 3 | G20.2 full, G20.3 | OPEN |
+| W20.11 | K5 | trainer levers (refresh 8, loader pinning) | 3 | G20.2 full, G20.3 | CLOSED |
 | W20.12 | closure | handover + final all-DoD audit | 3 | — | OPEN |
 
 Status values: OPEN → CLOSED (wave DoD Tier-D green, pushed, tagged) →
@@ -1376,7 +1376,7 @@ COMMIT: "W20.11.2 — the capture-loop loader pinning (pinned H2D,
 non-blocking)"
 
 #### W20.11.3 — wave close W20.11 (G20.2 full + G20.3 authored)
-- [ ] done
+- [x] done
 ROLE orchestrator · standard close-out + the harness extension
 (G20.2 full: step ≤ 2 s after K3, ≤ 1 s at refresh 8, 300 steps ≤ 10
 min end-to-end — read from the phase-timer history; G20.3: the W19
@@ -1455,8 +1455,8 @@ failure). A gate turns GREEN/RED **only** from
 | G20.P2 | K2: fht_large differential twins + determinism | kernel vs debug twin vs torch allclose ≤ 1e-5; run-to-run `torch.equal`; K%32≠0 and K≤16,384 refusals raise | W20.6 | AUTHORED — PENDING (awaiting the A10G box report; build the variants first or G20.6 FAILs honestly) |
 | G20.P3 | K3+K4: TQ kernel parity (quant+dequant+qjl) | same as G20.P1 thresholds on kernel outputs; batched-grid shapes 120–192 units | W20.8 (qjl folds in W20.9) | AUTHORED — PENDING (awaiting the A10G box report; the qjl leg completes W20.9) |
 | G20.1 | capture cycle + TQ share | capture ≤ 10 s/cycle after K3; TQ ≤ 5 ms/prefill (phase timers) | W20.8 (phase-1) | AUTHORED — PENDING (phase-1: short-run history timers; full confirmation after K4/K5) |
-| G20.2 | step time + the 300-step run | step ≤ 2 s after K3; ≤ 1 s at refresh 8; 300 steps ≤ 10 min | W20.8 (phase-1) / W20.11 (full) | AUTHORED — PENDING (phase-1; the refresh-8 + 300-step legs evaluate W20.11) |
-| G20.3 | W19 convergence (re-run on the kernel path) | loss leaves ln(8) at step 0; gk/gv_absmax > 0; held-out spread positive | W20.11 | NOT-AUTHORED |
+| G20.2 | step time + the 300-step run | step ≤ 2 s after K3; ≤ 1 s at refresh 8; 300 steps ≤ 10 min | W20.8 (phase-1) / W20.11 (full) | AUTHORED — PENDING (FULL: two 300-step runs at refresh 4/8, the loop clock end-to-end; honest box cost ≈ 25+ min) |
+| G20.3 | W19 convergence (re-run on the kernel path) | loss leaves ln(8) at step 0; gk/gv_absmax > 0; held-out spread positive | W20.11 | AUTHORED — PENDING (the exact history keys: loss/gk_absmax/gv_absmax/cos_pos/cos_neg; the ln(8)=ln(8-batch) tolerance 1e-4, the W19 suite's own) |
 | G20.4 | the parity contract (levels 1–2) | level 1: run-to-run `torch.equal` (codes + recon, kernel); level 2: ties ≤ 0.01%, norm ≤ 1 ulp, allclose ≤ 1e-5 | W20.8 | AUTHORED — PENDING (awaiting the A10G box report) |
 | G20.5 | protocol integrity | TRAIN → RE-INGEST → INDEX → EVAL → QUERY on the kernel path; npz digests stable run-to-run; cross-backend decode allclose ≤ 1e-5; W16 verbatim install bit-exact within backend | W20.10 | AUTHORED — PENDING (awaiting the A10G box report; the digest surface excludes only the meta's saved_at provenance field — the format's own determinism surface) |
 | G20.6 | canary/trap | canary build: zero poison survives; trap build: FAILS the determinism gate (the negative control must fail) | W20.6 | AUTHORED — PENDING (the variants must be built on the box first — scripts/gpu/w20_build_variants.sh) |
@@ -1482,7 +1482,7 @@ truthful (PROMPT.md §1.4):
 | W20.8 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.8 exit 0 (21/21, re-verified post-tag); push w20-wave-8 |
 | W20.9 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.9 exit 0 (15/15, re-verified post-tag); push w20-wave-9 |
 | W20.10 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.10 exit 0 (17/17, re-verified post-tag); push w20-wave-10 |
-| W20.11 | — (pending) |
+| W20.11 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.11 exit 0 (12/12, re-verified post-tag); push w20-wave-11 |
 | W20.12 | — (pending) |
 
 Line format: `CLOSED <date> — no test executed, no CPU test authored,
