@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: COMPLETE — 13/13 waves closed (W20.0–W20.12); the post-close box-feedback waves W20.13 (5 tasks) and W20.14 (5 tasks, 2026-10-12) closed on top, and the post-finetune-regime wave W20.15 (5 tasks, 2026-10-12) on top of those; all Tier-D DoD green; gates AUTHORED (PENDING box reports by design; §4.1 records the W20.13.4 threshold re-derivation).
+Status: COMPLETE — 13/13 waves closed (W20.0–W20.12); the post-close box-feedback waves W20.13 (5 tasks) and W20.14 (5 tasks, 2026-10-12) closed on top, the post-finetune-regime wave W20.15 (5 tasks, 2026-10-12) on top of those, and the content-addressing wave W21 (5 tasks, 2026-10-12 — the position-lock + anisotropy-pedestal mitigation, gates + global caches only) on top; all Tier-D DoD green; gates AUTHORED (PENDING box reports by design; §4.1 records the W20.13.4 threshold re-derivation).
 
 ---
 
@@ -1908,6 +1908,135 @@ report shows the high-overlap-only signature, the NEXT wave is the
 §2.2 slot-addressing conversation (position-locked states — an
 architecture question, not a gate-training run).
 
+---
+
+## WAVE W21 — the content-addressed global cache (the position-lock, answered)
+
+The box's W20.15 re-run delivered the predicted signature: mechanics
+clean (sawtooth decomposed, coverage tallied, gates moved to
+k[-0.087..+1.122]), spread still ~0.12-0.13, cos_neg PARKED at ~+0.36
+between RANDOM cross pairs — a representation-anisotropy pedestal plus
+the position-locked write (slot = p mod mem_size makes the state
+cosine a position-ALIGNED key correlation: surface overlap, not
+content; the low-overlap buckets flat, the W20.15 close note's "next
+wave" trigger). The run also OOM-crashed INSIDE the held-out control
+stage and lost the trained artifact (the 4x 1.07 GiB stacked states
+plus the retained capture pool). The mitigation is confined to exactly
+the two surfaces the handover allows — the GATES and the GLOBAL
+CACHES' write — no model, wiring, quantization, or pipeline change:
+content-addressed slots (simhash of the per-(b,h) mean-centered key
+over a fixed Sylvester-Hadamard mixing, kappa independent
+sign-blocks), centering at the write (the pedestal removed inside the
+cache write, train and serve identical), per-(layer, head) write
+gates. Paper lineage: Lample et al. 2019 (arXiv:1907.05242, PKM —
+content addressing), Wu et al. 2022 (arXiv:2203.08913, Memorizing
+Transformers), Su et al. 2021 (centering/whitening), Charikar 2002
+(simhash).
+
+#### W21.1 — m1m2.py: the content address + centering + per-head gates
+- [x] done
+ROLE module-owner · WRITE `src/rag/m1m2.py`: `write_addr`
+("content" default / "positional" — the v1 path kept bit-exact for the
+A/B), `center_write` (per-(b,h) token-mean removal; T=1 decode writes
+its centered zero — the memory freezes at prefill end), `addr_blocks`
+(kappa sign-blocks; the stride/bits geometry derived + validated
+loudly), `_content_slots` (Hadamard-mixed sign bits — deterministic,
+no RNG, the mixing is a plain attribute NEVER a buffer), the content
+scatter (per-(head, block) index_add into the (H*mem, D) flat layout),
+and the write gates to (num_linear_layers, num_heads) rows (read_gate
+stays per-layer). P3 zero-gate no-op holds in BOTH modes; the state
+geometry/quantization path/cache glue untouched.
+DO-D: `python3 -m py_compile src/rag/m1m2.py` exit 0; `rg -n
+"write_addr|_content_slots|_sylvester_hadamard" src/rag/m1m2.py` hits;
+`rg -n "num_linear_layers, num_heads" src/rag/m1m2.py` hits (the gate
+shape).
+COMMIT: "W21.1 — the content-addressed write: simhash slots over the
+Hadamard-mixed centered key + per-(layer, head) gates (the position
+lock and the pedestal, answered at the cache)"
+
+#### W21.2 — the trainer-side consequences (per-head grads, one sim site)
+- [x] done
+ROLE trainer-owner · WRITE `src/rag/m1m2_finetune.py`: the W18
+Function's backward accumulates PER-HEAD rows (one inner product per
+head, sum over slots+dims); the B x B sim matrix moves to ONE public
+construction site (`pair_sim_matrix` — the loss, `_pair_sim_stats`,
+`bucketed_spread`, and the driver's ladder all read it; the W20.14
+"the metric scores what the loss trains" rule, now shared code);
+`flat_unit` public; `sim_matrix_stats` / `bucketed_spread_from_sim`
+for the ladder's streamed matrices; `load_gates` refuses pre-W21 (L,)
+artifacts (shape) and cross-regime artifacts (write_addr meta) loudly,
+BEFORE any parameter mutates. Loss/metric semantics unchanged.
+DO-D: `python3 -m py_compile src/rag/m1m2_finetune.py` exit 0; `rg -n
+"sum(dim=(1, 2))" src/rag/m1m2_finetune.py` hits (the per-head
+backward); `rg -n "def pair_sim_matrix" src/rag/m1m2_finetune.py`
+hits.
+COMMIT: "W21.2 — the trainer side: per-head gate gradients + the one
+pair_sim_matrix site (the W20.14 rule by construction)"
+
+#### W21.3 — the driver: addressing flags, artifact-first, the streaming ladder
+- [x] done
+ROLE driver-owner · WRITE `scripts/gpu/finetune_m1m2.py`: `--write-addr
+/ --no-center-write / --addr-blocks` (applied to the shared module
+BEFORE the system prefill; the artifact records the regime);
+`[3.5]` the data-quality profile (the lexical-overlap distribution of
+the positives vs the label-0 controls — "is the data good" answered
+with numbers); the gates artifact + history save BEFORE any held-out
+report (the box's run lost 575 s of training to a report-stage OOM);
+`[6]` the held-out LADDER — one capture, every addressing config
+replayed offline from the same k/v (the run's config, kappa 1/2/8,
+uncentered content, centered positional, the v1 corner), each row
+reporting cos_pos/cos_neg/spread/off_max/diag_min + the overlap
+buckets + the label-0 control line; per-pair-side streaming units
+(never a stacked (B, dim) state), no_grad replays, del + empty_cache
+per config, warn-and-continue try/except per section.
+DO-D: `python3 -m py_compile scripts/gpu/finetune_m1m2.py` exit 0;
+`rg -n "_ADDR_LADDER|--write-addr" scripts/gpu/finetune_m1m2.py` hits.
+COMMIT: "W21.3 — the driver: the addressing A/B flags, the artifact-
+first ordering (an OOM never loses the gates), the one-capture
+held-out ladder + the data profile"
+
+#### W21.4 — the box-run regression gates (AUTHORED, PENDING)
+- [x] done
+ROLE test-author · WRITE `src/rag/tests/test_w21_content_addr.py`
+(A. order invariance — the permuted multiset lands in the same slots
+while the positional state flips; B. the kernel — same content high /
+independent low, content vs positional contrast; C. centering removes
+the common direction at module level; D. simhash collision
+monotonicity; E. per-head gate shapes + one-hot rows + P3 no-op; F.
+the T=1 decode zero; G. write_deltas bit-parity + the replay Function
+vs plain-chain per-head gradient parity; H. two fresh modules derive
+the same slots + the state_dict stays exactly the 3 gates; I. loud
+guards + the v1-artifact and cross-regime refusals) + UPDATE the
+W17/W18 shape pins (the linspace view, the per-head manual answer)
+and test_m1m2 D.5 to pin the POSITIONAL reference explicitly. NOT run
+on this box (the no-CPU-test law) — the box runs the suite.
+DO-D: `python3 -m py_compile` all four files exit 0; the W21 test
+names present.
+COMMIT: "W21.4 — the W21 contracts (AUTHORED, PENDING): order
+invariance, the kernel contrast, the pedestal, simhash quality,
+per-head parity"
+
+#### W21.5 — the wave close
+- [x] done
+ROLE orchestrator · WRITE `TASKS.md` (this section + the header
+status), `SPECIFICATION.md` (§2.2's N6/N7 amendments — the content
+address + centering + per-head gates), the auditor registration
+(`scripts/w20_static_audit.py` CHECKS W21), `HANDOVER.md` (the W21 box
+section: the analysis, the re-run commands, the decision tree)
+DO-D: `python3 scripts/w20_static_audit.py --wave W21` exit 0 AND
+`--all` exit 0; tag `w21-content-addr` pushed.
+COMMIT: "W21.5 — wave W21 closed: the position lock and the pedestal
+answered at the cache; the ladder makes the rows measurable"
+
+Box open items carried (NOT this wave's scope, recorded for the next):
+the kappa choice is a box decision (the [6] ladder prints the rows —
+pick the config with the best low-overlap gap and retrain if it is
+not the default 4); the label-0 rows as TRAINING hard negatives (a
+masked-InfoNCE loss change); the read_gate aux-NLL path (specced W17,
+deferred); if the ladder shows the content rows separating but the
+training spread still flat, the next lever is the LOSS temperature or
+the hard-negative mining, not the architecture.
+
 ## 5. The attestation ledger (the no-CPU-test law, per wave)
 
 One line per wave close, written by the orchestrator, only when
@@ -1931,6 +2060,7 @@ truthful (PROMPT.md §1.4):
 | W20.13 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (the g++/py_compile/static-audit vehicles only); auditor --wave W20.13 exit 0 (26/26, re-verified post-tag) AND --all exit 0 (the full 14-wave re-check in one pass); push w20-wave-13 |
 | W20.14 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile/static-audit vehicles + a pure-stdlib jsonl read of the training DATA, no repo code); auditor --wave W20.14 exit 0 (22/22, re-verified post-tag) AND --all exit 0 (the full 15-wave re-check in one pass); push w20-wave-14 |
 | W20.15 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile/static-audit vehicles + a pure-stdlib json/history read of the box-run artifacts, no repo code); auditor --wave W20.15 exit 0 (re-verified post-tag) AND --all exit 0 (the full 16-wave re-check in one pass); push w20-wave-15 |
+| W21 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile/static-audit vehicles only; the uploaded HANDOVER.md training log read as data); auditor --wave W21 exit 0 (36/36, re-verified post-tag) AND --all exit 0 (the full 17-wave re-check in one pass — the W20.15 "curated negatives" vocabulary pin held after the driver rewrite); push w21-content-addr |
 
 Line format: `CLOSED <date> — no test executed, no CPU test authored,
 no repo module imported on this box; auditor --wave W20.<n> exit 0;

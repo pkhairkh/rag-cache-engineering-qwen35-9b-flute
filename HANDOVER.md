@@ -468,3 +468,118 @@ What to expect, and how to read it:
 
 File the numbers verbatim (history json + the [5] ladder); the next
 wave starts from the bucket profile, not from the loss curve.
+
+---
+
+## W21 — the content-addressed global cache: the position lock and the pedestal, answered (2026-10-12)
+
+**The diagnosis (your new HANDOVER run, read against the code):** the
+run was mechanically perfect and semantically capped, exactly as the
+W20.15 instruments predicted. Three facts in the log name the cause:
+
+1. **`cos(neg)` parked at ~+0.36 between RANDOM cross pairs** — a
+   representation-anisotropy pedestal (the keys' shared "typical
+   direction"). The delta-loss removes the system state's common
+   component, not the token keys' common component. Reference: Su et
+   al. 2021, *Whitening Sentence Representations for Better Semantics*
+   — centering is the canonical fix, now inside the write.
+2. **Spread ~0.13 with no trend while the gates moved freely**
+   (k[-0.087..+1.122]) — the trainable surface could not express the
+   missing signal because there is none to express at ANY gate value:
+3. **The v1 write addresses slots by POSITION** (`slot = p mod
+   mem_size`): at T < mem_size each slot holds one token, so the state
+   cosine is the POSITION-ALIGNED key correlation — two sides of a
+   pair only interact token s with token s. Paraphrase content that
+   moved or re-phrased cannot align; only surface overlap separates
+   (the high-overlap buckets). Every reference memory design
+   addresses by CONTENT — Product-Key Memory (Lample et al. 2019,
+   arXiv:1907.05242), Memorizing Transformers (Wu et al. 2022,
+   arXiv:2203.08913), the model's own delta-rule S-states. The v1
+   scatter is the outlier. (Also: the run OOM-crashed in the
+   held-out control stage — 4 × 1.07 GiB stacked states — and lost
+   the artifact; fixed: artifact saves FIRST now.)
+
+**So yes — one substantial architectural issue, and it lives entirely
+in the two surfaces you allowed: the write's slot ADDRESS (the global
+cache) and the gates.** No model, wiring, quantization, or pipeline
+change.
+
+**The mitigation (W21, all landed in this push):**
+
+* `write_addr="content"` (new default): slot = **simhash of the
+  Hadamard-mixed, per-(head) mean-centered key** (Charikar 2002;
+  fixed Sylvester-Hadamard mixing — deterministic on every box, no
+  RNG, no artifact to ship). `addr_blocks` κ independent sign-blocks
+  (default 4 at mem 1024 → 8 bits/block) — each token writes κ slots;
+  similar contextual keys collide with high probability, unrelated
+  ones almost never. **Content matches anywhere in the two texts** —
+  position-free — which is what "retrieval by content overlap"
+  (SPECIFICATION N17) required all along.
+* `center_write=True` (new default): writes `k − mean_t k` — the
+  pedestal is removed inside the cache write, train and serve
+  identical. A T=1 decode call centers to zero (the memory freezes at
+  prefill end — cleaner than the v1 counter hack).
+* **Per-(layer, head) write gates** `(24, 32)`: the flattened state
+  cosine weights heads by ‖k̃_h‖²; a 2-5× head-scale spread is a
+  4-25× weight imbalance the v1 per-layer scalar cannot touch.
+* The v1 behavior is one flag away: `--write-addr positional
+  --no-center-write` (bit-exact v1 semantics, kept as the A/B).
+* Old gates .npz files are REFUSED loudly (shape) — v1-trained gate
+  values are meaningless under content addressing; retrain.
+* The driver: **artifact saves before the reports** (an OOM can never
+  eat the training again); the held-out **ladder** — one capture,
+  every addressing config replayed offline from the same k/v (the
+  run's config, κ=1/2/8, uncentered, centered positional, the v1
+  corner) with the overlap buckets and the label-0 control per row;
+  `[3.5]` the data-quality profile (positives vs label-0 lexical
+  overlap — "is the data good" with numbers).
+
+**The box sequence (no rebuild — the wave touches no CUDA):**
+
+```
+cd /home/ubuntu/RAGGA
+git pull --ff-only origin main          # >= W21.5
+source /home/ubuntu/venv/bin/activate
+python3 -m pytest src/rag/tests -q      # 260 + the 9 W21 gates
+
+# THE W21 RUN (same shape as yours; the addressing is the change):
+python3 scripts/gpu/finetune_m1m2.py \
+    --pairs-file data/pairs.jsonl \
+    --gates-out m1m2_gates_trained.npz \
+    --m1m2-mem-size 1024 \
+    --max-steps 300 \
+    --refresh-every 4 \
+    --gate-init 0.1
+# (add PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True if the box
+#  ever fragments; the ladder is OOM-hardened regardless)
+```
+
+**How to read the [6] ladder (the decision instrument — every row
+comes from the SAME captured k/v, so the differences are pure
+addressing):**
+
+* **`positional v1 (A/B)` row** ≈ your last run's numbers (spread
+  ~0.13, cos_neg ~+0.36) — the baseline, reproduced inside the new
+  report.
+* **Content rows: cos(neg) should collapse toward ~0** (the pedestal
+  gone — this alone is the centering proof) and **the low-overlap
+  bucket gap should go POSITIVE** where the positional rows show it
+  flat — that is the position lock measured, in one table.
+* **Pick κ from the ladder**: the row with the best low-overlap gap
+  wins; if it is not κ=4, retrain with `--addr-blocks <κ>` (a ~10 min
+  run, same command + the flag).
+* **The training trend**: with the signal now content-aligned and the
+  floor near zero, the loss should drop BELOW the v1 plateau and the
+  spread should trend UP (not oscillate). If the ladder separates but
+  training stays flat, the next lever is the loss (τ, hard negatives
+  — the label-0 pool), NOT the architecture (that conversation is
+  closed by this wave's rows either way).
+* The data verdict stands (W20.14's audit: GOOD — 7 sources, clean,
+  balanced; the label-0 half is the control line and the future
+  hard-negative pool). The new `[W21 data]` profile lines quantify it
+  per run: if the positives' overlap distribution sits clearly above
+  the label-0 profile, the pairs carry real signal for a
+  content-addressed kernel.
+
+File the [6] ladder + the [3.5] data lines verbatim; the next wave
+starts from those rows.

@@ -700,7 +700,8 @@ def main() -> int:
                     csim = _sim_from_units(C1, C2, D1, D2)
                     del C1, C2, D1, D2
                     cst = sim_matrix_stats(csim)
-                    print(f"      label-0 control: cos(pos) "
+                    print(f"      label-0 control (the curated negatives, "
+                          f"{csim.shape[0]} pairs): cos(pos) "
                           f"{cst['cos_pos']:+.4f} — true-vs-curated gap "
                           f"{st['cos_pos'] - cst['cos_pos']:+.4f}")
                     del csim
