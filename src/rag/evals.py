@@ -39,7 +39,22 @@ are the REPORT-EDGE float extractions at the printed line / JSON
 artifact (AFTER the device math is done) and the recall stub's host
 CRC key (a hash edge whose torch-byte feed is bit-identical to the
 legacy host-array one).
+
+W20.10.3: the round-trip site rides the BATCHED entries (PROPOSAL
+§3.6, the K4 serving side): when the dispatcher routes the sweep's
+geometry to the kernels (CUDA + eligible), the whole (n_vectors, d)
+block takes ONE tq_quant_batched + ONE tq_dequant_batched call — two
+kernel chains for the sweep row instead of 2n per-vector round trips;
+the per-vector mse stays ONE torch device reduction. Every other box
+(CPU self-test, pre-build, ineligible geometry, the 1/2-bit rows)
+keeps the per-vector q.roundtrip loop VERBATIM — the torch twin
+reference path, bit-identical to 4.4's sweep. The other stat sites
+verify dispatcher-clean: streaming/margin hold pure torch stats (no
+TQ round trip of their own); recall/e2e ride index.py/query.py, whose
+builds route through the dispatcher (and W20.10.2's batched passes).
+Stats stay torch; REPORT-EDGE formatting only.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -66,6 +81,48 @@ __all__ = [
 PAPER_D_MSE = {1: 0.36, 2: 0.117, 3: 0.03, 4: 0.009}
 PAPER_BOUND = lambda b: 2.72 * 4.0 ** -b  # noqa: E731
 MSE_TOL = {1: 0.10, 2: 0.05, 3: 0.15, 4: 0.15}  # paper values are rounded
+
+
+def _roundtrip_rows_batched(q, x: "torch.Tensor"):
+    """W20.10.3 — ONE batched round trip over an (n, d) fp32 block: ONE
+    tq_quant_batched call (the sweep's whole vector set in ONE
+    stream-ordered encode chain — the norm chain + the batched
+    butterfly + the ladder/pack inside the one launch) and ONE
+    tq_dequant_batched call (the packed rows straight back), two kernel
+    chains for the sweep row instead of 2n per-vector round trips
+    (PROPOSAL §3.6).
+
+    Returns the (n, d) fp32 reconstructions on x's device, or None
+    when the dispatcher would NOT route this geometry to the kernels
+    (CPU self-test, pre-build, ineligible geometry, split/qjl
+    quantizers, non-fp32 input) — the caller keeps the per-vector
+    q.roundtrip loop (the torch twin reference path, bit-identical to
+    4.4's sweep). The routing decision is the dispatcher's own
+    predicate (q._quant_kernel_eligible on the stacked block, the
+    kernel-pair probe inside it); the decode side shares the geometry
+    and the fresh codes carry no sketch (the kernel quant never
+    attaches one), so the pair routes together."""
+    import turboquant as tq   # the function-local sibling import (this
+    # file's own discipline — the CLI owns sys.path before this runs)
+    C = tq._load_tq_kernel()
+    if C is None or x.dim() != 2 \
+            or x.dtype != torch.float32 or not x.is_contiguous():
+        return None
+    if not tq._tq_kernel_available(x):
+        return None
+    if not q._quant_kernel_eligible(x):
+        return None
+    dev = x.device
+    signs = q._device_signs(dev)
+    cb_lo, cb_hi = q._device_codebooks(dev)
+    codes_lo, codes_hi, norms = C.tq_quant_batched(
+        x, q.d, signs, cb_lo.boundaries, cb_hi.boundaries,
+        q.n_lo, q.bits_lo, q.n_hi, q.bits_hi)
+    return C.tq_dequant_batched(
+        codes_lo, codes_hi, norms, signs,
+        cb_lo.centroids, cb_hi.centroids,
+        q.n_lo, q.bits_lo, q.n_hi, q.bits_hi,
+        torch.float32)
 
 
 def _now() -> str:
@@ -104,7 +161,16 @@ def measure_roundtrip(bits_list=(1, 2, 3, 3.5, 4), n_vectors: int = 16,
     while this sweep's default bits_list = (1, 2, 3, 3.5, 4); nothing
     in this file documents that domain (no module constant), so the
     values are LEFT AS-IS — the 1/2-bit rows will raise at quant() and
-    the A10G gate owns the resolution."""
+    the A10G gate owns the resolution.
+
+    W20.10.3: the round trips ride the batched entries when the
+    dispatcher routes this geometry to the kernels (CUDA + eligible):
+    ONE tq_quant_batched + ONE tq_dequant_batched over the sweep's
+    whole (n_vectors, d) block, the per-vector mse as ONE batched
+    device reduction (_roundtrip_rows_batched). Every other box (the
+    CPU self-test at d=1024, the 1/2-bit rows, pre-build) keeps the
+    per-vector q.roundtrip loop VERBATIM — the torch twin reference
+    path, bit-identical to 4.4's sweep."""
     import torch
     import turboquant as tq
 
@@ -117,13 +183,21 @@ def measure_roundtrip(bits_list=(1, 2, 3, 3.5, 4), n_vectors: int = 16,
     lines, mse_table, passed = [], {}, True
     for bits in bits_list:
         q = tq.TurboQuant(kind="custom", bits=bits, d=d, seed=7)
-        mses = []
-        for i in range(n_vectors):
-            xr = q.roundtrip(X[i])
-            mses.append(((X[i] - xr) ** 2).sum())   # 0-dim device tensor
-        # the legacy mean over the per-vector mse scalars — now ONE fp32
-        # device reduction over the same per-vector sums
-        mse_t = torch.stack(mses).mean()
+        # W20.10.3 — the batched round trip: the whole block through ONE
+        # tq_quant_batched + ONE tq_dequant_batched when the dispatcher
+        # routes this geometry to the kernels (CUDA + eligible); the
+        # per-vector mse stays ONE torch device reduction either way.
+        xr = _roundtrip_rows_batched(q, X)
+        if xr is not None:
+            mse_t = ((X - xr) ** 2).sum(dim=1).mean()
+        else:
+            mses = []
+            for i in range(n_vectors):
+                xri = q.roundtrip(X[i])
+                mses.append(((X[i] - xri) ** 2).sum())   # 0-dim device tensor
+            # the legacy mean over the per-vector mse scalars — now ONE fp32
+            # device reduction over the same per-vector sums
+            mse_t = torch.stack(mses).mean()
         # REPORT-EDGE: the single crossing per sweep row — mse feeds the
         # table/gate line below (report data); the math never left the
         # device.
