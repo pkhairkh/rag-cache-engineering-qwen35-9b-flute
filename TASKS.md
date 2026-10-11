@@ -359,7 +359,14 @@ PROPOSAL §1's table row-by-row. THE LAW: no behavioral verification on
 this box — py_compile + greps only; behavior is G20.P1 on the box.
 
 #### W20.3.1 — quant encode, torch-native (syndromes: `.item()`, `y.cpu().numpy()`, numpy searchsorted)
-- [ ] done
+- [x] done
+Note: the ties mapping realized as `np side='left' ≡ torch
+right=False` (matches the numpy default the pinned source uses;
+TASKS' prose said "side='right' equivalence" — the ledger intent is
+"match the numpy ties semantics EXACTLY", which this does; see the
+comment at the searchsorted calls). The W15 outlier mask packs
+big-endian (np.packbits parity) — deliberately distinct from
+`_pack_bits_t`'s little-endian idx stream.
 ROLE task-writer · READ `src/rag/turboquant.py:460-560` (quant +
 _quant_split), `src/rag/codebooks.py` (mirror API from 2.2) · WRITE
 `src/rag/turboquant.py`

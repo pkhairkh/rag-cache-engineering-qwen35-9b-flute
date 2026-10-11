@@ -200,6 +200,52 @@ def unpack_bits(packed: np.ndarray, bits: int, n: int) -> np.ndarray:
     return (raw * weights).sum(axis=-1, dtype=np.uint8)
 
 
+def _pack_bits_t(idx: torch.Tensor, bits: int) -> torch.Tensor:
+    """Torch twin of pack_bits — the W20.3.1 encode-side stand-in: uint8
+    indices in -> packed uint8 bit-stream out, same device, no host hop.
+
+    Layout pinned by G20.P1 fixtures; canonical pair lands in W20.3.2.
+    This stand-in reproduces the numpy pack_bits byte layout EXACTLY:
+    little-endian bit order (bit k of index i, LSB first, at flat
+    position i*bits + k; byte m = flat bits 8m..8m+7 with flat bit 8m in
+    the LSB), zero-padded tail; length = ceil(n*bits/8) bytes. bits==4
+    takes the two-nibbles-per-byte fast path: byte j = idx[2j] |
+    (idx[2j+1] << 4) — the earlier index in the LOW nibble, one zero
+    nibble pads an odd tail.
+
+    Checks are metadata-only (bits in 1..8; the input is flattened and
+    cast to uint8): a VALUE range probe would be a device sync — the
+    exact syndrome this rewrite exists to remove. Indices off the
+    searchsorted bucketize are < 2**bits by construction, so the legacy
+    range error is unreachable from the encode path."""
+    if bits not in range(1, 9):
+        raise ValueError(f"_pack_bits_t: bits must be 1..8, got {bits}")
+    idx = idx.reshape(-1)
+    n = idx.numel()
+    if n == 0:
+        return torch.zeros(0, dtype=torch.uint8, device=idx.device)
+    if idx.dtype != torch.uint8:
+        idx = idx.to(torch.uint8)
+    if bits == 4:
+        # fast path (pack_bits 1:1): two nibbles per byte, the EARLIER
+        # index in the low nibble; an odd tail pads with one zero nibble
+        if n % 2:
+            idx = torch.cat(
+                [idx, torch.zeros(1, dtype=torch.uint8, device=idx.device)])
+        return (idx[0::2] | (idx[1::2] << 4)).to(torch.uint8)
+    # general path: the LSB-first bit matrix (row i = index i's bits,
+    # LSB first) flattens to the stream, zero-pads to whole bytes, then
+    # folds each 8-tuple into one byte (stream bit 8m -> the LSB)
+    shifts = torch.arange(bits, device=idx.device)
+    flat = ((idx.to(torch.int64).reshape(-1, 1) >> shifts) & 1).reshape(-1)
+    tail = (-flat.numel()) % 8
+    if tail:
+        flat = torch.cat(
+            [flat, torch.zeros(tail, dtype=flat.dtype, device=idx.device)])
+    weights = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=idx.device)
+    return (flat.reshape(-1, 8) * weights).sum(dim=-1).to(torch.uint8)
+
+
 # ------------------------------------------------------------ quantizer ----
 class TurboQuant:
     """One quantizer instance per tensor KIND (PROPOSAL D3).
@@ -317,6 +363,10 @@ class TurboQuant:
                            else codebooks.get_codebook(self.bits_hi, self.d))
             # the D3 rotation: one sign vector per kind, generated once
             self._signs = fht.rotation_signs(self.d, self.seed)
+        # W20.3.1: the lazy per-device codebook mirror cache — device str
+        # -> (lo, hi) DeviceCodebook pair, built once per instance per
+        # device (never per quant call; see _device_codebooks)
+        self._dev_cb: Dict[str, tuple] = {}
         # W9.2 qjl flag (DEFAULT OFF — the fields below are computed
         # unconditionally but USED only on qjl paths, so flag-off output
         # is bit-identical to the pre-W9.2 behavior):
@@ -354,7 +404,15 @@ class TurboQuant:
         IDENTICALLY with and without the flag — the A/B is purely additive.
 
         group > 1 (the constructor's W15 paper-recipe flag) routes to the
-        outlier-channel split: see the class docstring."""
+        outlier-channel split: see the class docstring.
+
+        W20.3.1: the encode is torch-native and device-parametric — the
+        norm stays a 0-dim fp32 tensor on x's device (TQCodes rev-1),
+        the bucketize is torch.searchsorted against norm-scaled device
+        boundaries (the boundary-scaling identity — the normalized
+        vector is never materialized), the packed streams are torch
+        uint8. Nothing in the encode reads a value back to the host
+        except the single zero-norm branch below."""
         x = torch.as_tensor(x)
         if x.dim() != 1 or x.shape[0] != self.d:
             raise ValueError(
@@ -365,28 +423,78 @@ class TurboQuant:
         x32 = x.detach().to(torch.float32)
         if self.split:
             return self._quant_split(x32)
-        norm = float(x32.norm().item())
-        if norm == 0.0:  # degenerate: all-zero unit (codes of zero)
-            codes = TQCodes(self.kind, self.d, np.float32(0.0),
-                            self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
-                            np.zeros(_packed_len(self.n_lo, self.bits_lo), np.uint8),
-                            np.zeros(_packed_len(self.n_hi, self.bits_hi), np.uint8),
-                            self.seed)
+        # the fp norm as a 0-dim fp32 torch TENSOR (TQCodes rev-1: never
+        # a python float, never a host scalar — no host round trip)
+        norm = x32.norm().reshape(())
+        if norm == 0.0:
+            # degenerate: all-zero unit (codes of zero). This single
+            # host-visible branch is the torch-twin's known cost,
+            # eliminated by the W20.7 kernel design.
+            codes = TQCodes(
+                self.kind, self.d,
+                torch.zeros((), dtype=torch.float32, device=x32.device),
+                self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
+                torch.zeros(_packed_len(self.n_lo, self.bits_lo),
+                            dtype=torch.uint8, device=x32.device),
+                torch.zeros(_packed_len(self.n_hi, self.bits_hi),
+                            dtype=torch.uint8, device=x32.device),
+                self.seed)
         else:
-            r = (x32 / norm).reshape(1, self.d)
-            y = fht.fht_apply(r, self._signs).reshape(self.d)      # y = r @ T
-            y_np = y.cpu().numpy() if y.is_cuda else y.numpy()
-            lo, hi = y_np[: self.n_lo], y_np[self.n_lo:]
-            idx_lo = np.searchsorted(self._cb_lo.boundaries, lo).astype(np.uint8)
-            idx_hi = np.searchsorted(self._cb_hi.boundaries, hi).astype(np.uint8)
-            codes = TQCodes(self.kind, self.d, np.float32(norm),
-                            self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
-                            pack_bits(idx_lo, self.bits_lo),
-                            pack_bits(idx_hi, self.bits_hi),
-                            self.seed)
+            # rotation on x32's device (backend auto — same signs, same
+            # (1, d) argument shape as the legacy call). The FHT is
+            # linear: fht(x) = norm · fht(x/norm), so the rotated vector
+            # comes out UNSCALED and the normalization is folded into
+            # the boundaries below.
+            y = fht.fht_apply(x32.reshape(1, self.d),
+                              self._signs).reshape(self.d)
+            cb_lo, cb_hi = self._device_codebooks(x32.device)
+            # boundary-scaling identity (PROPOSAL §3.3):
+            #   argmin|y/n − c| ≡ argmin|y − n·c| for n>0 —
+            #   monotone-exact identical bucket decisions; the
+            #   normalized vector is never materialized (PROPOSAL §3.3).
+            # The device fp32 boundaries (the 2.2 mirror) scale by the
+            # 0-dim norm tensor ON the device; y stays UNSCALED.
+            # Ties: np side='left' ≡ torch right=False — the W16-verified
+            # CPU/GPU parity (leftmost insertion point; cell i =
+            # (boundaries[i-1], boundaries[i]]).
+            idx_lo = torch.searchsorted(cb_lo.boundaries * norm,
+                                        y[: self.n_lo], right=False)
+            idx_hi = torch.searchsorted(cb_hi.boundaries * norm,
+                                        y[self.n_lo:], right=False)
+            codes = TQCodes(
+                self.kind, self.d, norm,
+                self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
+                _pack_bits_t(idx_lo.to(torch.uint8), self.bits_lo),
+                _pack_bits_t(idx_hi.to(torch.uint8), self.bits_hi),
+                self.seed)
         if self.qjl:
             self._attach_qjl(codes, x32)
         return codes
+
+    def _device_codebooks(self, device: torch.device) -> tuple:
+        """(lo, hi) codebook pair mirrored onto `device` — the 2.2 surface
+        (get_codebook(bits, d, device=...) -> DeviceCodebook; .boundaries
+        are fp32 device tensors, searchsorted-ready).
+
+        Lazy and built ONCE per instance per device (cached in
+        self._dev_cb): every get_codebook call re-loads the npz cache —
+        fresh numpy tables, a new array identity, and the 2.2 mirror
+        registry keys on that identity — so a per-call fetch would
+        re-mirror and churn the registry; the instance cache keeps the
+        (bits, d, device) mirror entry hot for the process lifetime.
+        The constructor's numpy codebooks (the dequant-side legacy path,
+        W20.3.3) are left untouched."""
+        key = str(device)
+        pair = self._dev_cb.get(key)
+        if pair is None:
+            lo = codebooks.get_codebook(self.bits_lo, self.d,
+                                        device=device)
+            hi = (lo if self.bits_hi == self.bits_lo
+                  else codebooks.get_codebook(self.bits_hi, self.d,
+                                              device=device))
+            pair = (lo, hi)
+            self._dev_cb[key] = pair
+        return pair
 
     def _attach_qjl(self, codes: TQCodes, x32: torch.Tensor) -> None:
         """Compute + attach the structured QJL residual sketch (W9.2 flag).
@@ -427,28 +535,61 @@ class TurboQuant:
         top-k channels by energy → the outlier sub-set (bits_hi, own frame
         seed+555, own norm, pow2-padded own rotation); the rest → the
         regular sub-set (bits_lo, the kind's seed, own norm). Deterministic
-        (stable argsort on the channel energies)."""
+        (stable argsort on the channel energies).
+
+        W20.3.1: torch-native end-to-end — the channel energies, the
+        stable ordering, the sub-set gathers, the pow2 padding and the
+        packed channel mask all stay on x32's device; the sub-quantizers
+        are flat torch-native quants through this same quant() and
+        resolve their own device codebook mirrors."""
         n_ch, g = self.n_channels, self.group
-        x_np = x32.cpu().numpy() if x32.is_cuda else x32.numpy()
-        xg = x_np.reshape(n_ch, g)
-        energy = np.einsum("ij,ij->i", xg, xg)
-        order = np.argsort(-energy, kind="stable")
-        out_ch = np.sort(order[: self.k_out])
-        reg_ch = np.sort(order[self.k_out:])
-        mask = np.zeros(n_ch, dtype=bool)
-        mask[out_ch] = True
-        xreg = np.ascontiguousarray(xg[reg_ch].reshape(-1))
-        xout = np.ascontiguousarray(xg[out_ch].reshape(-1))
+        xg = x32.reshape(n_ch, g)
+        energy = (xg * xg).sum(dim=-1)
+        # numpy argsort(-energy, kind="stable") ≡ a stable ascending
+        # argsort of the negated keys — ties keep channel order (the
+        # determinism contract)
+        order = torch.argsort(-energy, stable=True)
+        out_ch = torch.sort(order[: self.k_out]).values
+        reg_ch = torch.sort(order[self.k_out:]).values
+        mask_ch = torch.zeros(n_ch, dtype=torch.bool, device=x32.device)
+        mask_ch[out_ch] = True
+        xreg = xg[reg_ch].reshape(-1)
+        xout = xg[out_ch].reshape(-1)
         q_reg, q_out = self._sub_quantizer("reg"), self._sub_quantizer("out")
-        c_reg = q_reg.quant(_pad_to(xreg, self.reg_d))
-        c_out = q_out.quant(_pad_to(xout, self.out_d))
+
+        def _pad(x: torch.Tensor, d: int) -> torch.Tensor:
+            # the legacy _pad_to discipline, torch-native: zero-pad UP to
+            # the power-of-two sub-d; the pad adds no energy — the
+            # sub-quantizer's stored norm is the real sub-set's
+            if x.shape[0] < d:
+                x = torch.cat(
+                    [x, torch.zeros(d - x.shape[0], dtype=x.dtype,
+                                    device=x.device)])
+            return x
+
+        c_reg = q_reg.quant(_pad(xreg, self.reg_d))
+        c_out = q_out.quant(_pad(xout, self.out_d))
+        # the packed per-channel mask, legacy layout EXACT: numpy
+        # packbits' default bitorder='big' — channel 0 is the MSB of byte
+        # 0, tail zero-padded to whole bytes (the dequant-side unpackbits
+        # reader is MSB-first). Deliberately NOT _pack_bits_t's
+        # little-endian index stream — a different fixture, a different
+        # layout.
+        mbits = mask_ch.to(torch.uint8)
+        tail = (-n_ch) % 8
+        if tail:
+            mbits = torch.cat(
+                [mbits, torch.zeros(tail, dtype=torch.uint8,
+                                    device=x32.device)])
+        w = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1], device=x32.device)
+        packed_mask = (mbits.reshape(-1, 8) * w).sum(dim=-1).to(torch.uint8)
         codes = TQCodes(
-            self.kind, self.d, np.float32(c_reg.norm),
+            self.kind, self.d, c_reg.norm,
             self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
             c_reg.idx_lo, c_out.idx_lo, self.seed,
             partition="outlier", group=g,
-            mask=np.packbits(mask),
-            norm_hi=np.float32(c_out.norm))
+            mask=packed_mask,
+            norm_hi=c_out.norm)
         if self.qjl:
             self._attach_qjl(codes, x32)
         return codes
