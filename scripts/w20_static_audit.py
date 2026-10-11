@@ -431,7 +431,83 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.3.6 —"},
         {"kind": "git_tag", "target": "w20-wave-3"},
     ],
-    # W20.4 … W20.12 — appended by each wave's close-out task.
+    # W20.4 — wiring + serving sweep + the K1 gates (appended at W20.4.7)
+    "W20.4": [
+        # W20.4.1 — tq_cache torch-native
+        {"kind": "absent", "target": "src/rag/tq_cache.py",
+         "pattern": r"np\.|numpy|\.item\(\)"},
+        {"kind": "py_compile", "target": "src/rag/tq_cache.py"},
+        # W20.4.2 — install requant
+        {"kind": "absent", "target": "src/rag/install.py",
+         "pattern": r"np\.|numpy|\.item\(\)"},
+        {"kind": "grep", "target": "src/rag/install.py",
+         "pattern": "def sum_turboquant_codes"},
+        {"kind": "py_compile", "target": "src/rag/install.py"},
+        # W20.4.3 — the serving sweep (faiss edge allowlisted)
+        {"kind": "grep", "target": "src/rag/index.py",
+         "pattern": "FAISS-EDGE"},
+        {"kind": "absent", "target": "src/rag/query.py",
+         "pattern": r"np\.|numpy"},
+        {"kind": "absent", "target": "src/rag/ingest.py",
+         "pattern": r"np\.|numpy"},
+        {"kind": "py_compile", "target": "src/rag/index.py"},
+        {"kind": "py_compile", "target": "src/rag/query.py"},
+        {"kind": "py_compile", "target": "src/rag/ingest.py"},
+        {"kind": "py_compile", "target": "src/rag/snapshot.py"},
+        # W20.4.4 — evals/m1m2
+        {"kind": "absent", "target": "src/rag/m1m2.py",
+         "pattern": r"\.item\(\)"},
+        {"kind": "grep", "target": "src/rag/evals.py",
+         "pattern": "REPORT-EDGE"},
+        {"kind": "py_compile", "target": "src/rag/evals.py"},
+        {"kind": "py_compile", "target": "src/rag/m1m2.py"},
+        # W20.4.5 — the CPU-elimination audit report
+        {"kind": "exists", "target": "env/w20_cpu_elimination_audit.md"},
+        {"kind": "grep", "target": "env/w20_cpu_elimination_audit.md",
+         "pattern": "103"},
+        {"kind": "grep", "target": "env/w20_cpu_elimination_audit.md",
+         "pattern": "G20.P1"},
+        # W20.4.6.a — the gate harness
+        {"kind": "exists", "target": "scripts/gpu/w20_gates.py"},
+        {"kind": "py_compile", "target": "scripts/gpu/w20_gates.py"},
+        {"kind": "grep", "target": "scripts/gpu/w20_gates.py",
+         "pattern": "G20.P1"},
+        {"kind": "grep", "target": "scripts/gpu/w20_gates.py",
+         "pattern": "THRESHOLDS"},
+        {"kind": "grep", "target": "scripts/gpu/w20_gates.py",
+         "pattern": "torch.cuda.is_available"},
+        {"kind": "absent", "target": "scripts/gpu/w20_gates.py",
+         "pattern": r"def test_"},
+        # W20.4.6.b — the CUDA-gated pytest surface
+        {"kind": "exists", "target":
+         "src/rag/tests/w20/test_w20_torch_path.py"},
+        {"kind": "grep", "target":
+         "src/rag/tests/w20/test_w20_torch_path.py",
+         "pattern": "def test_"},
+        {"kind": "grep", "target":
+         "src/rag/tests/w20/test_w20_torch_path.py",
+         "pattern": "_gpu_guard"},
+        {"kind": "grep", "target":
+         "src/rag/tests/w20/test_w20_torch_path.py",
+         "pattern": "allow_module_level"},
+        {"kind": "py_compile", "target":
+         "src/rag/tests/w20/test_w20_torch_path.py"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_turboquant.py"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_tq_cache.py"},
+        # W20.4.7 — wave close: ledger + git facts
+        {"kind": "ledger", "target": "W20.4"},
+        {"kind": "git_log", "target": "W20.4.1 —"},
+        {"kind": "git_log", "target": "W20.4.2 —"},
+        {"kind": "git_log", "target": "W20.4.3 —"},
+        {"kind": "git_log", "target": "W20.4.4 —"},
+        {"kind": "git_log", "target": "W20.4.5 —"},
+        {"kind": "git_log", "target": "W20.4.6 —"},
+        {"kind": "git_log", "target": "W20.4.6.a —"},
+        {"kind": "git_log", "target": "W20.4.6.b —"},
+        {"kind": "git_log", "target": "W20.4.7 —"},
+        {"kind": "git_tag", "target": "w20-wave-4"},
+    ],
+    # W20.5 … W20.12 — appended by each wave's close-out task.
 }
 
 

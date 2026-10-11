@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: IN EXECUTION — 4/13 waves closed (W20.0, W20.1, W20.2, W20.3).
+Status: IN EXECUTION — 5/13 waves closed (W20.0–W20.4).
 
 ---
 
@@ -20,7 +20,7 @@ Status: IN EXECUTION — 4/13 waves closed (W20.0, W20.1, W20.2, W20.3).
 | W20.1 | K1 | baseline tag + frozen probe fixtures | 4 | (capture) | CLOSED |
 | W20.2 | K1 | TQCodes device contract + codebook mirror | 3 | — | CLOSED |
 | W20.3 | K1 | turboquant.py torch rewrite (the core) | 6 | — | CLOSED |
-| W20.4 | K1 | wiring + serving sweep + K1 gates | 7 | G20.P1 | OPEN |
+| W20.4 | K1 | wiring + serving sweep + K1 gates | 7 | G20.P1 | CLOSED |
 | W20.5 | K2 | fht_forward_large / fht_backward_large | 6 | — | OPEN |
 | W20.6 | K2 | debug twins + canary/trap builds | 4 | G20.P2, G20.6 | OPEN |
 | W20.7 | K3 | tq_quant_batched (the fused encode) | 5 | — | OPEN |
@@ -695,7 +695,7 @@ COMMIT: "W20.4.6.b — G20.P1's pytest surface (CUDA-gated torch-path
 tests + mechanical pre-W20 adaptation)"
 
 #### W20.4.7 — wave close W20.4 (K1 complete)
-- [ ] done
+- [x] done
 ROLE orchestrator · standard close-out + HANDOVER's K1 section (the
 twin is live; the box runs G20.P1 per env/W20_GPU_PROTOCOL.md).
 Tier-D: 4.1–4.6 sets + the audit report + mechanical-only test diffs.
@@ -1321,7 +1321,7 @@ failure). A gate turns GREEN/RED **only** from
 
 | gate | contract | thresholds | authored in | status |
 |---|---|---|---|---|
-| G20.P1 | K1: the torch single path vs the frozen fixtures + the 237-suite regression | codes equal except ties ≤ 0.01%; norm ≤ 1 ulp; recon allclose ≤ 1e-5 rel; run-to-run `torch.equal` (CUDA); 237-suite 0 failures | W20.4 | NOT-AUTHORED |
+| G20.P1 | K1: the torch single path vs the frozen fixtures + the 237-suite regression | codes equal except ties ≤ 0.01%; norm ≤ 1 ulp; recon allclose ≤ 1e-5 rel; run-to-run `torch.equal` (CUDA); 237-suite 0 failures | W20.4 | AUTHORED — PENDING (awaiting the A10G box report per env/W20_GPU_PROTOCOL.md) |
 | G20.P2 | K2: fht_large differential twins + determinism | kernel vs debug twin vs torch allclose ≤ 1e-5; run-to-run `torch.equal`; K%32≠0 and K≤16,384 refusals raise | W20.6 | NOT-AUTHORED |
 | G20.P3 | K3+K4: TQ kernel parity (quant+dequant+qjl) | same as G20.P1 thresholds on kernel outputs; batched-grid shapes 120–192 units | W20.8 (qjl folds in W20.9) | NOT-AUTHORED |
 | G20.1 | capture cycle + TQ share | capture ≤ 10 s/cycle after K3; TQ ≤ 5 ms/prefill (phase timers) | W20.8 (phase-1) | NOT-AUTHORED |
@@ -1345,7 +1345,7 @@ truthful (PROMPT.md §1.4):
 | W20.1 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.1 exit 0 (25/25, re-verified post-tag); push w20-wave-1 |
 | W20.2 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.2 exit 0 (24/24, re-verified post-tag); push w20-wave-2 |
 | W20.3 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.3 exit 0 (24/24, re-verified post-tag; incl. the module-wide numpy-zero audit line); push w20-wave-3 |
-| W20.4 | — (pending) |
+| W20.4 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.4 exit 0 (43/43, re-verified post-tag); push w20-wave-4 |
 | W20.5 | — (pending) |
 | W20.6 | — (pending) |
 | W20.7 | — (pending) |

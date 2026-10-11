@@ -292,3 +292,32 @@ bits tests at b∈{1,2}; evals bits_list); G20.P1 is the behavioral
 authority for all of it. Wave DoD: Tier-D 24/24 post-tag; Tier-G none
 (G20.P1 lands W20.4). Attestation truthful. Next: W20.4 — wiring +
 serving sweep + the K1 gates.
+
+## W20.4 — K1 COMPLETE: the single torch path, the gates authored (CLOSED 2026-10-11)
+
+The 103-touchpoint elimination is landed and evidenced: the whole
+runtime (turboquant, tq_cache, install, index, query, ingest, m1m2,
+evals) is torch device-parametric — `env/w20_cpu_elimination_audit.md`
+(rg-derived, 17 module rows): **112 audited touchpoints → 0 outside
+the allowlist** (DISK-EDGE 143 across the npz codec surfaces;
+FAISS-EDGE exactly 4 in index.py; OFFLINE-ISLAND 93 in codebooks;
+REPORT-EDGE 2 comment-only). FINDINGS: none.
+
+G20.P1 is AUTHORED — PENDING, honestly: `scripts/gpu/w20_gates.py`
+(599 lines: THRESHOLDS mirroring the §4 registry 1:1, G20.P1 fully
+implemented — fixture parity [ties ≤ 0.01%, norm ≤ 1 ulp, recon
+allclose 1e-5, run-to-run torch.equal] + the 237-suite subprocess on
+the box; the 8 later gates as loud NOT-AUTHORED stubs) +
+`src/rag/tests/w20/test_w20_torch_path.py` (4 CUDA-gated,
+fixture-driven tests; manifest-absent = module skip). **The A10G box
+runs G20.P1 next** (env/W20_GPU_PROTOCOL.md steps 2-4: capture the
+fixtures first, then `--gates G20.P1`).
+
+The K1 open items (the box's plate, recorded in the ledger): the
+pack-domain decision (bits ∈ {3,4} vs the legacy 1..8 — evals'
+bits_list + the pre-W20 uniform-bits tests constrained mechanically,
+G20.P1 arbitrates); the sibling test files' np.array_equal sites
+(mechanical adaptation at gate time); the qjl=True path's fp32
+prefactor (last-ulp drift vs legacy host float64 — the parity gate
+covers it). Wave DoD: Tier-D 43/43 post-tag; attestation truthful.
+Next: W20.5 — fht_forward_large / fht_backward_large (K2 begins).
