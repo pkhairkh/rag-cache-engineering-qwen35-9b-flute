@@ -599,7 +599,13 @@ numpy-free (REPORT-EDGE markers only); py_compile ×2.
 COMMIT: "W20.4.4 — evals/m1m2 sweep (stats on device, no sync points)"
 
 #### W20.4.5 — the CPU-elimination audit report
-- [ ] done
+- [x] done
+Result at HEAD b9289f8: turboquant/tq_cache/install/query/ingest/
+m1m2/evals = 0/0 (np/sync); the allowlist holds — DISK-EDGE 143
+(tq_codes + snapshot + lut_export + m1m2_finetune), FAISS-EDGE exactly
+4 (index.py, the ceiling), OFFLINE-ISLAND 93 (codebooks solve),
+REPORT-EDGE 2 (comments only). FINDINGS: none unclassifiable. 112
+audited touchpoints → 0 outside the allowlist.
 ROLE task-writer (or orchestrator) · READ the auditor · WRITE
 `env/w20_cpu_elimination_audit.md` (new; generated content + the
 allowlist narrative)
