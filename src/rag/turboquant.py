@@ -109,7 +109,6 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple
 import math
 
-import numpy as np
 import torch
 
 import _paths  # noqa: F401  (anchors src/rag, src/scripts, src/flute_extended)
@@ -161,9 +160,10 @@ def pack_bits_t(idx: torch.Tensor, bits: int) -> torch.Tensor:
     """Pack uint8 quantization indices into the packed uint8 bit-stream
     (the canonical W20.3.2 encode side — the promoted W20.3.1 stand-in
     `_pack_bits_t`). uint8 in -> uint8 out, same device, no host hop,
-    no numpy anywhere in the body.
+    no host arrays anywhere in the body.
 
-    Byte layout — bit-precise (the EXACT numpy pack_bits layout):
+    Byte layout — bit-precise (the EXACT pack_bits layout of the
+    legacy array era):
     * bit order: LITTLE-ENDIAN — bit k of index i sits at flat stream
       position i*bits + k (each index's LSB first);
     * byte assembly: byte m holds flat bits 8m..8m+7 with flat bit 8m
@@ -183,13 +183,13 @@ def pack_bits_t(idx: torch.Tensor, bits: int) -> torch.Tensor:
     documented widening — the output folds back to uint8).
 
     Checks are metadata-only (the host-side bits domain): NO device
-    value probe — the numpy original's range check cost a host sync,
+    value probe — the array-era original's range check cost a host sync,
     the exact syndrome this rewrite removes; searchsorted bucketize
     indices are < 2**bits by construction, so the legacy range error
     is unreachable from the encode path.
 
     byte layout pinned by the frozen fixtures — G20.P1 is the pinning
-    gate (numpy pack_bits/unpack_bits parity)."""
+    gate (pack_bits/unpack_bits parity against the legacy array era)."""
     if bits not in (3, 4):
         raise ValueError(
             f"pack_bits_t: bits must be 3 or 4 (the TQ index stream "
@@ -224,10 +224,10 @@ def unpack_bits_t(packed: torch.Tensor, bits: int, n: int) -> torch.Tensor:
     """Unpack exactly `n` uint8 indices from the packed uint8 bit-stream
     (the canonical W20.3.2 decode side — the EXACT inverse of
     pack_bits_t). uint8 in -> uint8 out, same device, no host hop, no
-    numpy anywhere in the body.
+    host arrays anywhere in the body.
 
     Byte layout — bit-precise (identical contract to pack_bits_t, the
-    frozen-fixture numpy layout):
+    frozen-fixture legacy array-era layout):
     * bit order: LITTLE-ENDIAN — flat stream position i*bits + k holds
       bit k of output index i (each index's LSB first);
     * byte disassembly: byte m contributes flat bits 8m..8m+7, flat
@@ -246,7 +246,7 @@ def unpack_bits_t(packed: torch.Tensor, bits: int, n: int) -> torch.Tensor:
     widening; the output folds back to uint8).
 
     byte layout pinned by the frozen fixtures — G20.P1 is the pinning
-    gate (numpy pack_bits/unpack_bits parity)."""
+    gate (pack_bits/unpack_bits parity against the legacy array era)."""
     if bits not in (3, 4):
         raise ValueError(
             f"unpack_bits_t: bits must be 3 or 4 (the TQ index stream "
@@ -440,7 +440,8 @@ class TurboQuant:
         boundaries (the boundary-scaling identity — the normalized
         vector is never materialized), the packed streams are torch
         uint8. Nothing in the encode reads a value back to the host
-        except the single zero-norm branch below."""
+        except the single zero-norm branch below (and, on the qjl flag,
+        its exact twin — the γ == 0 branch in _attach_qjl)."""
         x = torch.as_tensor(x)
         if x.dim() != 1 or x.shape[0] != self.d:
             raise ValueError(
@@ -506,11 +507,11 @@ class TurboQuant:
 
         Lazy and built ONCE per instance per device (cached in
         self._dev_cb): every get_codebook call re-loads the npz cache —
-        fresh numpy tables, a new array identity, and the 2.2 mirror
+        fresh tables, a new identity, and the 2.2 mirror
         registry keys on that identity — so a per-call fetch would
         re-mirror and churn the registry; the instance cache keeps the
         (bits, d, device) mirror entry hot for the process lifetime.
-        The constructor's numpy codebooks stay untouched (the
+        The constructor's own host-side codebooks stay untouched (the
         offline-island reference); the W20.3.3 decode half now gathers
         through these mirrors too (.centroids — the encode bucketizes
         .boundaries)."""
@@ -535,29 +536,39 @@ class TurboQuant:
         (γ == 0: the degenerate zero-norm unit, or an exact reconstruction)
         stores zeros and γ = 0 — the compensation term is then exactly 0.
 
-        W16 DEVICE FIX: _dequant_mse returns a CPU tensor (its codebook
-        path is numpy/torch-CPU) while x32 can be CUDA — the GPU box's
-        --qjl A/B crashed exactly here ("Expected all tensors to be on
-        the same device"). The reconstruction is moved onto x32's device
-        BEFORE the residual subtraction (CPU behavior unchanged —
-        same-device is a no-op)."""
+        W20.3.4: torch-native and device-parametric end-to-end. The
+        residual rides the SAME adjoint/LUT decode path dequant()
+        uses — _dequant_mse, device-native since 3.3, computes on the
+        CODES' device, and the codes were built on x32's device by
+        this very quant call, so the reconstruction lands beside x32
+        with no move at all (the W16 CPU-pinned bridge is structurally
+        gone). γ is the 0-dim fp32 TENSOR — quant's norm discipline,
+        never a host scalar (the single γ == 0 branch below is the
+        zero-norm branch's exact twin). The sketch is torch.sign of
+        the residual's FHT — the scale invariance below means the
+        division by γ is never materialized — and lands in the codes
+        as an int8 torch TENSOR on x32's device."""
         x_mse = self._dequant_mse(codes, dtype=torch.float32)
-        if x_mse.device != x32.device:
-            x_mse = x_mse.to(x32.device)
         resid = x32 - x_mse
-        gamma = float(resid.norm().item())
-        if gamma > 0.0:
-            rn = (resid / gamma).reshape(1, self.d)
-            proj = fht.fht_apply(rn, self._qjl_signs_vec).reshape(self.d)
-            # ±1 exactly (np.sign; 0 only on an exact-zero projection —
-            # measure-zero for generic residuals, degrades that coordinate
-            # by 1/√d of its weight)
-            signs = np.sign(proj.cpu().numpy() if proj.is_cuda
-                            else proj.numpy()).astype(np.int8)
+        # γ = ‖r‖ as a 0-dim fp32 tensor — the quant norm discipline
+        gamma = resid.norm().reshape(())
+        if gamma == 0.0:
+            # degenerate: exact reconstruction or the zero-norm unit —
+            # the flag carries, the values are zero (the compensation
+            # term is then exactly 0)
+            signs = torch.zeros(self.d, dtype=torch.int8,
+                                device=x32.device)
         else:
-            signs = np.zeros(self.d, dtype=np.int8)
+            # sign(FHT(r/γ)) ≡ sign(FHT(r)) — the scale invariance
+            # (PROPOSAL §3.4); the division by γ is never materialized
+            proj = fht.fht_apply(resid.reshape(1, self.d),
+                                 self._qjl_signs_vec).reshape(self.d)
+            # ±1 exactly (torch.sign; 0 only on an exact-zero
+            # projection — measure-zero for generic residuals, degrades
+            # that coordinate by 1/√d of its weight)
+            signs = torch.sign(proj).to(torch.int8)
         codes.qjl_signs = signs
-        codes.gamma = np.float32(gamma)
+        codes.gamma = gamma
 
     # ------------------------------------------- W15: the outlier split ----
     def _quant_split(self, x32: torch.Tensor) -> TQCodes:
@@ -575,9 +586,9 @@ class TurboQuant:
         n_ch, g = self.n_channels, self.group
         xg = x32.reshape(n_ch, g)
         energy = (xg * xg).sum(dim=-1)
-        # numpy argsort(-energy, kind="stable") ≡ a stable ascending
-        # argsort of the negated keys — ties keep channel order (the
-        # determinism contract)
+        # the legacy array-era argsort(-energy, kind="stable") ≡ a
+        # stable ascending argsort of the negated keys — ties keep
+        # channel order (the determinism contract)
         order = torch.argsort(-energy, stable=True)
         out_ch = torch.sort(order[: self.k_out]).values
         reg_ch = torch.sort(order[self.k_out:]).values
@@ -588,7 +599,7 @@ class TurboQuant:
         q_reg, q_out = self._sub_quantizer("reg"), self._sub_quantizer("out")
 
         def _pad(x: torch.Tensor, d: int) -> torch.Tensor:
-            # the legacy _pad_to discipline, torch-native: zero-pad UP to
+            # the legacy pad-to discipline, torch-native: zero-pad UP to
             # the power-of-two sub-d; the pad adds no energy — the
             # sub-quantizer's stored norm is the real sub-set's
             if x.shape[0] < d:
@@ -599,8 +610,8 @@ class TurboQuant:
 
         c_reg = q_reg.quant(_pad(xreg, self.reg_d))
         c_out = q_out.quant(_pad(xout, self.out_d))
-        # the packed per-channel mask, legacy layout EXACT: numpy
-        # packbits' default bitorder='big' — channel 0 is the MSB of byte
+        # the packed per-channel mask, legacy layout EXACT: the legacy
+        # packbits default bitorder='big' — channel 0 is the MSB of byte
         # 0, tail zero-padded to whole bytes (the dequant-side unpackbits
         # reader is MSB-first). Deliberately NOT pack_bits_t's
         # little-endian index stream — a different fixture, a different
@@ -637,7 +648,7 @@ class TurboQuant:
         # (byte i's bit 7-j is channel 8i+j) — stays the torch shift/
         # mask from 3.2, and its 0/1 vector now feeds torch boolean
         # indexing DIRECTLY: torch.nonzero for the legacy nonzero pair,
-        # the host-numpy bridge GONE. torch.nonzero emits ascending
+        # the host-array bridge GONE. torch.nonzero emits ascending
         # indices — the legacy reader's exact contract, and the inverse
         # of the encode's sorted channel sets — so the decode-side
         # scatter restores the encode-side gather order.
@@ -666,7 +677,7 @@ class TurboQuant:
 
         W20.3.3: torch end-to-end on the CODES' device. The channel
         index tensors from _split_channels scatter the sub-set
-        reconstructions through torch advanced indexing — the numpy
+        reconstructions through torch advanced indexing — the
         host buffer (zeros + `xg[ch] = ...`) and the sub-dequant
         host-array hops are gone. Each sub-set's 0-dim fp32 norm
         (codes.norm / codes.norm_hi) scales INSIDE its sub-dequant —
@@ -769,9 +780,15 @@ class TurboQuant:
         2.2 surface, fetched once per device), fht.fht_adjoint
         (device-native, backend auto) and the 0-dim norm-tensor multiply
         all run ON THE CODES' DEVICE; the legacy CPU-reference body
-        (numpy gather, host-built adjoint input, compute-on-CPU-then-
-        move) is gone. CPU-resident codes decode on CPU, so every
-        legacy CPU-side consumer is unchanged.
+        (host-array gather, host-built adjoint input,
+        compute-on-CPU-then-move) is gone. CPU-resident codes decode
+        on CPU, so every legacy CPU-side consumer is unchanged.
+
+        W20.3.4: the QJL compensation term is device-native too — the
+        direct _qjl_compensation_term call computes on the codes'
+        device (the 3.3 CPU-detour bridge collapsed: no host hop, no
+        term H2D); flag-off codes (the None pair) skip the term
+        entirely.
 
         W18 `device`: when given, the FINAL tensor is moved there once —
         the caller's placement contract, the ONLY sanctioned transfer
@@ -786,7 +803,7 @@ class TurboQuant:
             # the REGULAR sub-set's norm; a zero regular set with a live
             # outlier set (or vice versa) is handled per sub-set inside
             # _dequant_split_mse (the 0-dim norm/norm_hi multiplies).
-            out = self._qjl_term_bridged(codes, out)
+            out = self._qjl_compensation_term(codes, out)
             out = out.to(dtype)
         else:
             q = self._route_for(codes)
@@ -795,36 +812,21 @@ class TurboQuant:
             out = out.to(device)
         return out
 
-    def _qjl_term_bridged(self, codes: TQCodes,
-                          out: torch.Tensor) -> torch.Tensor:
-        """The _qjl_compensation_term CALL SITE, device-bridged (W20.3.3
-        decode-region glue; 3.4 owns the term's body and its
-        torch-ification).
-
-        Pre-3.4 the term computes on the HOST (host-array signs, a
-        host-built adjoint input, CPU fht_adjoint) and ADDS onto its
-        `out` argument: on CPU `out` that is the legacy call, verbatim; on a
-        device-resident `out` the direct add would raise (the W16
-        --qjl A/B crash pattern), so the ADDITIVE term is evaluated
-        against a zero pass-through on the term's own device and the
-        moved term adds onto `out` — one H2D of the term, never a D2H
-        read of `out` (the _attach_qjl W16 bridge discipline). When 3.4
-        makes the term device-native this collapses to the direct
-        call. The None-pair guard skips the host round trip entirely
-        for the (default) qjl-off codes; a PARTIAL sketch still raises
-        inside the term, exactly as before."""
-        if codes.qjl_signs is None and codes.gamma is None:
-            return out
-        if out.device.type == "cpu":
-            return self._qjl_compensation_term(codes, out)
-        term = self._qjl_compensation_term(
-            codes, torch.zeros(self.d, dtype=torch.float32))
-        return out + term.to(out.device)
-
     def _qjl_compensation_term(self, codes: TQCodes,
                                out: torch.Tensor) -> torch.Tensor:
         """The Alg.-2 residual term, shared by both partitions (the sketch
-        lives in the ORIGINAL frame — partition-agnostic)."""
+        lives in the ORIGINAL frame — partition-agnostic).
+
+        W20.3.4: torch-native and device-resident — the int8 signs
+        widen to fp32 ON THE CODES' DEVICE (a dtype conversion always
+        copies, so read-only / mmap-backed signs storage is never
+        written — the legacy writable-copy hop deleted), the adjoint
+        rides fht.fht_adjoint (device-native, backend auto), and γ
+        scales as the 0-dim fp32 TENSOR — no host scalar read, no
+        sync: a degenerate γ == 0 multiplies the finite adjoint to the
+        exact zero term (0 × finite = 0 — the legacy γ-branch guard
+        added the same zero). Flag-off codes (the None pair) return
+        `out` untouched — the default path takes zero new code."""
         if codes.qjl_signs is None and codes.gamma is None:
             return out
         if codes.qjl_signs is None or codes.gamma is None:
@@ -834,24 +836,21 @@ class TurboQuant:
                 f"QJL sketch (qjl_signs={'set' if codes.qjl_signs is not None else 'None'}, "
                 f"gamma={'set' if codes.gamma is not None else 'None'}) — "
                 f"corrupted serialization?")
-        s = np.asarray(codes.qjl_signs)
-        if s.dtype != np.int8 or s.ndim != 1 or s.shape[0] != codes.d:
+        s = codes.qjl_signs
+        if s.dtype != torch.int8 or s.dim() != 1 or s.shape[0] != codes.d:
             raise ValueError(
                 f"TurboQuant({self.kind}): qjl_signs must be a "
-                f"({codes.d},) int8 ±1 sketch, got shape={s.shape}, "
+                f"({codes.d},) int8 ±1 sketch, got shape={tuple(s.shape)}, "
                 f"dtype={s.dtype}")
-        gamma = float(codes.gamma)
-        if gamma != 0.0:
-            # _check_codes pins codes.seed == self.seed, so the cached
-            # second draw is the codes' own QJL sign vector.
-            # np.array(...) = a WRITABLE fp32 copy: torch.from_numpy on
-            # a read-only view (e.g. the zero-copy views onto mmap'd
-            # snapshot members) would warn + be UB on write.
-            s_t = torch.from_numpy(
-                np.array(s, dtype=np.float32)).reshape(1, self.d)
-            z = fht.fht_adjoint(s_t, self._qjl_signs_vec).reshape(self.d)
-            out = out + (QJL_C * gamma / math.sqrt(self.d)) * z
-        return out
+        # the fp32 widening copy ON THE CODES' DEVICE (a dtype
+        # conversion always copies — read-only / mmap-backed signs
+        # storage is never written; the (1, d) argument shape is the
+        # legacy call's)
+        s_t = s.to(torch.float32).reshape(1, self.d)
+        # _check_codes pins codes.seed == self.seed, so the cached
+        # second draw is the codes' own QJL sign vector.
+        z = fht.fht_adjoint(s_t, self._qjl_signs_vec).reshape(self.d)
+        return out + (QJL_C * codes.gamma / math.sqrt(self.d)) * z
 
     def _dequant_flat(self, codes: TQCodes,
                       dtype: torch.dtype = torch.float32,
@@ -870,7 +869,7 @@ class TurboQuant:
         the CODES' device and `device` moves the final tensor once."""
         self._check_codes(codes)
         out = self._dequant_mse(codes, dtype=torch.float32)
-        out = self._qjl_term_bridged(codes, out)
+        out = self._qjl_compensation_term(codes, out)
         out = out.to(dtype)
         if device is not None:
             out = out.to(device)
@@ -891,7 +890,7 @@ class TurboQuant:
         codebooks live on the CODES' device — fetched once, never per
         call), the un-rotation is fht.fht_adjoint (device-native,
         backend auto: CUDA kernel when eligible, the torch butterfly
-        otherwise — the host-numpy adjoint input is GONE), and the norm
+        otherwise — the host-built adjoint input is GONE), and the norm
         is the 0-dim fp32 TENSOR multiply (no host scalar read of any
         kind — a degenerate zero norm scales the finite reconstruction
         to the exact zero vector). The fp32 math runs first; the
@@ -908,7 +907,7 @@ class TurboQuant:
         idx_hi = unpack_bits_t(codes.idx_hi, codes.bits_hi, codes.n_hi)
         # the tensor LUT gather: centroids_t[idx] into the device-resident
         # fp32 centroid tables (uint8 indices widened to long for torch
-        # advanced indexing — no numpy gather, no host-array take; the
+        # advanced indexing — no host gather, no host-array take; the
         # mirror is built from the SAME solved tables, so CPU values
         # are bit-identical to the legacy gather)
         cb_lo, cb_hi = self._device_codebooks(dev)
@@ -952,18 +951,6 @@ def _next_pow2(n: int) -> int:
     if n < 1:
         raise ValueError(f"_next_pow2: n must be >= 1, got {n}")
     return 1 << (n - 1).bit_length()
-
-
-def _pad_to(x: np.ndarray, d: int) -> torch.Tensor:
-    """Zero-pad the flat (n,) numpy vector UP to (d,) and return a
-    contiguous fp32 torch tensor (n <= d). The pad adds no energy — the
-    sub-quantizer's stored norm is the real sub-set's."""
-    if x.shape[0] > d:
-        raise ValueError(f"_pad_to: n={x.shape[0]} exceeds d={d}")
-    if x.shape[0] < d:
-        x = np.concatenate(
-            [x, np.zeros(d - x.shape[0], dtype=np.float32)])
-    return torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32))
 
 
 # -------------------------------------------------------------- registry ---

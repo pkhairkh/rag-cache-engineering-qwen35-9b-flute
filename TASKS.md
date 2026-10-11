@@ -441,7 +441,13 @@ COMMIT: "W20.3.3 — dequant torch-native (tensor LUT gather, adjoint,
 norm tensor)"
 
 #### W20.3.4 — the QJL branch torch-native
-- [ ] done
+- [x] done
+The audit line HOLDS: `rg "np\.|numpy" src/rag/turboquant.py` == 0
+module-wide (the K1 core's final state — 28 hits swept to zero, prose
+included). The qjl γ!=0 host branch is gone (branchless 0-dim
+multiply, the 3.3 discipline); the term's scalar prefactor is now
+fp32-torch vs legacy host-float64 — last-ulp drift possible on the
+qjl=True path only (G20.P1's parity business).
 ROLE task-writer · READ `src/rag/turboquant.py:510-560` (the qjl
 encode branch), `:695-712` (_qjl_compensation_term) · WRITE
 `src/rag/turboquant.py`
