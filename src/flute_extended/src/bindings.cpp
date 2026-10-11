@@ -109,6 +109,24 @@ torch::Tensor fht_backward_large(torch::Tensor g, torch::Tensor signs);
 torch::Tensor tq_debug_fht_large_forward(torch::Tensor x, torch::Tensor signs);
 torch::Tensor tq_debug_fht_large_backward(torch::Tensor g, torch::Tensor signs);
 
+// W20.7.4 -- the batched TQ encode entry (also defined in src/kernel_tq.cu
+// at global scope, this declaration family's pattern): ONE host call over
+// a prefill's whole (M, d) fp32 unit matrix -- 7.1's norm chain + 5.2's
+// batched large-K butterfly + 7.3's ladder/pack + the zero-norm sweep,
+// one stream-ordered kernel chain per prefill (PROPOSAL.md §3.6: "two
+// kernel chains per prefill instead of ~4,000 host round trips" -- the
+// decode chain is W20.8's tq_dequant_batched). signs are the quantizer's
+// (d,) fp32 rotation vector (fht.rotation_signs), passed IN by the
+// caller -- never generated here; boundaries_{lo,hi} the codebook device
+// mirrors. Returns (codes_lo (M, L_lo) uint8, codes_hi (M, L_hi) uint8,
+// norms (M,) fp32); the packed byte layout is fixture-pinned (G20.P1's
+// frozen fixtures; G20.P3's kernel-parity gate). The wrapper never
+// reads device memory (no D2H).
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> tq_quant_batched(
+    torch::Tensor units, int64_t d, torch::Tensor signs,
+    torch::Tensor boundaries_lo, torch::Tensor boundaries_hi,
+    int64_t n_lo, int64_t bits_lo, int64_t n_hi, int64_t bits_hi);
+
 // Unified dispatcher. Accepts either (indices, lut) for the quantized path
 // or (W_dense) for the dense CUTLASS baseline. Pass an empty Tensor for the
 // unused variants. q_layout selects the packed-indices layout:
@@ -347,4 +365,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "path); signs at the first load, the same butterfly, rsqrtf(K) "
           "at the final store",
           py::arg("g"), py::arg("signs"));
+
+    // W20.7.4 -- the batched TQ encode entry (src/kernel_tq.cu): ONE
+    // host call over a prefill's whole unit batch -- the norm chain +
+    // the batched large-K butterfly + the ladder/pack + the zero-norm
+    // sweep, stream-ordered on the current CUDA stream. The
+    // two-chains-per-prefill design (PROPOSAL.md §3.6: "two kernel
+    // chains per prefill instead of ~4,000 host round trips"; the
+    // decode chain is W20.8's tq_dequant_batched); the packed byte
+    // layout is fixture-pinned (turboquant.py's pack_bits canonical,
+    // G20.P1's frozen fixtures, G20.P3's kernel-parity gate).
+    m.def("tq_quant_batched", &tq_quant_batched,
+          "Batched TurboQuant encode: one call over the prefill's (M, d) "
+          "fp32 unit matrix -> (codes_lo (M, L_lo) uint8, codes_hi (M, "
+          "L_hi) uint8, norms (M,) fp32); signs are the quantizer's (d,) "
+          "fp32 rotation vector, boundaries the codebook mirrors; the "
+          "wrapper never reads device memory (no D2H)",
+          py::arg("units"),
+          py::arg("d"),
+          py::arg("signs"),
+          py::arg("boundaries_lo"),
+          py::arg("boundaries_hi"),
+          py::arg("n_lo"),
+          py::arg("bits_lo"),
+          py::arg("n_hi"),
+          py::arg("bits_hi"));
 }

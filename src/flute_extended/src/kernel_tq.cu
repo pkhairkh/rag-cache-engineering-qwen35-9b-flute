@@ -2327,3 +2327,454 @@ void tq_quant_ladder_pack_run(
 }
 
 }  // namespace
+
+// ===========================================================================
+// W20.7.4 -- tq_quant_batched: the batched encode entry + the zero-norm
+// sweep. TASKS.md:1044-1061; PROPOSAL.md:187-193 (§3.6) and §3.3's step
+// orchestration. The prefill's ONE host call.
+//
+// THE ORCHESTRATION -- two kernel chains per prefill, not ~4,000 host
+// round trips (PROPOSAL.md:189-193: "one tq_quant_batched over all of a
+// prefill's ~120-192 units ... two kernel chains per prefill instead of
+// ~4,000 host round trips" -- the ENCODE chain is this entry; the decode
+// chain is W20.8's). The entry composes the family's existing stages;
+// NOTHING is re-implemented, every kernel stays the committed
+// fixture-pinned copy (the additions-only law; 7.3's composition
+// decision realized as the host launch sequence it planned,
+// kernel_tq.cu:1922-1953):
+//   (a) norms = tq_quant_norm_rows(units)  -- 7.1's chain: the (M, 64)
+//       partial grid + the fold launch, the norm of the UNROTATED rows
+//       (turboquant.py:510: norm = x32.norm() BEFORE the rotation -- the
+//       FHT is norm-preserving, the order is the twin's). (M,) fp32,
+//       computed once, RETURNED once -- the entry's third output IS
+//       7.1's tensor (no copy, no re-reduce, no host read; the
+//       forward-build note's caller-owned-buffer option exists,
+//       kernel_tq.cu:1467-1475, but the wrapper's fresh (M,) IS the
+//       natural output here).
+//   (b) y = fht_forward_large(units, signs) -- 5.2's (M, K)-batched
+//       two-pass butterfly: the quant rotation (turboquant.py:530-531),
+//       signs AFTER the butterfly, 1/sqrt(K) in the epilogue, the norm
+//       NEVER divided out (7.2's identity, kernel_tq.cu:1710-1724). y is
+//       (M, K) fp32, the butterfly's own out-of-place state tensor.
+//   (c) tq_quant_ladder_pack_run(...)      -- 7.3's ladder + pack over
+//       the ROTATED rows, through its own launcher (grid = M x K/16384
+//       tiles; the in-kernel grid-stride loop is R20.6's overshoot
+//       guard -- the CTA-count guard, kernel_tq.cu:2009-2013, 2317-2321:
+//       2^22's 256-tile-per-unit grids stay launch-legal and the byte
+//       values grid-independent, "256-tile units still ~1 wave-pair at
+//       80 SMs", PROPOSAL.md:318).
+//   (d) the zero-norm sweep (below)        -- the degenerate-unit
+//       branch, device-side.
+// The chain's cross-stage ordering rides the stream's launch
+// boundaries -- this family's ONLY cross-CTA synchronization
+// (fht_large.cuh:106-108): the FULL butterfly completes before the
+// ladder (quant's bucketize consumes the FINAL rotated coordinates,
+// turboquant.py:530-545), and the pack pass completes before the sweep.
+// The host NEVER touches device memory content anywhere: no .item(),
+// no .cpu(), no D2H sync (turboquant.py:490-497's encode discipline) --
+// the twin's single host-visible branch is exactly what this entry
+// eliminates.
+//
+// THE SIGNS CONTRACT -- passed IN, never generated: the (d,) fp32 +-1
+// rotation vector is the QUANTIZER's (fht.rotation_signs(d, seed),
+// fht.py:105-115, (K,) float32 storage; turboquant.py:446). The caller
+// (W20.8's dispatcher, TASKS.md:1097-1116) supplies it on the units'
+// device; this C++ owns no RNG and no seed -- the seeds live in the
+// Python frame (PROPOSAL D3), and generating signs here would fork the
+// frame's determinism source.
+//
+// THE ZERO-NORM BRANCH -- the placement decision. 7.2/7.3 assigned it
+// to this unit: "n > 0 is the CALLER's contract -- the degenerate
+// zero-norm unit is W20.7.4's device-side branch ... it never reaches
+// the ladder" (kernel_tq.cu:1721-1724; the 7.3 banner's hand-off,
+// kernel_tq.cu:2038-2039: "the zero-norm degenerate is 7.4's
+// device-side branch, never this kernel's"). Realized as a SEPARATE
+// device-side sweep kernel, NOT a branch edited into 7.3's pack kernel:
+//   * the additions-only law -- 7.3's kernel is committed and stays
+//     byte-identical (the layout-pin gates own exactly one copy of it);
+//   * the semantics are the torch twin's explicit branch
+//     (turboquant.py:511-523): norm == 0.0 -> CODES OF ZERO -- the
+//     unit's two packed rows become ZERO-FILLED streams (the zero-codes
+//     layout, turboquant.py:519-522), norm 0. The branch condition is
+//     the exact IEEE compare norms[m] == 0.0f (the twin's
+//     `if norm == 0.0`, turboquant.py:511), evaluated ON DEVICE: the
+//     branch costs ZERO host round trips ("the torch-twin's known cost,
+//     eliminated by the W20.7 kernel design", turboquant.py:512-514).
+//   * ORDER: the sweep is the chain's LAST launch -- its zeros are the
+//     final bytes. For the TRUE all-zero row the degenerate ladder
+//     ALREADY emits codes-of-zero (y = 0 exactly; every scaled boundary
+//     is +-0; 0 <= 0 at rung 0 -> idx 0 for every coordinate -> the
+//     zero word -- the layout pin's zero stream; the ladder's compare
+//     direction, kernel_tq.cu:1894-1908), so the sweep's overwrite is a
+//     parity no-op there; its real work is the measure-zero UNDERFLOW
+//     degenerate (a row of values whose fp32 squares all flush to 0:
+//     norm == 0 with y != 0, where the degenerate ladder's decisions
+//     are NOT the twin's explicit zeros). The sweep pins the twin's
+//     branch in both cases.
+//   * DETERMINISM: the sweep's writes are a pure function of the
+//     norms' zero bits; every byte single-owned (row byte b -> thread
+//     b % width, iteration b / width); run-to-run torch.equal holds.
+//     No barrier rides the sweep's grid-stride loop -- the kernel has
+//     no shared memory, so the healthy unit's early exit is plain
+//     divergence, legal exactly where the pack kernel's smem table
+//     lifetime forbids it (kernel_tq.cu:2230-2238).
+//   * the same ulp class as the ladder ties: the twin branches on ITS
+//     torch.norm bits, this chain on 7.1's tree bits
+//     (kernel_tq.cu:1457-1465) -- a norm straddling 0 within an ulp can
+//     take the two paths' different branches; G20.P3's norm threshold
+//     (<= 1 ulp) and tie counter own the exposure (TASKS.md:1122-1124).
+//
+// THE TORCH_CHECK FAMILY (loud, metadata-only):
+//   * units: 2-D (M, d) contiguous CUDA fp32 -- fp32 ONLY (the encode
+//     chain consumes the butterfly's fp32 output; fp16/bf16 rows stay
+//     on the torch twin, which casts first, turboquant.py:505);
+//   * d == units.size(1) (a mismatch is frame drift, PROPOSAL D3);
+//     d a power of two > 16384, % 32 == 0 -- the butterfly's envelope
+//     (fht_large_check_args's family, kernel_tq.cu:490-531; a power of
+//     two above 16384 is necessarily 32-aligned -- the clause mirrors
+//     the family's refusal order, checked loudly, never assumed);
+//   * M <= INT32_MAX (grid.x) and M*d <= 2^41 (the butterfly's launch
+//     arithmetic, kernel_tq.cu:514-520);
+//   * signs: (d,) fp32 contiguous CUDA -- the contract above;
+//   * bits_lo, bits_hi in {3, 4} (codebooks.py:219-228);
+//   * n_lo >= 0, n_hi >= 0, n_lo + n_hi == d (the split partitions d);
+//     n_lo % 16 == 0 -- THE ALIGNMENT CONTRACT (kTqPackSlice, the
+//     16-coordinate slice ownership, kernel_tq.cu:2015-2024):
+//     misaligned fractions are REFUSED loudly and route to the torch
+//     twin (the auto-backend discipline -- never a silently mis-packed
+//     stream);
+//   * boundaries_{lo,hi}: 1-D fp32 contiguous CUDA, numel == 2^bits - 1
+//     (tq_boundary_count; the 2.2 device mirrors, turboquant.py:556-570)
+//     -- checked UNCONDITIONALLY: the length is a property of bits (the
+//     codebook's mirror; TQCodes carries the split's bits even for an
+//     empty half), and an empty half's table is never dereferenced (the
+//     pack kernel's own n_half > 0 guards). ASCENDING is NOT re-checked
+//     -- it would read the tables' CONTENT, a banned D2H;
+//     codebooks.py:445-446's load-time strict-ascent validation is the
+//     cited precondition (kernel_tq.cu:1755-1757).
+//
+// THE GRID ACCOUNTING (the PROPOSAL's budget line, realized as the
+// launch sequence): the sketch's fused grid -- "grid = SUM(units x
+// tiles) + norm CTAs ~ 6,100 CTAs at 2^19 -- ~76 waves of the 80 SMs,
+// each wave microseconds" (PROPOSAL.md:190-191; :225's "6,100-CTA
+// batched grids = ~76 waves"), 120-192 units x 2^19 in the brief's
+// range -- lands on the ladder+pack pass: 192 x 32 tiles = 6,144 CTAs
+// at the 192-unit 2^19 prefill (120 units -> 3,840), the 64 KiB-smem
+// 1-CTA/SM pass the waves count. The realized chain's other grids: the
+// norm chain's (M, 64) partial CTAs + ceil(M/256) fold CTAs (12,288 +
+// 1 at M = 192, 256-thread bandwidth streaming), the butterfly's
+// pass-1 (M, K/16384) = the same 6,144 and pass-2's ceil(M*K/2 / 1024)
+// streaming CTAs per cross stage (5 stages at 2^19), and the sweep's M
+// CTAs. Every grid is a pure function of (M, K) -- no device query
+// feeds any launch (the determinism contract).
+//
+// THE M == 0 BRANCH: the entry's (the pack launcher refuses M == 0
+// loudly, kernel_tq.cu:2263-2265 -- "the M == 0 branch is 7.4's"):
+// zero units -> the three empty tensors, no launch (a zero-size grid is
+// not a legal launch -- the family discipline, kernel_tq.cu:577-580).
+//
+// THE WORKSPACES: the entry allocates exactly the OUTPUTS -- codes_lo
+// (M, L_lo) uint8, codes_hi (M, L_hi) uint8 (L = tq_packed_len(n_half,
+// bits_half), the _packed_len pin, kernel_tq.cu:2070-2083) -- and
+// returns 7.1's (M,) norms. y and the norm chain's partials are the
+// stages' own wrapper-allocated workspaces, freed at scope exit on the
+// same stream -- the caching allocator's stream-ordered discipline
+// (kernel_tq.cu:1652-1657): a later launch on this stream cannot
+// observe the freed blocks. y costs (M, K) fp32 -- 2 MiB per unit at
+// 2^19, 384 MiB at the 192-unit prefill -- the butterfly's committed
+// design, the price 7.3's banner already booked (ONE extra fp32 read
+// pass of y, kernel_tq.cu:1946-1948).
+//
+// THE LAYOUT PIN (inherited, cited per the 7.3 invariant): the packed
+// byte layout is IDENTICAL to today's pack_bits (turboquant.py:212-245,
+// the W20.3.2 canonical) -- fixture-pinned by G20.P1's frozen fixtures;
+// G20.P3's kernel-parity gate counts divergences (codes equal except
+// ties <= 0.01%, norm <= 1 ulp, TASKS.md:1122-1124).
+//
+// Resource accounting (sm_86): the sweep is 256 threads/CTA (the norm
+// chain's small-CTA width), grid.x = M (the chain's smallest grid), no
+// shared memory, no dynamic-smem opt-in; ~4 B read (the broadcast
+// norm) and 0..L bytes written per CTA.
+//
+// COMPILE RECORD: nvcc is ABSENT on this authoring box (env/W20_ENV.md)
+// -- compile and behavioral verification defer to the A10G box (the
+// W20.5.4 TU registration carries this file; W20.7.5 / W20.8.3 run the
+// gates). Authored statically, re-read for review; every defect found
+// here is a box-side discovery.
+// ===========================================================================
+
+namespace {
+
+// The sweep's CTA width: 256 threads (the norm chain's small-CTA shape
+// -- 8 whole warps; the sweep's work is one broadcast read plus, only
+// for degenerate units, a byte fill).
+constexpr int kTqZeroSweepThreads = 256;
+
+static_assert(kTqZeroSweepThreads % 32 == 0,
+              "whole warps (the family discipline, kTqNormThreads's)");
+
+// ---------------------------------------------------------------------------
+// tq_quant_zero_norm_sweep_kernel -- the degenerate-unit branch, on
+// device. One CTA per unit, grid-stride over the M units (R20.6's guard
+// pattern: the values are a pure function of the norms' zero bits, so
+// any grid a future caller caps to computes the same bytes -- the pack
+// kernel's own guard discipline, kernel_tq.cu:2009-2013). A healthy
+// unit (norms[unit] != 0) exits without a single write -- its bytes are
+// the pack pass's, already final. A degenerate unit (norms[unit] ==
+// 0.0f) zero-fills its two packed rows: turboquant.py:511-523's codes
+// of zero. NO shared memory, NO barrier: the per-unit early exit is
+// plain divergence (nothing here is cooperative -- unlike the pack
+// kernel's smem table lifetime, kernel_tq.cu:2230-2238, whose barriers
+// must stay CTA-uniform).
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(kTqZeroSweepThreads)
+tq_quant_zero_norm_sweep_kernel(
+    const float* __restrict__ norms,  // (M,) 7.1's output, read-only
+    uint8_t* __restrict__ codes_lo,   // (M, lo_bytes); null if lo_bytes == 0
+    uint8_t* __restrict__ codes_hi,   // (M, hi_bytes); null if hi_bytes == 0
+    int M, int lo_bytes, int hi_bytes) {
+    // int64 unit -- the family's int-envelope belt (M <= INT32_MAX, but
+    // the stride increment must not wrap a signed int at M > 2^30;
+    // constructible by arithmetic, not faith).
+    for (int64_t unit = static_cast<int64_t>(blockIdx.x);
+         unit < M; unit += gridDim.x) {
+        // the branch condition: the EXACT IEEE compare, on device -- the
+        // twin's `if norm == 0.0` (turboquant.py:511) with the host read
+        // eliminated. -0.0 == 0.0 fires too (a value the fp32
+        // sum-of-squares cannot emit; the compare is the twin's
+        // semantics, verbatim). NaN != 0 skips (out of contract -- the
+        // ladder's own NaN banner, kernel_tq.cu:1777-1780).
+        if (norms[unit] != 0.0f) {
+            continue;  // healthy: the pack pass owns the unit's bytes
+        }
+        // codes of zero: both packed rows zero-filled (the twin's
+        // torch.zeros(_packed_len(...)), turboquant.py:519-522). Row
+        // byte b is written by exactly ONE thread (b % width, iteration
+        // b / width): single-writer per byte, nothing cooperative. An
+        // empty half (bytes == 0) never dereferences its pointer (a
+        // null base plus a zero offset is the null base).
+        uint8_t* row_lo =
+            codes_lo + unit * static_cast<int64_t>(lo_bytes);
+        uint8_t* row_hi =
+            codes_hi + unit * static_cast<int64_t>(hi_bytes);
+        for (int b = threadIdx.x; b < lo_bytes; b += kTqZeroSweepThreads) {
+            row_lo[b] = uint8_t(0);
+        }
+        for (int b = threadIdx.x; b < hi_bytes; b += kTqZeroSweepThreads) {
+            row_hi[b] = uint8_t(0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tq_quant_zero_norm_sweep_run -- the sweep's launcher (the family's
+// raw-pointer pattern: integer geometry + pointer hygiene checked
+// loudly, the host never touching device content). The FULL grid by
+// default (one CTA per unit, grid.x = M <= INT32_MAX -- the entry's
+// check); the kernel's grid-stride loop is the R20.6 guard that keeps
+// any future cap value-correct.
+// ---------------------------------------------------------------------------
+void tq_quant_zero_norm_sweep_run(
+    const float* norms,
+    uint8_t* codes_lo, uint8_t* codes_hi,
+    int M, int lo_bytes, int hi_bytes,
+    cudaStream_t stream) {
+    TORCH_CHECK(M > 0,
+                "tq_quant_zero_sweep: M must be > 0 (a zero-size grid is "
+                "not a legal launch -- the M == 0 branch is the entry's)");
+    TORCH_CHECK(norms != nullptr,
+                "tq_quant_zero_sweep: norms must be a live device pointer");
+    TORCH_CHECK(lo_bytes == 0 || codes_lo != nullptr,
+                "tq_quant_zero_sweep: a live lo stream needs its pointer");
+    TORCH_CHECK(hi_bytes == 0 || codes_hi != nullptr,
+                "tq_quant_zero_sweep: a live hi stream needs its pointer");
+    tq_quant_zero_norm_sweep_kernel
+        <<<M, kTqZeroSweepThreads, 0, stream>>>(
+            norms, codes_lo, codes_hi, M, lo_bytes, hi_bytes);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------
+// Argument validation -- the entry's loud TORCH_CHECK family (the
+// banner's list; metadata only, never content -- the internal wrappers
+// and launchers re-check their own geometry as the belt, so a failure
+// surfaces with the entry's prefix first).
+// ---------------------------------------------------------------------------
+void tq_quant_batched_check_args(
+    const torch::Tensor& units, int64_t d,
+    const torch::Tensor& signs,
+    const torch::Tensor& boundaries_lo, const torch::Tensor& boundaries_hi,
+    int64_t n_lo, int64_t bits_lo, int64_t n_hi, int64_t bits_hi) {
+    TORCH_CHECK(units.is_cuda(),
+                "tq_quant_batched: units must be a CUDA tensor");
+    TORCH_CHECK(units.dim() == 2,
+                "tq_quant_batched: units must be 2-D (M, d) - the "
+                "prefill's unit matrix (the dispatcher flattens "
+                "(..., d) to rows)");
+    TORCH_CHECK(units.is_contiguous(),
+                "tq_quant_batched: units must be contiguous");
+    TORCH_CHECK(units.scalar_type() == at::kFloat,
+                "tq_quant_batched: units dtype must be float32 (the "
+                "encode chain consumes the butterfly's fp32 output; "
+                "fp16/bf16 rows stay on the torch twin, which casts "
+                "first, turboquant.py:505), got ", units.scalar_type());
+    TORCH_CHECK(d == units.size(1),
+                "tq_quant_batched: d must match units' last dim (got d=",
+                d, ", units.size(1)=", units.size(1), ") - frame drift? "
+                "(PROPOSAL D3)");
+    TORCH_CHECK(d > 0 && d <= static_cast<int64_t>(INT32_MAX),
+                "tq_quant_batched: d must be a positive int-sized count "
+                "(got d=", d, ")");
+    const int K = static_cast<int>(d);
+    // The butterfly's envelope, mirrored (fht_large_check_args's
+    // family, kernel_tq.cu:490-531).
+    TORCH_CHECK(K > flute::FHT_LARGE_TILE,
+                "tq_quant_batched: d=", K, " <= 16384 - one 64 KiB tile "
+                "or less; the small-K paths own it");
+    TORCH_CHECK((K & (K - 1)) == 0,
+                "tq_quant_batched: d must be a power of two (the FHT "
+                "rotation the encode chain rides), got d=", K);
+    TORCH_CHECK(K % 32 == 0,
+                "tq_quant_batched: d must be divisible by 32 (the "
+                "kernel_fht.cu:21 discipline), got d=", K);
+    // M's launch bounds (grid.x everywhere in the chain).
+    TORCH_CHECK(units.size(0) <= static_cast<int64_t>(INT32_MAX),
+                "tq_quant_batched: M must fit a grid.x launch (got M=",
+                units.size(0), ")");
+    // The butterfly's launch arithmetic (kernel_tq.cu:514-520).
+    TORCH_CHECK(units.size(0) * d <= (int64_t{1} << 41),
+                "tq_quant_batched: M*d = ", units.size(0) * d,
+                " exceeds the butterfly launch grid's addressable pairs");
+    // The signs contract (the banner's): the quantizer's (d,) fp32
+    // rotation vector, passed IN by the caller.
+    TORCH_CHECK(signs.is_cuda() && signs.dim() == 1 &&
+                signs.scalar_type() == at::kFloat &&
+                signs.numel() == d && signs.is_contiguous(),
+                "tq_quant_batched: signs must be a contiguous (d,) "
+                "float32 CUDA tensor - the quantizer's rotation vector "
+                "(fht.rotation_signs, supplied by the caller), got "
+                "numel=", signs.numel(), ", d=", d);
+    // The split's cardinals.
+    TORCH_CHECK(bits_lo == 3 || bits_lo == 4,
+                "tq_quant_batched: bits_lo must be 3 or 4 (the TQ index "
+                "stream widths, codebooks.py:219-228), got ", bits_lo);
+    TORCH_CHECK(bits_hi == 3 || bits_hi == 4,
+                "tq_quant_batched: bits_hi must be 3 or 4 (the TQ index "
+                "stream widths, codebooks.py:219-228), got ", bits_hi);
+    TORCH_CHECK(n_lo >= 0 && n_hi >= 0 && n_lo + n_hi == d,
+                "tq_quant_batched: the lo/hi split must partition d "
+                "(n_lo=", n_lo, ", n_hi=", n_hi, ", d=", d, ")");
+    // THE ALIGNMENT CONTRACT (the banner's): refuse loudly, route to
+    // the torch twin.
+    TORCH_CHECK(n_lo % kTqPackSlice == 0,
+                "tq_quant_batched: n_lo must be a multiple of ",
+                kTqPackSlice, " (the 16-coordinate slice ownership; "
+                "got n_lo=", n_lo, ") - misaligned fractions stay on "
+                "the torch twin");
+    // The boundary mirrors: 1-D fp32 CUDA, length 2^bits - 1 --
+    // UNCONDITIONALLY (bits validated above; the banner's reasoning).
+    const int64_t want_lo = tq_boundary_count(static_cast<int>(bits_lo));
+    const int64_t want_hi = tq_boundary_count(static_cast<int>(bits_hi));
+    TORCH_CHECK(boundaries_lo.is_cuda() && boundaries_lo.dim() == 1 &&
+                boundaries_lo.scalar_type() == at::kFloat &&
+                boundaries_lo.is_contiguous() &&
+                boundaries_lo.numel() == want_lo,
+                "tq_quant_batched: boundaries_lo must be a contiguous (",
+                want_lo, ",) float32 CUDA tensor (the 2^bits_lo - 1 "
+                "codebook mirror), got numel=", boundaries_lo.numel());
+    TORCH_CHECK(boundaries_hi.is_cuda() && boundaries_hi.dim() == 1 &&
+                boundaries_hi.scalar_type() == at::kFloat &&
+                boundaries_hi.is_contiguous() &&
+                boundaries_hi.numel() == want_hi,
+                "tq_quant_batched: boundaries_hi must be a contiguous (",
+                want_hi, ",) float32 CUDA tensor (the 2^bits_hi - 1 "
+                "codebook mirror), got numel=", boundaries_hi.numel());
+    // ASCENDING is NOT re-checked: it would read the tables' CONTENT
+    // (a banned D2H); codebooks.py:445-446's load-time strict-ascent
+    // validation is the precondition (kernel_tq.cu:1755-1757).
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// tq_quant_batched -- the public entry (bound by src/bindings.cpp in
+// W20.7.4). ONE host call over the prefill's whole unit batch: 7.1's
+// norm chain, 5.2's batched butterfly, 7.3's ladder+pack, the zero-norm
+// sweep -- two kernel chains per prefill, not ~4,000 host round trips
+// (PROPOSAL.md:189-193). The wrapper allocates the outputs, launches
+// the chain, and NEVER reads device memory content (no .item(), no
+// .cpu(), no D2H sync anywhere).
+// ---------------------------------------------------------------------------
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> tq_quant_batched(
+    torch::Tensor units, int64_t d, torch::Tensor signs,
+    torch::Tensor boundaries_lo, torch::Tensor boundaries_hi,
+    int64_t n_lo, int64_t bits_lo, int64_t n_hi, int64_t bits_hi) {
+    tq_quant_batched_check_args(units, d, signs, boundaries_lo,
+                                boundaries_hi, n_lo, bits_lo, n_hi,
+                                bits_hi);
+
+    const int M = static_cast<int>(units.size(0));
+    const int K = static_cast<int>(d);
+    const int in_lo = static_cast<int>(n_lo);       // range-checked above
+    const int in_hi = static_cast<int>(n_hi);
+    const int ibits_lo = static_cast<int>(bits_lo);
+    const int ibits_hi = static_cast<int>(bits_hi);
+
+    // ---- the outputs (allocation only; sizes from the ONE pinned
+    // length function, kernel_tq.cu:2070-2083) -------------------------
+    const int64_t L_lo = tq_packed_len(in_lo, ibits_lo);
+    const int64_t L_hi = tq_packed_len(in_hi, ibits_hi);
+    TORCH_CHECK(L_lo <= static_cast<int64_t>(INT32_MAX) &&
+                L_hi <= static_cast<int64_t>(INT32_MAX),
+                "tq_quant_batched: a packed stream length exceeds int "
+                "(L_lo=", L_lo, ", L_hi=", L_hi, ")");
+    torch::Tensor codes_lo = torch::empty({units.size(0), L_lo},
+                                          units.options().dtype(at::kByte));
+    torch::Tensor codes_hi = torch::empty({units.size(0), L_hi},
+                                          units.options().dtype(at::kByte));
+
+    // The M == 0 branch (the pack launcher's TORCH_CHECK documents it
+    // as this entry's): the three empty tensors, no launch (the family
+    // discipline, kernel_tq.cu:577-580).
+    if (M == 0) {
+        torch::Tensor norms =
+            torch::empty({0}, units.options().dtype(at::kFloat));
+        return {codes_lo, codes_hi, norms};
+    }
+
+    // ---- (a) the norm chain: 7.1's wrapper (its own (64, M) workspace
+    // + its two launches; the (M,) fp32 output is this entry's third
+    // return -- computed once, returned once, never read on the host) --
+    torch::Tensor norms = tq_quant_norm_rows(units);
+
+    // ---- (b) the batched butterfly: 5.2's public forward (out-of-
+    // place, (M, K) fp32 rotated rows -- signs and 1/sqrt(K) in the
+    // epilogue, the norm never divided out) ----------------------------
+    torch::Tensor y = fht_forward_large(units, signs);
+
+    auto stream = at::cuda::getCurrentCUDAStream();  // the house kernels'
+                                                     // stream
+
+    // ---- (c) the ladder + pack pass: 7.3's launcher (its own grid
+    // arithmetic + TORCH_CHECKs; grid = M x K/16384 tiles, the in-kernel
+    // grid-stride loop the R20.6 overshoot guard) ----------------------
+    tq_quant_ladder_pack_run(
+        y.data_ptr<float>(), norms.data_ptr<float>(),
+        boundaries_lo.data_ptr<float>(), boundaries_hi.data_ptr<float>(),
+        codes_lo.data_ptr<uint8_t>(), codes_hi.data_ptr<uint8_t>(),
+        M, K, in_lo, ibits_lo, in_hi, ibits_hi, stream);
+
+    // ---- (d) the zero-norm sweep: the degenerate units' codes-of-zero,
+    // device-side (the chain's LAST launch -- its zeros are the final
+    // bytes) ------------------------------------------------------------
+    tq_quant_zero_norm_sweep_run(
+        norms.data_ptr<float>(),
+        codes_lo.data_ptr<uint8_t>(), codes_hi.data_ptr<uint8_t>(),
+        M, static_cast<int>(L_lo), static_cast<int>(L_hi), stream);
+
+    // y and the norm chain's partials free at scope exit on the same
+    // stream -- the caching allocator's stream-ordered discipline
+    // (kernel_tq.cu:1652-1657): a later launch on this stream cannot
+    // observe the freed blocks.
+    return {codes_lo, codes_hi, norms};
+}

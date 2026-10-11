@@ -1042,7 +1042,14 @@ COMMIT: "W20.7.3 — inlined butterfly + bfi packing (layout
 fixture-pinned)"
 
 #### W20.7.4 — the batched entry + bindings (grid Σ tiles, overshoot-guarded)
-- [ ] done
+- [x] done
+Returns std::tuple<codes_lo, codes_hi, norms>. The zero-norm branch =
+a separate appended sweep kernel launched LAST (7.3's banner assigned
+the branch to 7.4; exact IEEE norms[m]==0; the underflow-degenerate
+case is the sweep's real work). Signs passed IN by the dispatcher
+(never generated in C++). Open for W20.8: full-length boundary
+mirrors even for empty halves; y workspace 2 MiB/unit (chunk if
+VRAM-tight).
 ROLE task-writer · READ `kernel_tq.cu` (7.1–7.3), `bindings.cpp`
 (binding conventions) · WRITE `kernel_tq.cu`, `bindings.cpp`
 BRIEF: `tq_quant_batched(units, d, books, out_codes, out_norms)`: one
