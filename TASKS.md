@@ -1680,6 +1680,115 @@ re-derivation touched exactly the two lines the box measured false,
 with the arithmetic written down. The box re-runs the suite + the
 gates as the only verdicts there are.
 
+## WAVE W20.14 — the M1/M2 discrimination metric (post-finetune handover)
+
+Goal: the A10G box's M1/M2 gate fine-tune completes (300 steps, 573 s,
+no OOM, live gradients, gates moving) but reports cos(pos) ≡ cos(neg)
+EXACTLY at every step and held-out spread 0.0000 — "fails to learn
+discrimination". Root cause: NOT a learning failure. The held-out
+metric `cosine_spread` v1 computed the (B,) TRUE-pair cosine vector and
+reported the "negatives" as that SAME vector rolled by one — a roll is
+a permutation, and a permutation's mean is identical, so pos == neg
+EXACTLY by construction, for ANY model, at ANY step (the 0.615/0.615
+... 0.4801/0.4801 table is this identity, not evidence). The LOSS was
+always correct (infonce_pairs_loss: the full B×B sim matrix, diagonal
+targets, in-batch negatives off-diagonal — unchanged, pinned by the
+W17/W19 gates), and the box's below-ln(8) losses (1.40, 0.97, ...) were
+real ranking signal the metric could not see. The loss oscillation is
+the capture pool cycling (refresh_every=4) sampled at log_every=25 —
+25 mod 4 = 1 walks the pool phases; an artifact, not divergence.
+
+Also landed: the data-quality audit of `data/pairs.jsonl` (33,595 rows
+— clean: 0 schema problems, 0 duplicate/conflicting/cross-order pairs,
+47.9%/52.1% pos/neg balance, uniform decile profile so the positional
+val split is sound, 0.1% in-batch text-sharing windows, 3.2% val↔train
+exact-text overlap, 13 self-pairs; the 17,519 label-0 rows are UNUSED
+by the v1 loader — free eval capacity, recorded below). And the H6
+knob (`--train-layers`) for the box's isolate-single-layer experiment.
+
+#### W20.14.1 — cosine_spread: the roll bug
+- [x] done
+ROLE finetune owner · READ `m1m2_finetune.py` (the v1 metric body),
+the box handover's exact-equality table · WRITE `m1m2_finetune.py`
+BRIEF: negatives are now the OFF-DIAGONAL mean of the same B×B sim
+matrix the InfoNCE trains on (every other pair's b-side) — the metric
+scores exactly the discrimination the loss optimizes. Shared
+`_pair_sim_stats` helper; the b<2 branch keeps NaN loudness.
+INVARIANTS: `infonce_pairs_loss` byte-untouched; the public
+cosine_spread signature unchanged (the driver and train_gates call
+sites stay).
+DO-D: `rg "shifted = sim.roll" m1m2_finetune.py` zero hits;
+`rg "_pair_sim_stats"` hits; py_compile green.
+COMMIT: "W20.14.1 — cosine_spread: the roll bug (a permutation's mean
+is identical — pos==neg at every step by construction)"
+
+#### W20.14.2 — the trainer instrumentation (the box can finally see)
+- [x] done
+ROLE finetune owner · WRITE `m1m2_finetune.py`
+BRIEF: every history entry carries the _pair_sim_stats fields
+(cos_pos/cos_neg/spread/off_max/diag_min — the hardest negative and
+the weakest true pair ride along) + the pool phase (the 1-based
+refresh-cycle position). The log line prints spread + worst-neg +
+weakest-pos + pool — the loss-oscillation explainer is now visible
+per step.
+INVARIANTS: the capture/replay/backward cadence, the W18 exactness
+contract, the W19 pool contract all untouched; `del` of the replay
+graphs stays after the metrics are read.
+DO-D: py_compile green; `rg '"pool": steps_on_batch'` hits.
+COMMIT: "W20.14.2 — the trainer instrumentation: _pair_sim_stats into
+every history entry (...) + the pool phase"
+
+#### W20.14.3 — the H6 knob: train_layers
+- [x] done
+ROLE finetune owner · WRITE `m1m2_finetune.py`, `scripts/gpu/finetune_m1m2.py`
+BRIEF: GatesTrainConfig.train_layers (None = all) + driver
+--train-layers ('all' / '5' / '0-11,16'): the write gates outside the
+subset get zeroed grads after backward (BEFORE the |g| read, so the
+instrumentation reports the applied gradient; weight_decay=0 default
+keeps masked gates bit-anchored). The box's "isolate single layer /
+does the shared signal average out" experiment is one flag per run.
+Out-of-range indices are a loud refusal.
+INVARIANTS: default path (train_layers=None) is behavior-identical to
+W20.13.5.
+DO-D: py_compile green on both files.
+COMMIT: "W20.14.3 — the H6 knob: GatesTrainConfig.train_layers +
+--train-layers (...)"
+
+#### W20.14.4 — the box-run regression gates (AUTHORED, PENDING)
+- [x] done
+ROLE test author · WRITE `src/rag/tests/test_w19_finetune.py`
+BRIEF: test_w19f_7 — the rigged batch (true pairs share directions,
+cross pairs independent): pos≈1, neg≈0, spread>0.8, off_max<0.6
+(v1 reported neg == pos == 1.0 here — the regression pin);
+test_w19f_8 — the history fields + pool values + the train_layers
+bit-anchor contract (masked layers torch.equal, unmasked moves) +
+the out-of-range ValueError. Statuses: AUTHORED on this box, PENDING
+on the A10G box (the only place they run).
+DO-D: py_compile green; the two test names grep-hit.
+COMMIT: "W20.14.4 — the box-run regression gates (AUTHORED, PENDING)"
+
+#### W20.14.5 — the wave close
+- [x] done
+ROLE orchestrator · WRITE `scripts/w20_static_audit.py` (the W20.14
+CHECKS: the roll absent, the stats/grep + py_compile fleet, the
+ledger, the five commit prefixes, the tag; PLUS the W20.12 stale
+check re-pinned — the box operator's post-finetune push 8e73674
+replaced the W20 summary handover with the post-finetune handover,
+the retired heading stays a git fact on w20-complete), `TASKS.md`
+(this section + the §5 line), `HANDOVER.md` (the box re-run sequence,
+rebased atop the operator's handover)
+DO-D: `python3 scripts/w20_static_audit.py --wave W20.14` exit 0 AND
+`--all` exit 0; tag `w20-wave-14` pushed.
+COMMIT: "W20.14.5 — wave W20.14 closed: the discrimination was always
+there; the metric can finally see it"
+
+Box open items carried (NOT this wave's scope, recorded for the next):
+the label-0 rows as an eval cohort (a held-out pos/neg discrimination
+report is now one small driver change, post-verification); the 3.2%
+val↔train exact-text overlap (a dedup pass, if the box wants a cleaner
+held-out number); the read_gate contrastive path (needs the aux-NLL
+term, the driver's --aux-nll-weight was specced in W17 and deferred).
+
 ## 5. The attestation ledger (the no-CPU-test law, per wave)
 
 One line per wave close, written by the orchestrator, only when
@@ -1701,6 +1810,7 @@ truthful (PROMPT.md §1.4):
 | W20.11 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.11 exit 0 (12/12, re-verified post-tag); push w20-wave-11 |
 | W20.12 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.12 exit 0 (8/8, re-verified post-tag) AND --all exit 0 (the full 13-wave re-check in one pass); push w20-wave-12 implicit in the w20-complete tag sequence |
 | W20.13 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (the g++/py_compile/static-audit vehicles only); auditor --wave W20.13 exit 0 (26/26, re-verified post-tag) AND --all exit 0 (the full 14-wave re-check in one pass); push w20-wave-13 |
+| W20.14 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile/static-audit vehicles + a pure-stdlib jsonl read of the training DATA, no repo code); auditor --wave W20.14 exit 0 (22/22, re-verified post-tag) AND --all exit 0 (the full 15-wave re-check in one pass); push w20-wave-14 |
 
 Line format: `CLOSED <date> — no test executed, no CPU test authored,
 no repo module imported on this box; auditor --wave W20.<n> exit 0;

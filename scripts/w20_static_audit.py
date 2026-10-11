@@ -788,8 +788,13 @@ CHECKS = {
     # W20.12 — closure (appended at W20.12.2)
     "W20.12": [
         # W20.12.1 — the handover + spec addendum
+        # W20.14.5: the box operator's post-finetune push (8e73674)
+        # legitimately REPLACED the W20 summary handover with the
+        # post-finetune handover (the "spread 0" report W20.14 answers)
+        # — the check now pins the LIVE handover's W20 lineage; the
+        # retired heading stays a git fact on the w20-complete tag.
         {"kind": "grep", "target": "HANDOVER.md",
-         "pattern": r"## W20 — the complete wave summary"},
+         "pattern": "Fails to Learn Discrimination"},
         {"kind": "grep", "target": "SPECIFICATION.md",
          "pattern": "W20 implementation status"},
         # W20.12.2 — the final audit facts
@@ -847,6 +852,49 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.13.4 —"},
         {"kind": "git_log", "target": "W20.13.5 —"},
         {"kind": "git_tag", "target": "w20-wave-13"},
+    ],
+    # W20.14 — the box-feedback M1/M2 discrimination-metric wave (the
+    # post-finetune handover: cos(pos) == cos(neg) EXACTLY at every step)
+    "W20.14": [
+        # W20.14.1 — the roll bug fixed (the metric that could not see)
+        {"kind": "absent", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"shifted = sim\.roll"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": "THE ROLL BUG"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"def _pair_sim_stats"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"off-diagonal"},
+        {"kind": "py_compile", "target": "src/rag/m1m2_finetune.py"},
+        # W20.14.2 — the instrumentation
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": "\"off_max\": float\\(off\\.max\\(\\)\\)"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": "\"pool\": steps_on_batch"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": "aliases the pool cycle"},
+        # W20.14.3 — the layer mask (the H6 knob)
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": "train_layers: Optional\\[Sequence\\[int\\]\\]"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": "p\\.grad\\[~keep_mask\\] = 0"},
+        {"kind": "grep", "target": "scripts/gpu/finetune_m1m2.py",
+         "pattern": r"--train-layers"},
+        {"kind": "py_compile", "target": "scripts/gpu/finetune_m1m2.py"},
+        # W20.14.4 — the box-run regression gates (AUTHORED, PENDING)
+        {"kind": "grep", "target": "src/rag/tests/test_w19_finetune.py",
+         "pattern": "test_w19f_7_cosine_spread_measures_the_in_batch"},
+        {"kind": "grep", "target": "src/rag/tests/test_w19_finetune.py",
+         "pattern": "test_w19f_8_history_carries_the_w2014_fields"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_w19_finetune.py"},
+        # W20.14.5 — the wave close
+        {"kind": "ledger", "target": "W20.14"},
+        {"kind": "git_log", "target": "W20.14.1 —"},
+        {"kind": "git_log", "target": "W20.14.2 —"},
+        {"kind": "git_log", "target": "W20.14.3 —"},
+        {"kind": "git_log", "target": "W20.14.4 —"},
+        {"kind": "git_log", "target": "W20.14.5 —"},
+        {"kind": "git_tag", "target": "w20-wave-14"},
     ],
 }
 

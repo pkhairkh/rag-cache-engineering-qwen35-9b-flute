@@ -264,3 +264,93 @@ python3 scripts/gpu/finetune_m1m2.py \
 - **M1/M2 discrimination: ❌ Spread = 0 at all steps**
 
 The system is functionally complete and stable. The only remaining work is debugging why the contrastive objective isn't producing discriminative M1/M2 states. The loss surface may have another saddle point, or the state construction may be collapsing diversity.
+
+## W20.14 — the M1/M2 discrimination metric: the roll bug (CLOSED 2026-10-12)
+
+The post-finetune handover read "M1/M2 fails to learn discrimination —
+cos(pos) ≡ cos(neg) at every step, held-out spread 0.0000". The root
+cause is a METRIC identity, not a learning failure: `cosine_spread` v1
+computed the (B,) true-pair cosine vector and reported the "negatives"
+as that SAME vector rolled by one. A roll is a permutation; a
+permutation's mean is the same mean; so cos(pos) == cos(neg) EXACTLY,
+at every step, for ANY model — the metric was structurally incapable
+of reporting a spread. The InfoNCE loss was always correct (the full
+B×B matrix, diagonal targets — unchanged this wave), and the box's
+below-ln(8) losses (1.40, 0.97, ...) were real ranking signal the
+metric hid. The loss oscillation is the capture pool cycling
+(refresh_every=4) sampled at log_every=25 — 25 mod 4 = 1 walks the
+pool phases; artifact, not divergence.
+
+What landed (W20.14.1–.5, tag `w20-wave-14`):
+
+1. **cosine_spread fixed** (`src/rag/m1m2_finetune.py`): the negatives
+   are now the OFF-DIAGONAL mean of the same B×B sim matrix the loss
+   trains on (shared `_pair_sim_stats` helper) — the metric scores
+   exactly the discrimination the loss optimizes.
+2. **Trainer instrumentation**: every history entry carries
+   cos_pos/cos_neg/spread/off_max/diag_min + the pool phase; the log
+   line prints them (`m1m2_gates_trained_history.json` gets the same
+   fields — the box's post-hoc analysis reads them).
+3. **The H6 knob**: `--train-layers '5'` / `'0-11,16'` /
+   `'all'` — write-gate layer-subset training (masked gates
+   bit-anchored: zero grads + weight_decay 0). The
+   isolate-single-layer experiment is one flag per run.
+4. **Regression gates** (`test_w19_finetune.py`, AUTHORED — PENDING on
+   the box): test_w19f_7 (the rigged batch: pos≈1, neg≈0 — v1 reported
+   neg == pos == 1.0), test_w19f_8 (history fields, pool values, the
+   mask's bit-anchor contract, the out-of-range refusal).
+
+**The data verdict** (the handover's question — `data/pairs.jsonl`,
+audited with a pure-stdlib read on the dev box): GOOD. 33,595 rows /
+16,076 positive / 17,519 negative; zero schema problems; zero
+duplicate rows; zero same-pair conflicting labels; zero cross-order
+duplicates; balanced 47.9/52.1; short QA-style members (median 17-22
+words — nothing truncates at 256 tokens); unique 29,398/30,292 texts
+with only mild hub reuse (max ×15-19); in-batch text-sharing windows
+2/2009 (0.1% — negligible false-negative risk); uniform decile profile
+(pos-rate 0.46-0.50, stable lengths — the positional val split is
+sound); 13 self-pairs. Two honest caveats: 912 train-pair members
+(3.2%) share an exact text with the val split (mildly optimistic
+held-out numbers — dedup if it matters), and the 17,519 label-0 rows
+are UNUSED by the v1 loader (in-batch negatives only) — free held-out
+eval capacity, carried as the wave's open item.
+
+**The box re-run sequence** (no rebuild — the wave touches no CUDA):
+
+```
+cd /home/ubuntu/RAGGA
+git pull --ff-only origin main          # >= W20.14.5
+source /home/ubuntu/venv/bin/activate
+python3 -m pytest src/rag/tests/w20 -q          # unchanged, all green
+python3 -m pytest src/rag/tests -q              # 260 + the 2 new W20.14 gates
+
+# the re-measure (the SAME command as the handover's failing run):
+python3 scripts/gpu/finetune_m1m2.py \
+    --pairs-file data/pairs.jsonl \
+    --gates-out m1m2_gates_trained.npz \
+    --m1m2-mem-size 1024 \
+    --max-steps 300 \
+    --refresh-every 4 \
+    --gate-init 0.1
+```
+
+What to expect, and what each number now means:
+
+* **cos(neg) is no longer cos(pos) with a label** — it is the mean
+  off-diagonal sim (the exact negatives the loss trains against).
+  EXPECT: cos(pos) in the 0.4-0.6 band you already saw, cos(neg)
+  below it, spread > 0 growing through the run. If the spread is
+  positive and rising, the §7 objective is doing what the spec wants
+  and the prior "0.0000" was the metric.
+* **spread/off_max/diag_min + pool in every log line and in
+  `m1m2_gates_trained_history.json`** — worst-neg vs weakest-pos is
+  the per-step margin; pool 1/4..4/4 explains the loss sawtooth
+  (fresh capture = loss jump; same pool = descent).
+* **The H6 experiment**, if wanted: rerun with `--train-layers 5`
+  (or any subset) and compare the final spread — per-layer signal
+  vs the shared-gate average, one run per subset.
+
+File the numbers verbatim (history json + the [5] held-out line);
+if the held-out gap is still ~0 with the fixed metric, THEN it is a
+real learning question and the next wave starts from the deltas
+(hypotheses H1/H2 — the state construction itself), not the metric.
