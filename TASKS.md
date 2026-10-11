@@ -1142,7 +1142,16 @@ COMMIT: "W20.8.2 — the kernel-first dispatcher (torch = the twin, the
 CPU path)"
 
 #### W20.8.3 — test_w20_tq_kernels.py (CUDA-gated; G20.P3/G20.4 thresholds)
-- [ ] done
+- [x] done
+Twin mechanism: a contextmanager monkeypatch of the dispatcher's ONE
+probe (turboquant._tq_kernel_available → False) — the same
+TurboQuant instance serves both legs (same signs/codebooks/seed; only
+routing flips). The phase-1 gates G20.1/G20.2 run a SHORT finetune
+(finetune_m1m2.py --self-test --max-steps 8) and read the history
+phase timers; refresh-8 + 300-step legs recorded not-evaluated
+(W20.11 full) — never silently passed. G20.1's TQ-share leg is timed
+in-process (CUDA events) since phase timers cannot isolate TQ from
+the model forward. Remaining stubs: G20.3, G20.5.
 ROLE task-writer · READ `_gpu_guard.py`, the fixtures, `PROPOSAL.md §5`
 · WRITE `src/rag/tests/w20/test_w20_tq_kernels.py` (new),
 `scripts/gpu/w20_gates.py` (extend: G20.P3 — kernel quant+dequant
