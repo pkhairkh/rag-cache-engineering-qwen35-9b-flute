@@ -441,3 +441,24 @@ parity with the tie budget as the faithful codes threshold, l2norm ≤
 Tier-G: the QJL gates fold into G20.P3's scope (noted in §4). Wave
 DoD: Tier-D 15/15 post-tag; attestation truthful. Next: W20.10 — the
 serving-side batched passes (K4 end, G20.5).
+
+## W20.10 — the serving side batched, K4 COMPLETE (CLOSED 2026-10-11)
+
+The serving sites ride the batched entries: install's requant folds
+(one chain per unit-kind geometry — the W16 copy paths untouched,
+the CPU legacy fold verbatim for non-kernel boxes); index's frame
+vector builds (grouped by quantizer identity → one batched dequant
+per group; the frame normalize via tq_l2norm_rows with the torch
+fallback; the 4 FAISS-EDGE hops unchanged — faiss fed once at the
+boundary); evals' sweep blocks (one quant + one dequant over the
+whole block, the per-vector mse a single device reduction; the CPU
+fallback verbatim).
+
+G20.5 AUTHORED — PENDING: the protocol-integrity gate (TRAIN →
+RE-INGEST ×2 → INDEX → EVAL → QUERY as subprocess stages; the npz
+digest sets stable run-to-run — the digest surface excludes only
+meta's saved_at, the format's own determinism surface; the
+cross-backend decode allclose 1e-5; the W16 verbatim install's
+digest equality within the backend). 8 of 9 gates authored (G20.3
+remains — W20.11). Wave DoD: Tier-D 17/17 post-tag; attestation
+truthful. Next: W20.11 — the trainer levers (K5).

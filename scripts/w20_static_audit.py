@@ -739,7 +739,34 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.9.4 —"},
         {"kind": "git_tag", "target": "w20-wave-9"},
     ],
-    # W20.10 … W20.12 — appended by each wave's close-out task.
+    # W20.10 — the serving-side batched passes (appended at W20.10.4)
+    "W20.10": [
+        {"kind": "grep", "target": "src/rag/install.py",
+         "pattern": "tq_quant_batched|tq_dequant_batched|_tq_kernel_available"},
+        {"kind": "absent", "target": "src/rag/install.py",
+         "pattern": r"np\.|numpy|\.item\(\)"},
+        {"kind": "py_compile", "target": "src/rag/install.py"},
+        {"kind": "grep", "target": "src/rag/index.py",
+         "pattern": "tq_l2norm_rows|tq_dequant_batched|_tq_kernel_available"},
+        {"kind": "grep", "target": "src/rag/index.py",
+         "pattern": "FAISS-EDGE"},
+        {"kind": "py_compile", "target": "src/rag/index.py"},
+        {"kind": "grep", "target": "src/rag/evals.py",
+         "pattern": "tq_quant_batched|tq_dequant_batched|_tq_kernel_available"},
+        {"kind": "py_compile", "target": "src/rag/evals.py"},
+        {"kind": "grep", "target": "scripts/gpu/w20_gates.py",
+         "pattern": "gate_g20_5"},
+        {"kind": "grep", "target": "scripts/gpu/w20_gates.py",
+         "pattern": "NOT-AUTHORED-YET"},
+        {"kind": "py_compile", "target": "scripts/gpu/w20_gates.py"},
+        {"kind": "ledger", "target": "W20.10"},
+        {"kind": "git_log", "target": "W20.10.1 —"},
+        {"kind": "git_log", "target": "W20.10.2 —"},
+        {"kind": "git_log", "target": "W20.10.3 —"},
+        {"kind": "git_log", "target": "W20.10.4 —"},
+        {"kind": "git_tag", "target": "w20-wave-10"},
+    ],
+    # W20.11 … W20.12 — appended by each wave's close-out task.
 }
 
 

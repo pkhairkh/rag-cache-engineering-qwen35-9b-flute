@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: IN EXECUTION — 10/13 waves closed (W20.0–W20.9).
+Status: IN EXECUTION — 11/13 waves closed (W20.0–W20.10).
 
 ---
 
@@ -26,7 +26,7 @@ Status: IN EXECUTION — 10/13 waves closed (W20.0–W20.9).
 | W20.7 | K3 | tq_quant_batched (the fused encode) | 5 | — | CLOSED |
 | W20.8 | K3 | tq_dequant_batched + dispatcher | 4 | G20.P3, G20.1, G20.2, G20.4 | CLOSED |
 | W20.9 | K4 | QJL kernel chain + tq_l2norm_rows | 4 | — | CLOSED |
-| W20.10 | K4 | serving-side batched passes | 4 | G20.5 | OPEN |
+| W20.10 | K4 | serving-side batched passes | 4 | G20.5 | CLOSED |
 | W20.11 | K5 | trainer levers (refresh 8, loader pinning) | 3 | G20.2 full, G20.3 | OPEN |
 | W20.12 | closure | handover + final all-DoD audit | 3 | — | OPEN |
 
@@ -1312,7 +1312,7 @@ hit; the scoped numpy grep clean; py_compile.
 COMMIT: "W20.10.3 — the eval harness batched"
 
 #### W20.10.4 — wave close W20.10 (G20.5 authored)
-- [ ] done
+- [x] done
 ROLE orchestrator · standard close-out + the harness extension
 (G20.5: protocol integrity — TRAIN → RE-INGEST → INDEX → EVAL → QUERY
 end-to-end on the kernel path; npz digests stable run-to-run;
@@ -1448,7 +1448,7 @@ failure). A gate turns GREEN/RED **only** from
 | G20.2 | step time + the 300-step run | step ≤ 2 s after K3; ≤ 1 s at refresh 8; 300 steps ≤ 10 min | W20.8 (phase-1) / W20.11 (full) | AUTHORED — PENDING (phase-1; the refresh-8 + 300-step legs evaluate W20.11) |
 | G20.3 | W19 convergence (re-run on the kernel path) | loss leaves ln(8) at step 0; gk/gv_absmax > 0; held-out spread positive | W20.11 | NOT-AUTHORED |
 | G20.4 | the parity contract (levels 1–2) | level 1: run-to-run `torch.equal` (codes + recon, kernel); level 2: ties ≤ 0.01%, norm ≤ 1 ulp, allclose ≤ 1e-5 | W20.8 | AUTHORED — PENDING (awaiting the A10G box report) |
-| G20.5 | protocol integrity | TRAIN → RE-INGEST → INDEX → EVAL → QUERY on the kernel path; npz digests stable run-to-run; cross-backend decode allclose ≤ 1e-5; W16 verbatim install bit-exact within backend | W20.10 | NOT-AUTHORED |
+| G20.5 | protocol integrity | TRAIN → RE-INGEST → INDEX → EVAL → QUERY on the kernel path; npz digests stable run-to-run; cross-backend decode allclose ≤ 1e-5; W16 verbatim install bit-exact within backend | W20.10 | AUTHORED — PENDING (awaiting the A10G box report; the digest surface excludes only the meta's saved_at provenance field — the format's own determinism surface) |
 | G20.6 | canary/trap | canary build: zero poison survives; trap build: FAILS the determinism gate (the negative control must fail) | W20.6 | AUTHORED — PENDING (the variants must be built on the box first — scripts/gpu/w20_build_variants.sh) |
 
 The capture (W20.1) and the 237-suite baseline are protocol steps, not
@@ -1471,7 +1471,7 @@ truthful (PROMPT.md §1.4):
 | W20.7 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.7 exit 0 (17/17, re-verified post-tag; the module-wide atomics-free absent-check green); compile deferred to the A10G box; push w20-wave-7 |
 | W20.8 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.8 exit 0 (21/21, re-verified post-tag); push w20-wave-8 |
 | W20.9 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.9 exit 0 (15/15, re-verified post-tag); push w20-wave-9 |
-| W20.10 | — (pending) |
+| W20.10 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.10 exit 0 (17/17, re-verified post-tag); push w20-wave-10 |
 | W20.11 | — (pending) |
 | W20.12 | — (pending) |
 

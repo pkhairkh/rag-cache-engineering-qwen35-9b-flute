@@ -38,11 +38,15 @@ build-script pointer -- a gate is never skippable); G20.P3 + G20.4
 vs the torch twin over the geometry ladder and the batched-grid
 shapes (120-192 units), the parity contract's levels 1-2, and the
 PHASE-1 performance timers read from a finetune_m1m2.py short-run
-history -- full confirmation after K4/K5 per TASKS.md §4). The
-remaining 2 gates (G20.5, G20.3) are NOT-AUTHORED stubs -- their
-waves (W20.10, W20.11) extend GATE_RUNNERS; invoking a stub prints
-"G20.<id>: NOT-AUTHORED-YET (authored in <wave> per TASKS.md §4)"
-and the harness exits 2.
+history -- full confirmation after K4/K5 per TASKS.md §4); G20.5
+(W20.10: the protocol integrity gate -- the TRAIN -> RE-INGEST ->
+INDEX -> EVAL -> QUERY chain as subprocesses of the protocol's own
+scripts on the kernel path, the npz digest stability across two true
+RE-INGEST runs, the cross-backend decode differential, and the W16
+verbatim install digest). The remaining gate (G20.3) is a
+NOT-AUTHORED stub -- its wave (W20.11) extends GATE_RUNNERS; invoking
+a stub prints "G20.<id>: NOT-AUTHORED-YET (authored in <wave> per
+TASKS.md §4)" and the harness exits 2.
 """
 from __future__ import annotations
 
@@ -165,7 +169,7 @@ GATE_REGISTRY: Dict[str, Dict[str, str]] = {
     "G20.4": {"contract": "the parity contract (levels 1-2)",
               "authored_in": "W20.8", "status": "AUTHORED"},
     "G20.5": {"contract": "protocol integrity",
-              "authored_in": "W20.10", "status": "NOT-AUTHORED"},
+              "authored_in": "W20.10", "status": "AUTHORED"},
     "G20.6": {"contract": "canary/trap",
               "authored_in": "W20.6", "status": "AUTHORED"},
 }
@@ -2033,9 +2037,537 @@ def gate_g20_6(device: Dict[str, Any]) -> Dict[str, Any]:
                         summary)
 
 
+# ------------------------------------------------------------ G20.5 -------
+# The protocol chain (TASKS.md §4 G20.5, env/W20_GPU_PROTOCOL.md): TRAIN
+# -> RE-INGEST -> INDEX -> EVAL -> QUERY, each stage the protocol's own
+# script as a subprocess, in order, on the kernel path (the built TQ
+# kernel pair is asserted FIRST -- a chain served on the torch fallback
+# is not the chain the row contracts). Then the two in-process legs: the
+# cross-backend decode differential (the _torch_twin one-probe mechanism)
+# and the W16 verbatim install digest. Every artifact lives under the
+# gate's own root inside DEFAULT_REPORT_DIR (gitignored BY DESIGN --
+# box-written, never committed).
+_G20_5_ARTIFACT_ROOT = DEFAULT_REPORT_DIR / "g20_5_protocol"
+_G20_5_SCRIPTS: Dict[str, Path] = {
+    "RE-INGEST": REPO_ROOT / "scripts" / "gpu" / "run_ingestion.py",
+    "INDEX": REPO_ROOT / "scripts" / "gpu" / "run_index.py",
+    "EVAL": REPO_ROOT / "scripts" / "gpu" / "eval_retrieval.py",
+    "QUERY": REPO_ROOT / "scripts" / "gpu" / "run_query.py",
+}
+_G20_5_M1M2_MEM = 1024             # TRAIN's own default -- the SAME rule
+_G20_5_N_DOCS = 4                  # the tiny synthetic corpus (4 documents)
+_G20_5_MAX_TOKENS = 64             # truncated documents -- the run stays SMALL
+_G20_5_N_QUESTIONS = 2             # the EVAL leg's question count
+_G20_5_TOP_K = 3                   # the rerank width (EVAL + QUERY)
+_G20_5_QUERY_TOKENS = 8            # the QUERY leg's decode budget
+_G20_5_STAGE_TIMEOUT_S = 1800.0    # model load + a tiny corpus, generous
+_G20_5_STDOUT_TAIL = 12            # the stages' own phase lines, recorded
+_G20_5_QUERY_QUESTION = ("What does the query flow install before it "
+                         "decodes a short answer?")
+# the tiny synthetic corpus: deterministic fixed text; the ids map 1:1 to
+# the chunk ids by line order (eval_retrieval's own gold-mapping rule)
+_G20_5_CORPUS = (
+    ("g20-5-doc-00",
+     "Protocol integrity probe document zero. The ingestion driver "
+     "tokenizes this deterministic paragraph, runs the prefill through "
+     "the quantized cache, and stores the chunk codes as an absolute "
+     "snapshot. The system reset point rides system state npz and the "
+     "manifest pins the chunk protocol for every later stage."),
+    ("g20-5-doc-01",
+     "Protocol integrity probe document one. The index builder reads "
+     "every chunk snapshot, dequantizes the retrieval vector one "
+     "candidate at a time, and writes the centered frame as a side file "
+     "next to the manifest. Query time loads that frame before it "
+     "reranks the candidates."),
+    ("g20-5-doc-02",
+     "Protocol integrity probe document two. The evaluation harness "
+     "scores retrieval quality question by question, recording the top "
+     "three identifiers and the spread between the best and the worst "
+     "score for every frame it measures."),
+    ("g20-5-doc-03",
+     "Protocol integrity probe document three. The query flow reseeds a "
+     "fresh cache from the system state, encodes the question, reranks "
+     "the corpus, installs the top chunk verbatim, and decodes a short "
+     "answer under a fixed token budget."),
+)
+_G20_5_QUESTIONS = (
+    ("Which artifact carries the system reset point and pins the chunk "
+     "protocol for every later stage?", "g20-5-doc-00"),
+    ("What does the index builder write as a side file next to the "
+     "manifest before query time loads it?", "g20-5-doc-01"),
+)
+
+
+def _g20_5_synthetic_corpus() -> Dict[str, str]:
+    """The tiny deterministic corpus + gold questions (the protocol
+    scripts demand data; the gate keeps the runs SMALL): 4 fixed-text
+    documents + 2 gold questions written under the gate's artifact root
+    (gitignored BY DESIGN, box-written). Same bytes every call -- the
+    two RE-INGEST runs and the EVAL leg all read this one file."""
+    _G20_5_ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+    corpus = _G20_5_ARTIFACT_ROOT / "documents.jsonl"
+    questions = _G20_5_ARTIFACT_ROOT / "questions.jsonl"
+    corpus.write_text("".join(
+        json.dumps({"id": did, "text": text}) + "\n"
+        for did, text in _G20_5_CORPUS), encoding="utf-8")
+    questions.write_text("".join(
+        json.dumps({"text": q, "expected_doc_ids": [gold]}) + "\n"
+        for q, gold in _G20_5_QUESTIONS), encoding="utf-8")
+    return {"corpus": str(corpus), "questions": str(questions)}
+
+
+def _g20_5_run_stage(stage: str, cmd: List[str]) -> Dict[str, Any]:
+    """One protocol stage as a subprocess (the _run_finetune_short
+    discipline: cwd = repo root, captured output, generous timeout): the
+    record carries the stage name, the exact cmd, the exit code, the
+    stdout tail + its LAST line (the metrics contract: every stage's
+    exit code + tail line), the stderr prefix and the duration -- a
+    broken stage FAILs the gate, never a silent skip."""
+    cmd = [str(c) for c in cmd]
+    print(f"[G20.5]   $ {' '.join(cmd)}  (cwd {REPO_ROOT}, timeout "
+          f"{_G20_5_STAGE_TIMEOUT_S:.0f} s)")
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True,
+                              text=True, timeout=_G20_5_STAGE_TIMEOUT_S)
+        rc, out, err = int(proc.returncode), proc.stdout or "", \
+            proc.stderr or ""
+    except subprocess.TimeoutExpired:
+        return {"stage": stage, "cmd": cmd, "returncode": None,
+                "stdout_tail": None, "tail_line": None,
+                "stderr": f"TIMEOUT after {_G20_5_STAGE_TIMEOUT_S:.0f} s",
+                "duration_s": round(time.monotonic() - t0, 1)}
+    except OSError as exc:
+        return {"stage": stage, "cmd": cmd, "returncode": None,
+                "stdout_tail": None, "tail_line": None,
+                "stderr": f"launch failure: {exc!r}",
+                "duration_s": round(time.monotonic() - t0, 1)}
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    return {"stage": stage, "cmd": cmd, "returncode": rc,
+            "stdout_tail": "\n".join(lines[-_G20_5_STDOUT_TAIL:]),
+            "tail_line": lines[-1] if lines else "(no stdout)",
+            "stderr": err.strip()[:2000],
+            "duration_s": round(time.monotonic() - t0, 1)}
+
+
+def _g20_5_npz_digest(path: Path) -> str:
+    """sha256 over ONE npz's members in canonical (sorted-key) order,
+    with the meta JSON's `saved_at` removed first -- the snapshot
+    format's own determinism contract (snapshot.py: the same inputs give
+    byte-identical files EXCEPT the single saved_at UTC ISO string,
+    deliberately excluded from the format's own digest too). The digest
+    covers every code member byte + the normalized meta; run-to-run
+    equality IS the level-1 bit-stability contract at the protocol
+    level."""
+    import numpy as np  # the box stack, post-assert (the P1 discipline)
+    h = hashlib.sha256()
+    with np.load(str(path), allow_pickle=False) as z:
+        for key in sorted(z.files):
+            h.update(key.encode("utf-8"))
+            if key == "meta":
+                meta = json.loads(str(z[key].item()))
+                meta.pop("saved_at", None)  # the ONE call-varying field
+                h.update(json.dumps(meta, sort_keys=True,
+                                    separators=(",", ":")).encode("utf-8"))
+            else:
+                h.update(np.ascontiguousarray(z[key]).tobytes())
+    return h.hexdigest()
+
+
+def _g20_5_npz_digests(out_dir: Path) -> Dict[str, str]:
+    """The digest table over every npz the RE-INGEST stage produced
+    under out_dir (system_state.npz + snapshots/chunk_*.npz), keyed by
+    the path relative to the run's own out-dir."""
+    return {p.relative_to(out_dir).as_posix(): _g20_5_npz_digest(p)
+            for p in sorted(out_dir.rglob("*.npz"))}
+
+
+def _g20_5_codes_digest(codes: Any) -> str:
+    """sha256 over ONE TQCodes' tensor members (the packed idx streams,
+    the norms, the outlier split's norm_hi/mask when present), host
+    bytes, device-agnostic -- the within-backend bit-exactness surface
+    for the W16 verbatim install leg."""
+    import numpy as np  # the box stack, post-assert (the P1 discipline)
+    h = hashlib.sha256()
+    for name in ("idx_lo", "idx_hi", "norm", "norm_hi", "mask"):
+        t = getattr(codes, name, None)
+        if t is None:
+            continue
+        h.update(name.encode("utf-8"))
+        h.update(np.ascontiguousarray(
+            t.detach().to("cpu").numpy()).tobytes())
+    return h.hexdigest()
+
+
+class _G20_5RecordingCache:
+    """The install-stage probe's cache stand-in: the real TQCache's
+    setters are placement-only by contract (W20.4.1/.2 -- CODE-COPY, the
+    cache owns placement), so the codes AT THE SETTER are the installed
+    codes; this recorder captures them for the digest comparison without
+    standing up the 9B model. layers is empty: the qjl A/B probe finds
+    no layer, so the install rides the default False -- bit-identical to
+    the pre-W15 install."""
+
+    def __init__(self) -> None:
+        self.layers: List[Any] = []
+        self.s_installed: Dict[int, Any] = {}
+        self.conv_installed: Dict[int, Any] = {}
+        self.m1_codes: Any = None
+        self.m2_codes: Any = None
+
+    def set_s_codes(self, layer: int, codes: Any) -> None:
+        self.s_installed[int(layer)] = codes
+
+    def set_conv_codes(self, layer: int, codes: Any) -> None:
+        self.conv_installed[int(layer)] = codes
+
+
+def _g20_5_cross_backend_decode(th: Dict[str, Any]) -> Dict[str, Any]:
+    """The cross-backend decode leg: ONE seeded probe (the G20_P3_LADDER
+    production rung's own recipe: d=2^19, the recorded x/frame seeds)
+    quantized through the kernel path, then the SAME codes decoded
+    through the kernel path (the dispatcher) and the torch path (the
+    _torch_twin one-probe monkeypatch -- G20.P3's mechanism) -- §4's
+    allclose <= 1e-5 on the two decodes. The routing is recorded: a
+    torch-vs-torch pass would be vacuous and must read as such."""
+    tq = _REPO["turboquant"]
+    rtol = float(th["cross_backend_decode_allclose_rtol"])
+    atol = float(th["cross_backend_decode_allclose_atol"])
+    d, _, x_seed, frame_seed = G20_P3_LADDER[0]
+    q = _p3_quantizer(d, frame_seed)
+    x = _p3_units(1, d, x_seed)
+    codes = q.quant(x[0])                # the kernel-path encode
+    kernel_routed = bool(q._dequant_kernel_eligible(codes, torch.float32))
+    r_kernel = q.dequant(codes)          # the kernel-path decode
+    with _torch_twin():
+        r_torch = q.dequant(codes)       # the torch-path decode
+    allclose = bool(torch.allclose(r_kernel, r_torch, rtol=rtol, atol=atol))
+    max_abs_diff = float((r_kernel.to(torch.float32)
+                          - r_torch.to(torch.float32)).abs().max().item())
+    return {
+        "probe": "one seeded unit at the G20_P3_LADDER[0] rung (d=2^19, "
+                 "the production recipe), encoded through the kernel path",
+        "d": d, "x_seed": x_seed, "frame_seed": frame_seed,
+        "rtol": rtol, "atol": atol,
+        "kernel_routed": kernel_routed, "allclose": allclose,
+        "max_abs_diff": max_abs_diff,
+        "kernel_ext_probe": bool(tq._tq_kernel_available(codes.idx_lo)),
+    }
+
+
+def _g20_5_w16_verbatim_install(disk_dir: Path) -> Dict[str, Any]:
+    """The W16 verbatim install leg: ONE chunk (n=1, the absolute
+    protocol -- run_ingestion's default) through the install stage's own
+    convenience entry (install_from_disk: load_system_state + load_chunk
+    + install_snapshot, spec §6 steps 5-6), installed into the recording
+    cache; the digest table compares every installed unit (S per layer,
+    conv per layer, M1/M2 when the corpus carries them) against an
+    INDEPENDENT fresh load of the same snapshot npz -- within-backend
+    bit-exactness: the codes the cache receives are the codes on disk,
+    byte for byte, through the from_arrays hop twice."""
+    from install import install_from_disk, load_snapshot
+    snap_path = disk_dir / "snapshots" / "chunk_00000.npz"
+    cache = _G20_5RecordingCache()
+    report = install_from_disk(cache, str(disk_dir), [0])
+    snap = load_snapshot(str(snap_path))  # the independent reference load
+    units, bitexact = 0, 0
+    s_table, conv_table, memories = {}, {}, {}
+
+    def _unit(installed: Any, want: Any) -> Dict[str, Any]:
+        d_i = (_g20_5_codes_digest(installed)
+               if installed is not None else None)
+        d_s = _g20_5_codes_digest(want)
+        return {"installed": d_i, "snapshot": d_s, "bitexact": d_i == d_s}
+
+    for layer in sorted(snap.s_codes):
+        s_table[layer] = _unit(cache.s_installed.get(layer),
+                               snap.s_codes[layer])
+        units += 1
+        bitexact += int(s_table[layer]["bitexact"])
+    for layer in sorted(snap.conv_codes):
+        conv_table[layer] = _unit(cache.conv_installed.get(layer),
+                                  snap.conv_codes[layer])
+        units += 1
+        bitexact += int(conv_table[layer]["bitexact"])
+    for name in ("m1", "m2"):
+        want = getattr(snap, name + "_codes")
+        if want is None:
+            continue
+        memories[name] = _unit(getattr(cache, name + "_codes"), want)
+        units += 1
+        bitexact += int(memories[name]["bitexact"])
+    modes = {str(k): v.get("mode") for k, v in report.items()
+             if isinstance(v, dict)}
+    return {
+        "snapshot": str(snap_path), "protocol": str(snap.protocol),
+        "chunk_id": int(snap.chunk_id),
+        "s_digests": s_table, "conv_digests": conv_table,
+        "memory_digests": memories, "modes": modes,
+        "mode_summary": ", ".join(sorted(set(modes.values()))) or "(none)",
+        "n_units": units, "n_bitexact": bitexact,
+        "bitexact": units > 0 and bitexact == units,
+        "install_report": report,
+    }
+
+
+def gate_g20_5(device: Dict[str, Any]) -> Dict[str, Any]:
+    """G20.5 -- protocol integrity (TASKS.md §4's G20.5 row: "TRAIN ->
+    RE-INGEST -> INDEX -> EVAL -> QUERY on the kernel path; npz digests
+    stable run-to-run; cross-backend decode allclose <= 1e-5; W16
+    verbatim install bit-exact within backend"): the five stages run as
+    subprocesses of the protocol's own scripts, in §4's order --
+    finetune_m1m2.py's short run (the G20.1/2-established --self-test
+    invocation, shared per process) TRAINs and hands its trained-gates
+    artifact to run_ingestion.py's TWO RE-INGEST runs (a TRUE re-ingest:
+    the run dirs are wiped first -- the driver's manifest resume would
+    skip, not re-run; --m1m2-gates ... --m1m2-mem-size SAME per the
+    deployment protocol), then run_index.py, eval_retrieval.py and
+    run_query.py over run 1's disk dir, each stage's exit code + tail
+    line recorded as metrics. Then the two in-process legs: the
+    cross-backend decode differential and the W16 verbatim install
+    digest. Absent prerequisites (the extension, the model artifacts)
+    FAIL loudly with the pointer -- a gate is never skippable. A10G box
+    only."""
+    tq = _REPO["turboquant"]
+    th = THRESHOLDS["G20.5"]
+    _no_suite = {"invoked": False, "exit_code": None, "failures": None,
+                 "summary_line": None}
+    stages: Dict[str, Any] = {}
+
+    def _chain_fail(stage: str, rec: Dict[str, Any]) -> Dict[str, Any]:
+        why = f"the {stage} stage broke (returncode {rec.get('returncode')})"
+        print()
+        print("*" * 72)
+        print(f"G20.5 FAIL: {why}")
+        print("  The protocol chain needs the model artifacts and the "
+              "built kernel pair on this A10G box (env/W20_GPU_PROTOCOL.md).")
+        tail = rec.get("stdout_tail") or rec.get("stderr") or ""
+        for line in tail.splitlines()[-8:]:
+            print(f"    | {line}")
+        print("*" * 72)
+        not_run = [s for s in th["protocol_sequence"] if s not in stages]
+        not_run += ["cross_backend_decode", "w16_verbatim_install"]
+        return _gate_result(
+            "G20.5", "FAIL", device, th,
+            metrics={"error": why, "stages": stages, "not_run": not_run},
+            suite=_no_suite,
+            summary=f"protocol chain broken at {stage} -- model artifacts "
+                    "present? (env/W20_GPU_PROTOCOL.md)")
+
+    print("[G20.5] 1/9 -- the built extension (the kernel path's "
+          "prerequisite -- the G20.4 belt)")
+    C = tq._load_tq_kernel()
+    if (C is None or not hasattr(C, "tq_quant_batched")
+            or not hasattr(C, "tq_dequant_batched")):
+        why = ("the extension is not built (flute_extended._C import "
+               "failed)" if C is None else
+               "the built extension lacks the TQ kernel pair "
+               "(tq_quant_batched/tq_dequant_batched)")
+        print()
+        print("*" * 72)
+        print(f"G20.5 FAIL: {why}")
+        print("  Build flute_extended on this A10G box first "
+              "(env/W20_GPU_PROTOCOL.md step 1,")
+        print("  scripts/gpu/w20_provision.sh). A gate is not skippable.")
+        print("*" * 72)
+        return _gate_result(
+            "G20.5", "FAIL", device, th, metrics={"error": why},
+            suite=_no_suite,
+            summary="extension incomplete -- build first "
+                    "(env/W20_GPU_PROTOCOL.md step 1)")
+
+    print(f"[G20.5] 2/9 -- TRAIN (finetune_m1m2.py --self-test, "
+          f"{_FINETUNE_SHORT_STEPS} steps at refresh "
+          f"{_FINETUNE_REFRESH_EVERY}; the trained-gates artifact feeds "
+          "RE-INGEST)")
+    train = _run_finetune_short("G20.5")
+    stages["TRAIN"] = {"script": str(_FINETUNE_SCRIPT), "record": train}
+    if not train.get("history"):
+        return _chain_fail("TRAIN", train)
+    gates_npz = Path(str(train["history_path"]).replace(
+        "_history.json", ".npz"))
+    stages["TRAIN"]["gates_artifact"] = str(gates_npz)
+    if not gates_npz.is_file():
+        return _chain_fail(
+            "TRAIN", {**train,
+                      "stderr": f"trained-gates artifact absent: "
+                                f"{gates_npz}"})
+    print(f"[G20.5]   trained-gates artifact: {gates_npz}")
+
+    print("[G20.5] 3/9 -- RE-INGEST x2 (run_ingestion.py, the tiny "
+          "synthetic corpus, the TRAIN artifact wired -- run 2 exists "
+          "for the run-to-run npz digest stability)")
+    import shutil
+    data = _g20_5_synthetic_corpus()
+    stages["RE-INGEST"] = {
+        "script": str(_G20_5_SCRIPTS["RE-INGEST"]),
+        "corpus": data["corpus"], "n_docs": _G20_5_N_DOCS,
+        "max_tokens": _G20_5_MAX_TOKENS,
+        "gates_artifact": str(gates_npz)}
+    runs: List[Dict[str, Any]] = []
+    digest_tables: List[Dict[str, str]] = []
+    for run_no in (1, 2):
+        run_dir = _G20_5_ARTIFACT_ROOT / f"ingest_run_{run_no}"
+        if run_dir.exists():        # a TRUE re-ingest: the manifest
+            shutil.rmtree(run_dir)  # resume would skip, not re-run
+        rec = _g20_5_run_stage("RE-INGEST", [
+            sys.executable, str(_G20_5_SCRIPTS["RE-INGEST"]),
+            "--corpus", data["corpus"],
+            "--out-dir", str(run_dir),
+            "--n-docs", str(_G20_5_N_DOCS),
+            "--max-tokens", str(_G20_5_MAX_TOKENS),
+            "--m1m2-gates", str(gates_npz),
+            "--m1m2-mem-size", str(_G20_5_M1M2_MEM)])
+        rec["out_dir"] = str(run_dir)
+        runs.append(rec)
+        stages["RE-INGEST"][f"run_{run_no}"] = rec
+        if rec["returncode"] != 0:
+            return _chain_fail("RE-INGEST", rec)
+        digest_tables.append(_g20_5_npz_digests(run_dir))
+        stages["RE-INGEST"][f"digests_run_{run_no}"] = digest_tables[-1]
+        print(f"[G20.5]   run {run_no}: {rec['tail_line']}  "
+              f"({len(digest_tables[-1])} npz digested, "
+              f"{rec['duration_s']} s)")
+    digests_stable = bool(digest_tables[0]) and (
+        digest_tables[0] == digest_tables[1])
+    if not digest_tables[0]:
+        print("[G20.5]   FAIL -- the RE-INGEST stage produced no npz")
+    elif digests_stable:
+        print(f"[G20.5]   npz digests stable run-to-run: "
+              f"{len(digest_tables[0])} files, the digest sets match "
+              "exactly")
+    else:
+        drift = sorted(k for k in set(digest_tables[0])
+                       | set(digest_tables[1])
+                       if digest_tables[0].get(k) != digest_tables[1].get(k))
+        print(f"[G20.5]   FAIL -- npz digest drift across the runs: "
+              f"{drift[:4]}{' ...' if len(drift) > 4 else ''}")
+
+    print("[G20.5] 4/9 -- INDEX (run_index.py over run 1's disk dir)")
+    index_rec = _g20_5_run_stage("INDEX", [
+        sys.executable, str(_G20_5_SCRIPTS["INDEX"]),
+        "--disk-dir", runs[0]["out_dir"]])
+    frame_npz = Path(str(runs[0]["out_dir"])) / "retrieval_frame.npz"
+    index_rec["retrieval_frame"] = {
+        "path": str(frame_npz), "exists": frame_npz.is_file(),
+        "sha256": (_sha256_file(frame_npz) if frame_npz.is_file() else None)}
+    stages["INDEX"] = {"script": str(_G20_5_SCRIPTS["INDEX"]),
+                       "record": index_rec}
+    if index_rec["returncode"] != 0 or not frame_npz.is_file():
+        return _chain_fail("INDEX", index_rec)
+    print(f"[G20.5]   {index_rec['tail_line']}  "
+          f"({index_rec['duration_s']} s)")
+
+    print("[G20.5] 5/9 -- EVAL (eval_retrieval.py, the gold questions "
+          "over the tiny corpus)")
+    eval_rec = _g20_5_run_stage("EVAL", [
+        sys.executable, str(_G20_5_SCRIPTS["EVAL"]),
+        "--disk-dir", runs[0]["out_dir"],
+        "--corpus", data["corpus"],
+        "--questions-file", data["questions"],
+        "--n-questions", str(_G20_5_N_QUESTIONS),
+        "--top-k", str(_G20_5_TOP_K),
+        "--m1m2-gates", str(gates_npz)])
+    stages["EVAL"] = {"script": str(_G20_5_SCRIPTS["EVAL"]),
+                      "record": eval_rec}
+    if eval_rec["returncode"] != 0:
+        return _chain_fail("EVAL", eval_rec)
+    print(f"[G20.5]   {eval_rec['tail_line']}  ({eval_rec['duration_s']} s)")
+
+    print(f"[G20.5] 6/9 -- QUERY (run_query.py, one deterministic "
+          f"question, a {_G20_5_QUERY_TOKENS}-token decode budget)")
+    query_rec = _g20_5_run_stage("QUERY", [
+        sys.executable, str(_G20_5_SCRIPTS["QUERY"]),
+        "--question", _G20_5_QUERY_QUESTION,
+        "--disk-dir", runs[0]["out_dir"],
+        "--top-k", str(_G20_5_TOP_K),
+        "--max-new-tokens", str(_G20_5_QUERY_TOKENS),
+        "--m1m2-gates", str(gates_npz)])
+    stages["QUERY"] = {"script": str(_G20_5_SCRIPTS["QUERY"]),
+                       "record": query_rec}
+    if query_rec["returncode"] != 0:
+        return _chain_fail("QUERY", query_rec)
+    print(f"[G20.5]   {query_rec['tail_line']}  "
+          f"({query_rec['duration_s']} s)")
+
+    print("[G20.5] 7/9 -- the cross-backend decode differential (the "
+          "one-probe monkeypatch mechanism G20.P3 uses)")
+    try:
+        decode = _g20_5_cross_backend_decode(th)
+    except Exception as exc:  # loud, recorded -- never a silent skip
+        decode = {"error": repr(exc)}
+        print(f"[G20.5]   decode: FAIL -- {exc!r}")
+    else:
+        print(f"[G20.5]   kernel routed {decode['kernel_routed']}; "
+              f"max |diff| {decode['max_abs_diff']:.3e} (allclose "
+              f"{'ok' if decode['allclose'] else 'DRIFT'} at "
+              f"{float(th['cross_backend_decode_allclose_rtol']):.0e})")
+
+    print("[G20.5] 8/9 -- the W16 verbatim install (one chunk through "
+          "install_from_disk, the installed digests vs the snapshot's)")
+    try:
+        w16 = _g20_5_w16_verbatim_install(Path(runs[0]["out_dir"]))
+    except Exception as exc:  # loud, recorded -- never a silent skip
+        w16 = {"error": repr(exc)}
+        print(f"[G20.5]   W16: FAIL -- {exc!r}")
+    else:
+        print(f"[G20.5]   {w16['n_bitexact']}/{w16['n_units']} installed "
+              f"units bit-exact; modes: {w16['mode_summary']}")
+
+    print("[G20.5] 9/9 -- the verdict")
+    stage_exit_codes = {
+        "TRAIN": train.get("returncode"),
+        "RE-INGEST": runs[0].get("returncode"),
+        "INDEX": index_rec.get("returncode"),
+        "EVAL": eval_rec.get("returncode"),
+        "QUERY": query_rec.get("returncode"),
+    }
+    checks = {
+        "protocol_stages_exit_zero": all(
+            rc == 0 for rc in stage_exit_codes.values()),
+        "protocol_sequence_order": list(stages.keys()) == list(
+            th["protocol_sequence"]),
+        "npz_digests_stable_run_to_run": bool(digests_stable) if bool(
+            th["npz_digests_stable_run_to_run"]) else True,
+        "cross_backend_decode_allclose": bool(decode.get("allclose")),
+        "cross_backend_kernel_routed": bool(decode.get("kernel_routed")),
+        "w16_install_bitexact_within_backend": bool(w16.get("bitexact"))
+        if bool(th["w16_install_bitexact_within_backend"]) else True,
+    }
+    metrics = {
+        "stages": stages, "stage_exit_codes": stage_exit_codes,
+        "npz_digests": {
+            "run_1": digest_tables[0], "run_2": digest_tables[1],
+            "stable": bool(digests_stable),
+            "note": "sha256 over each npz's members in sorted-key order "
+                    "with the meta's saved_at removed -- the snapshot "
+                    "format's own determinism contract (the one "
+                    "call-varying provenance field, excluded from the "
+                    "format's digest too)",
+        },
+        "cross_backend_decode": decode,
+        "w16_verbatim_install": w16,
+        "checks": checks,
+    }
+    status = "PASS" if all(checks.values()) else "FAIL"
+    decode_txt = (f"{decode['max_abs_diff']:.2e}"
+                  if isinstance(decode.get("max_abs_diff"), float)
+                  else "n/a")
+    w16_txt = (f"{w16['n_bitexact']}/{w16['n_units']}"
+               if "n_bitexact" in w16 else "n/a")
+    summary = (f"TRAIN->RE-INGEST->INDEX->EVAL->QUERY exit 0; npz "
+               f"digests {'stable' if digests_stable else 'DRIFT'} "
+               f"({len(digest_tables[0])} files); cross-backend decode "
+               f"{decode_txt}; W16 verbatim {w16_txt}")
+    print(f"[G20.5] done -- {status}")
+    return _gate_result("G20.5", status, device, th, metrics, _no_suite,
+                        summary)
+
+
 # The runner table: G20.P1 (W20.4) + W20.6's pair (G20.P2 + G20.6) +
 # W20.8's four (G20.P3 parity, G20.1/G20.2 phase-1 timers, G20.4 the
-# parity contract); each authoring wave appends its gates per the §4
+# parity contract) + W20.10's G20.5 (protocol integrity); each
+# authoring wave appends its gates per the §4
 # registry (W20.9 folds qjl into G20.P3; W20.10: G20.5; W20.11:
 # G20.2 full + G20.3). A gate in GATE_REGISTRY but not here is
 # a NOT-AUTHORED stub.
@@ -2046,6 +2578,7 @@ GATE_RUNNERS: Dict[str, Any] = {
     "G20.1": gate_g20_1,
     "G20.2": gate_g20_2,
     "G20.4": gate_g20_4,
+    "G20.5": gate_g20_5,
     "G20.6": gate_g20_6,
 }
 
