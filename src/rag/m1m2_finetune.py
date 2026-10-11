@@ -160,6 +160,27 @@ at ~0.12-0.13. Three instruments + one regime fix landed:
     instead of arguable. The label-0 rows (17,519 curated non-pairs,
     unused by the v1 loader) become the driver's CONTROL LINE.
 
+W22 — THE HARD NEGATIVES (the proven small-batch fix): the W21 box
+run trained REAL signal for the first time (spread +0.20..0.35, no
+plateau) but with B=8 the InfoNCE's negative pool is SEVEN in-batch
+cross pairs — random draws whose difficulty swings the loss 0.28..1.64
+between blocks (the W20.15 sawtooth's residue), while the 17.5k
+curated label-0 non-pairs ride along UNUSED. Every reference design
+at this batch scale mines curated/hard negatives into the candidate
+set (DPR's in-batch + hard negatives, Karpukhin et al. 2020, arXiv:
+2004.04906; MoCo's queue of shared negatives, He et al. 2020, arXiv:
+1911.05722; Robinson et al. 2021, arXiv:2011.12031 — the contrastive
+shortcut-solution analysis). `train_gates(negatives=...)` +
+GatesTrainConfig.neg_pairs now attach N curated negative SIDES to
+every capture pool: the loss logits gain N extra columns —
+sim(a_i, n_l) never a target — so each anchor must rank its OWN pair
+above the curated non-pairs too. The negatives are replayed under
+grad like any side (their gates receive the push-away gradient), the
+metric gains cos_hneg (the curated-negative column mean — the same
+number the driver's label-0 control line reports on held-out data),
+and neg_pairs=0 (the library default) is bit-identical to the W21
+regime (the driver's --neg-pairs 8 is the recommended run).
+
 WHAT IS TRAINED: ONLY the M1M2 module's gate vectors
 (write_gate_k/write_gate_v per linear layer, optionally read_gate) —
 `freeze_all_but_gates` turns off every other parameter of the model
@@ -578,13 +599,25 @@ def pair_sim_matrix(m1_a: torch.Tensor, m2_a: torch.Tensor,
 
 def infonce_pairs_loss(m1_a: torch.Tensor, m2_a: torch.Tensor,
                        m1_b: torch.Tensor, m2_b: torch.Tensor,
-                       tau: float = 0.07) -> torch.Tensor:
-    """InfoNCE with in-batch negatives over the pair states.
+                       tau: float = 0.07, m1_n: Optional[torch.Tensor] = None,
+                       m2_n: Optional[torch.Tensor] = None
+                       ) -> torch.Tensor:
+    """InfoNCE with in-batch negatives (+ W22 curated hard-negative
+    columns) over the pair states.
 
     sim(i, j) = 0.5 * (cos(m1_a[i], m1_b[j]) + cos(m2_a[i], m2_b[j]));
     logits = sim / tau; the diagonal (the true pairs) are the targets.
     B >= 2 required (in-batch negatives); the matrix is symmetric so the
     a->b direction covers both.
+
+    W22 — `m1_n`/`m2_n` (N curated non-pair side-states, stacked like
+    the b-operands) append N negative COLUMNS: sim(a_i, n_l) is never
+    a target, so every anchor must ALSO rank its own pair above the
+    curated non-pairs (DPR/MoCo's shared hard negatives; the box's B=8
+    in-batch pool is 7 random draws — the loss's dominant noise). The
+    columns flow gradient into the negatives' replays (push-away).
+    Both must be given together, N >= 1, and B/N operands share the
+    flattened dims (any (N, ...) states — flat_unit normalizes).
     """
     if tau <= 0 or not isinstance(tau, float):
         raise ValueError(f"infonce_pairs_loss: tau must be > 0, got {tau!r}")
@@ -594,6 +627,26 @@ def infonce_pairs_loss(m1_a: torch.Tensor, m2_a: torch.Tensor,
             f"infonce_pairs_loss: batch of {b} pair has no in-batch "
             f"negatives — use B >= 2")
     sim = pair_sim_matrix(m1_a, m2_a, m1_b, m2_b)
+    if (m1_n is None) != (m2_n is None):
+        raise ValueError(
+            "infonce_pairs_loss: m1_n and m2_n are a pair — give both "
+            f"(got {'m1_n' if m2_n is None else 'm2_n'} only)")
+    if m1_n is not None:
+        n = m1_n.shape[0]
+        if n < 1:
+            raise ValueError(
+                f"infonce_pairs_loss: {n} curated negative column(s) — "
+                f"at least 1 (or None to disable)")
+        if m2_n.shape[0] != n:
+            raise ValueError(
+                f"infonce_pairs_loss: m1_n has {n} rows but m2_n has "
+                f"{m2_n.shape[0]} — the two memories' negatives must "
+                f"share the side list")
+        # the SAME one construction site (the W20.14 rule): the
+        # negative columns are pair_sim_matrix with the b-operands
+        # swapped for the curated sides.
+        neg = pair_sim_matrix(m1_a, m2_a, m1_n, m2_n)     # (B, N)
+        sim = torch.cat([sim, neg], dim=1)
     logits = sim / tau
     targets = torch.arange(b, device=logits.device)
     return torch.nn.functional.cross_entropy(logits, targets)
@@ -624,14 +677,28 @@ def sim_matrix_stats(sim: torch.Tensor) -> Dict[str, float]:
             "off_max": float(off.max()), "diag_min": float(diag.min())}
 
 
-def _pair_sim_stats(m1_a, m2_a, m1_b, m2_b) -> Dict[str, float]:
+def _pair_sim_stats(m1_a, m2_a, m1_b, m2_b, m1_n=None, m2_n=None
+                    ) -> Dict[str, float]:
     """W20.14 — the B x B pair-similarity stats the history and the
     held-out report share (no grad; sim_matrix_stats over the shared
     pair_sim_matrix — EXACTLY the matrix infonce_pairs_loss trains
     on, so the metric scores the same discrimination the loss
-    optimizes)."""
+    optimizes).
+
+    W22 — `m1_n`/`m2_n` (the curated negative sides, when the pool
+    carries them) add `cos_hneg`: the mean sim(a_i, n_l) over the
+    hard-negative columns the loss ALSO trains against (the same
+    number the driver's label-0 control line reports held-out). NaN
+    when no negatives ride the pool (the W21 regime)."""
     with torch.no_grad():
-        return sim_matrix_stats(pair_sim_matrix(m1_a, m2_a, m1_b, m2_b))
+        st = sim_matrix_stats(pair_sim_matrix(m1_a, m2_a, m1_b, m2_b))
+        if m1_n is not None and m2_n is not None \
+                and m1_n.shape[0] > 0 and m2_n.shape[0] > 0:
+            neg = pair_sim_matrix(m1_a, m2_a, m1_n, m2_n)  # (B, N)
+            st["cos_hneg"] = float(neg.mean())
+        else:
+            st["cos_hneg"] = float("nan")
+        return st
 
 
 def cosine_spread(m1_a, m2_a, m1_b, m2_b) -> Tuple[float, float]:
@@ -845,6 +912,16 @@ class GatesTrainConfig:
     # steps; the prefill count halves again vs 4). The operator's call
     # on the box — A/B it and watch the loss/cos separation.
     refresh_every: int = 4
+    # W22 — the curated hard negatives: how many label-0 single sides
+    # ride EACH capture pool as extra InfoNCE columns (shared across
+    # the batch — DPR/MoCo's design; the box's B=8 in-batch pool is 7
+    # random draws whose difficulty swings the loss block-to-block).
+    # 0 (the default) = the exact W21 regime (bit-identical); the
+    # driver's recommended run passes 8. The `negatives` iterable to
+    # train_gates yields batches of single-side ids (host tensors);
+    # exhaustion falls back to the plain regime for that pool (one
+    # loud warning, never a crash).
+    neg_pairs: int = 0
     # W20.14 — the H6 investigation knob: train the write gates for ONLY
     # these layer indices (None = all, the default). Layers outside the
     # set get their gate gradients ZEROED after backward — with the
@@ -924,13 +1001,23 @@ is the refresh cycle; see train_gates). Values bit-identical."""
 
 
 def train_gates(model, pairs: Iterable[Sequence[torch.Tensor]], system,
-                cache_factory: Callable, cfg: Optional[GatesTrainConfig] = None
+                cache_factory: Callable,
+                cfg: Optional[GatesTrainConfig] = None,
+                negatives: Optional[Iterable[Sequence[torch.Tensor]]] = None
                 ) -> GatesTrainConfig:
     """The §7 gate fine-tune loop (general similarity pairs, NEVER the
     served corpus — corpus independence is the design).
 
     pairs: an iterable of (ids_a, ids_b) positive-pair batches of length
     cfg.batch_pairs (token-id tensors (1, T); the DRIVER tokenizes).
+
+    W22 — negatives: an iterable of SINGLE-side id batches of length
+    cfg.neg_pairs (the driver's curated label-0 sides, the same seeded
+    epoch-rebatch regime). Each capture pool attaches them as shared
+    InfoNCE hard-negative columns (see infonce_pairs_loss); the
+    negatives' replays are grad-carrying sides like any other, so their
+    push-away gradient lands in the SAME (L, H) gates. neg_pairs=0 or
+    negatives=None is the exact W21 regime (bit-identical).
 
     W19 step anatomy: a CAPTURE POOL — one batch of pairs prefilled under
     no_grad (the production path), then trained on for
@@ -975,6 +1062,14 @@ over the captured k/v) is untouched.
         raise ValueError(
             f"train_gates: refresh_every must be >= 1, got "
             f"{cfg.refresh_every}")
+    if isinstance(cfg.neg_pairs, bool) or not isinstance(cfg.neg_pairs, int) \
+            or cfg.neg_pairs < 0:
+        raise ValueError(
+            f"train_gates: neg_pairs must be an int >= 0, got "
+            f"{cfg.neg_pairs!r}")
+    neg_pending = (iter(negatives)
+                   if negatives is not None and cfg.neg_pairs > 0 else None)
+    neg_exhausted = {"warned": False}
     inner = getattr(model, "model", model)
     module = inner.m1m2
     # W20.11.2 — the loader pinning: the capture device (where the
@@ -1070,6 +1165,7 @@ over the captured k/v) is untouched.
                     f"pairs — the InfoNCE needs >= 2 (in-batch "
                     f"negatives)")
             cap_batch = []
+            cap_negs: List[Tuple] = []       # W22 — the pool's curated sides
             pool_bytes = 0
             for ids_a, ids_b in batch:
                 sides = []
@@ -1084,6 +1180,37 @@ over the captured k/v) is untouched.
                     # is droppable now — codes only.
                     del cache
                 cap_batch.append(sides)
+            # W22 — the curated hard-negative sides ride the SAME pool
+            # (one prefill each, the same retention contract; staged on
+            # the capture device like the pair sides). Exhaustion is a
+            # one-time loud warning + the plain W21 regime for the rest
+            # of the run — never a crash mid-pool.
+            if neg_pending is not None:
+                try:
+                    neg_batch = [_stage_ids(t, cap_dev)
+                                 for t in next(neg_pending)]
+                except StopIteration:
+                    if not neg_exhausted["warned"]:
+                        print("    [gates] [W22] the negatives iterator is "
+                              "exhausted — the remaining pools train on "
+                              "in-batch negatives only (the W21 regime)",
+                              flush=True)
+                        neg_exhausted["warned"] = True
+                    neg_pending = None
+                    neg_batch = []
+                if neg_pending is not None and len(neg_batch) != cfg.neg_pairs:
+                    raise ValueError(
+                        f"train_gates: the negatives batch holds "
+                        f"{len(neg_batch)} side(s), cfg.neg_pairs is "
+                        f"{cfg.neg_pairs} — the driver's iterator must "
+                        f"yield exactly cfg.neg_pairs per batch")
+                for ids in neg_batch:
+                    cache = cache_factory()
+                    calls, m1_i, m2_i = prefill_capture_calls(
+                        model, ids, cache, system)
+                    pool_bytes += _calls_bytes(calls)
+                    cap_negs.append((calls, m1_i, m2_i))
+                    del cache
             # W20.11.2 — pre-stage the NEXT pool's prefill inputs NOW:
             # the staging window is the rest of this refresh cycle (the
             # tiny non_blocking copies ride the current stream during
@@ -1097,8 +1224,11 @@ over the captured k/v) is untouched.
             batch_idx += 1      # W20.15 — a new capture block starts
             phase["capture_s"] += time.perf_counter() - tc
             if cfg.log_every:
+                neg_note = (f" + {len(cap_negs)} neg sides"
+                            if cap_negs else "")
                 print(f"    [gates] capture batch prefilled: "
-                      f"{len(cap_batch)} pairs ({pool_bytes / 2**20:.0f}"
+                      f"{len(cap_batch)} pairs{neg_note} "
+                      f"({pool_bytes / 2**20:.0f}"
                       f" MiB retained k/v)", flush=True)
         steps_on_batch += 1
 
@@ -1122,8 +1252,24 @@ over the captured k/v) is untouched.
         m2_a = torch.stack([s[0][1] for s in states])
         m1_b = torch.stack([s[1][0] for s in states])
         m2_b = torch.stack([s[1][1] for s in states])
+        # W22 — the curated sides replay under grad exactly like the
+        # pair sides (the push-away gradient must reach their gates);
+        # delta_loss centers them in the same retrieval frame.
+        m1_n = m2_n = None
+        if cap_negs:
+            neg_states = []
+            for (calls, m1_i, m2_i) in cap_negs:
+                m1, m2 = replay_states(module, calls, m1_i, m2_i,
+                                       memopt=cfg.memopt)
+                if cfg.delta_loss:
+                    m1, m2 = m1 - m1_i, m2 - m2_i
+                neg_states.append((m1, m2))
+            m1_n = torch.stack([s[0] for s in neg_states])
+            m2_n = torch.stack([s[1] for s in neg_states])
+            del neg_states
         phase["replay_s"] += time.perf_counter() - tr
-        loss = infonce_pairs_loss(m1_a, m2_a, m1_b, m2_b, tau=cfg.tau)
+        loss = infonce_pairs_loss(m1_a, m2_a, m1_b, m2_b, tau=cfg.tau,
+                                  m1_n=m1_n, m2_n=m2_n)
         opt.zero_grad(set_to_none=True)
         tb = time.perf_counter()
         loss.backward()
@@ -1141,7 +1287,8 @@ over the captured k/v) is untouched.
         # measurable: the same B x B sim matrix, read as stats (the v1
         # metric reported the negatives as the ROLLED true-pair mean —
         # a permutation, identical mean, spread structurally 0)
-        stats = _pair_sim_stats(m1_a, m2_a, m1_b, m2_b)
+        stats = _pair_sim_stats(m1_a, m2_a, m1_b, m2_b, m1_n=m1_n,
+                                m2_n=m2_n)
         # W19 — the saddle/health detector: the gate-grad magnitudes the
         # box asked for (recorded BEFORE the clip; 0.0 = dead path)
         gk_absmax = _grad_absmax(module.write_gate_k)
@@ -1150,6 +1297,8 @@ over the captured k/v) is untouched.
         # outputs) free here; explicit del after the metrics are read
         # keeps the peak flat across steps on the A10G.
         del states, m1_a, m2_a, m1_b, m2_b
+        if m1_n is not None:
+            del m1_n, m2_n
         torch.nn.utils.clip_grad_norm_(
             [p for p in module.parameters() if p.requires_grad],
             cfg.grad_clip)
@@ -1164,10 +1313,12 @@ over the captured k/v) is untouched.
             **_gate_value_stats(module),  # W20.15 — where the gates ARE
             **stats, **phase})
         if cfg.log_every and step % cfg.log_every == 0:
+            hneg_note = ("" if not math.isfinite(stats["cos_hneg"])
+                         else f" hneg {stats['cos_hneg']:+.3f}")
             print(f"    [gates] step {step:4d} pool {steps_on_batch}/"
                   f"{cfg.refresh_every} loss {loss.item():.4f} "
                   f"cos(pos) {stats['cos_pos']:+.3f} "
-                  f"cos(neg) {stats['cos_neg']:+.3f} "
+                  f"cos(neg) {stats['cos_neg']:+.3f}{hneg_note} "
                   f"spread {stats['spread']:+.3f} "
                   f"[worst neg {stats['off_max']:+.3f} "
                   f"weakest pos {stats['diag_min']:+.3f}] "
