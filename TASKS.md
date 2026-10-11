@@ -963,7 +963,14 @@ butterfly, bfi packing, the batched entry. R20.6's grid-overshoot
 guard rides the entry.
 
 #### W20.7.1 — the deterministic norm reduction (the split-K finalizer discipline)
-- [ ] done
+- [x] done
+Route (b) realized: the SECOND-LAUNCH fold (splitk's control-only
+ticket precedent documented but rejected — this module's grep-zero
+invariant is stricter; the launch boundary is the only cross-CTA
+sync). Association: ascending-j fmaf → xor-butterfly 16→1 → warps
+0..7 ascending → partials 0..63 ascending → __fsqrt_rn (fast-math
+independent). NOT bit-identical to torch.norm (different tree) —
+run-to-run determinism + tolerance gates carry it.
 ROLE task-writer · READ `kernel_tq.cu` (5.2's staging), `kernel_gemv_splitk.cu:120-260`
 (the last-ticket finalizer + workspace fold) · WRITE `kernel_tq.cu`
 BRIEF: grid-stride sum-of-squares; per-warp `shfl.sync` butterfly tree

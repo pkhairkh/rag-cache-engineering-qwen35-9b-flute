@@ -1367,3 +1367,321 @@ torch::Tensor tq_debug_fht_large_backward(torch::Tensor g, torch::Tensor signs) 
     // the move home: a same-dtype device copy (no conversion rides it)
     return gx_cpu.to(g.device());
 }
+
+// ===========================================================================
+// W20.7.1 -- tq_quant_norm: the deterministic per-unit L2 norm reduction.
+//
+// The first stage of tq_quant_batched (WAVE W20.7, PROPOSAL §3.3's fused
+// encode). For each of the M units -- the rows of an (M, K) matrix, K a
+// power of two in the family envelope (the production d = 2^19..2^22) --
+// compute ||x_m||_2 with turboquant.py:510's `x32.norm()` semantics: the
+// sum of squares over the K elements in fp32, then the square root. The
+// result lands as an (M,) fp32 CUDA tensor on x's device: each element
+// is its unit's norm -- the "0-dim per unit" discipline downstream (the
+// tensor math treats them as scalars; TQCodes rev-1 stores each unit's
+// norm as a 0-dim fp32 device tensor, and the host NEVER reads the
+// values back -- no .item(), no .cpu(), no D2H sync anywhere here; the
+// degenerate zero-norm branch is W20.7.4's DEVICE-side concern, never
+// the host's -- turboquant.py:511-523's known cost, eliminated by this
+// kernel design).
+//
+// THE REDUCTION STRUCTURE -- the association order IS the contract:
+//
+//   stage 1   tq_quant_norm_partial_kernel: grid (M, 64), 256 threads.
+//   CTA (m, p) owns the CONTIGUOUS element slice [p*chunk, (p+1)*chunk)
+//   of unit m (chunk = K/64, exact -- both are powers of two):
+//     * per THREAD: the block-stride element map (fht.cuh:90's
+//       `for (j = tid; j < n; j += THREADS)` discipline, slice-local) --
+//       a pure function of (M, K); no device query feeds the geometry.
+//       The squares accumulate in ASCENDING j order, one fmaf per
+//       element: the fma intrinsic is ALWAYS the single-rounding fused
+//       op, fast-math flags included (unlike div/sqrt); std::fmaf in a
+//       CPU twin reproduces the sequence bit-for-bit (the one edge:
+//       --use_fast_math also sets ftz, so DENORMAL inputs flush to zero
+//       here where torch's kernels keep them -- the N(0,1) production
+//       rows never feed it; the differential gate's tolerance owns the
+//       edge).
+//     * per WARP: the shfl_xor butterfly at FIXED XOR widths
+//       16 -> 8 -> 4 -> 2 -> 1. fp32 redux.sync.add does not exist
+//       (PTX ISA 9.7.13.12 -- the reduction op is integer-only); the
+//       shfl tree IS the fp32 warp path. The widths pin the
+//       association: level 1 pairs (i, i^16), level 2 pairs those sums
+//       across ^8, down to ^1. Every lane converges to the warp total
+//       BIT-IDENTICALLY: at each exchange lane L computes v_L + v_{L^w}
+//       while lane L^w computes the same two terms the other way
+//       around, and IEEE addition is commutative (a+b and b+a round to
+//       the same bits; only ASSOCIATION is order-sensitive -- and the
+//       tree's levels are fixed).
+//     * per CTA: the 8 warp sums red[0..7] fold in FIXED ASCENDING warp
+//       order by thread 0 -- red[0] + red[1] + ... + red[7],
+//       left-associated (kernel_gemv_splitk.cu:338-339's red[row][0..3]
+//       fixed-order fold, the family precedent's shape).
+//     * the CTA's partial lands in its EXCLUSIVELY-OWNED workspace slot
+//       partials[p*M + m]: CTA (m, p) is the ONLY writer of that
+//       element, and the grid covers every (m, p) exactly once -- the
+//       wrapper's torch::empty needs no zeroing (kernel_gemv_splitk.cu
+//       :120-126's P discipline).
+//
+//   stage 2   tq_quant_norm_fold_kernel -- the SECOND-LAUNCH finalizer.
+//   One thread per unit folds the 64 partials in FIXED ASCENDING
+//   partial order -- ((...((p0 + p1) + p2)...) + p63), left-associated
+//   -- and stores __fsqrt_rn(total): the correctly-rounded IEEE root via
+//   the _rn intrinsic, the epilogue's one rounding beyond the adds. The
+//   intrinsic is REQUIRED: this build compiles with --use_fast_math
+//   (setup.py:171), which maps a plain sqrtf to sqrt.approx.f32 (~1-2
+//   ulp, deterministic but not correctly rounded); __fsqrt_rn lowers to
+//   sqrt.rn.f32 regardless of the fast-math flag -- and torch's own
+//   final sqrt is sqrt.rn, so given the same accumulated bits the
+//   epilogue rounds IDENTICALLY to the torch path (the only divergence
+//   from torch.norm is the sum's association, not the root).
+//
+// THE FINALIZER CHOICE -- route (b), the second launch, taken
+// deliberately. kernel_gemv_splitk.cu:362-407 reduces its split
+// partials through an ARRIVAL TICKET: each CTA __threadfence()s, then
+// takes one fetch-and-add on a per-tile ticket counter, and the LAST
+// arrival folds the workspace BY INDEX (kernel_gemv_splitk.cu:62-76
+// documents the split: the ticket is CONTROL FLOW -- it selects WHICH
+// CTA folds, never the order the data sums in -- so that reduction is
+// deterministic in the data despite the run-dependent arrival order;
+// the CUDA threadFenceReduction pattern). That precedent is sound, but
+// this file's invariant is stricter: NO reduction primitive of ANY
+// kind may appear in kernel_tq.cu (the module grep must stay at zero).
+// The norm therefore avoids tickets entirely: the fold is a SECOND
+// kernel launch, and the stream's launch boundary -- this family's
+// ONLY cross-CTA synchronization (fht_large.cuh:106-108, the pass-2
+// discipline) -- orders it after every partial write. Zero tickets,
+// zero fences, zero cross-CTA shared state: the fold order is fixed by
+// the PROGRAM, not by arrival -- deterministic unconditionally, not
+// merely "deterministic in the data".
+//
+// DETERMINISM CONTRACT: run-to-run torch.equal assertable -- every
+// workspace slot has exactly one writer, every fold is a fixed left
+// association, the element->thread map is a pure function of (M, K).
+// This is NOT a claim of bit-identity with torch.norm: torch's own
+// reduction tree carries its own (different) association, so the
+// differential gate compares with tolerance while the determinism gate
+// compares kernel-to-kernel (two calls, equal bits -- the class of
+// contract every decode kernel in this family carries,
+// kernel_gemv_splitk.cu:107-114).
+//
+// FORWARD BUILD (W20.7.2-.4): the boundary ladder scales its 16
+// codebook boundaries by norms[m] (the boundary-scaling identity), the
+// multi-tile butterfly + bfi packing consume x UNSCALED, and the
+// batched entry drives this two-launch chain as its first stage. The
+// kernels below take raw pointers so 7.4 can aim the fold at a
+// caller-provided out_norms buffer directly; this section's wrapper
+// (tq_quant_norm_rows) allocates and returns a fresh (M,) tensor per
+// the W20.7.1 brief. Nothing here is bound in bindings.cpp -- W20.7.4
+// owns the public tq_quant_batched and its registration.
+//
+// Resource accounting (sm_86): both stages 256 threads/CTA; stage 1
+// grid (M, 64) with 32 B static shared (red[8]); at M = 1 that is 64
+// CTAs (80% of the 80 SMs, bandwidth-bound streaming); chunk = K/64 =
+// 8192..65536 elements per CTA at K = 2^19..2^22 (32..256 per thread);
+// the workspace is (64, M) fp32 = 256 B per unit; stage 2's grid is
+// ceil(M/256) CTAs whose warps read one 128 B line per partial index
+// (the (64, M) partial-major layout is the coalescing reason).
+//
+// COMPILE RECORD: nvcc is ABSENT on this authoring box (env/W20_ENV.md)
+// -- compile and behavioral verification defer to the A10G box (the
+// W20.5.4 TU registration carries this file; W20.6/W20.7.5 run the
+// gates). Authored statically, re-read for review; every defect found
+// here is a box-side discovery.
+// ===========================================================================
+
+namespace {
+
+// The stage geometry: a compile-time constant pair (the launch geometry
+// must never query the device -- the determinism contract). 64 partial
+// CTAs per unit, 256 threads (8 whole warps) each.
+constexpr int kTqNormThreads  = 256;
+constexpr int kTqNormPartials = 64;  // partial CTAs per unit (grid.y)
+
+static_assert(kTqNormThreads % 32 == 0,
+              "the warp butterfly needs whole 32-lane warps");
+static_assert((kTqNormPartials & (kTqNormPartials - 1)) == 0,
+              "partials per unit is a power of two (chunk = K/64 exact)");
+static_assert(kTqNormPartials <= 65535,
+              "the partial axis rides grid.y (its 65535 cap)");
+
+// ---------------------------------------------------------------------------
+// Stage 1 -- the partial sum-of-squares (the banner's contract, stage 1).
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void __launch_bounds__(kTqNormThreads)
+tq_quant_norm_partial_kernel(
+    const scalar_t* __restrict__ x,  // (M, K) input, read-only
+    float* __restrict__ partials,    // (kTqNormPartials, M) exclusive slots
+    int M, int K, int chunk) {
+    const int unit = blockIdx.x;  // grid.x = M units
+    const int part = blockIdx.y;  // grid.y = 64 partial CTAs per unit
+    const int tid  = threadIdx.x;
+    const int64_t base = static_cast<int64_t>(unit) * K
+                       + static_cast<int64_t>(part) * chunk;
+
+    // ---- per-thread accumulation: the block-stride map, ascending j --
+    // One fmaf per element (single rounding, exactly defined); the
+    // sequence is a left fold over the thread's ascending elements. The
+    // unroll overlaps LOADS only: every fmaf consumes acc, so the add
+    // chain stays sequential in j (the data dependence pins the order
+    // regardless of unrolling).
+    float acc = 0.0f;
+    #pragma unroll 4
+    for (int j = tid; j < chunk; j += kTqNormThreads) {
+        // the x32 cast (turboquant.py:505): exact widening for
+        // fp16/bf16, identity for fp32 -- the square is always fp32.
+        const float v = static_cast<float>(x[base + j]);
+        acc = fmaf(v, v, acc);
+    }
+
+    // ---- the warp butterfly: shfl_xor at fixed widths 16 -> 1 --------
+    // (fp32 redux.sync.add does not exist -- PTX ISA 9.7.13.12; the
+    // shfl tree IS the fp32 warp path.) All 32 lanes execute this
+    // uniform code, so the full mask is legal; every lane ends with
+    // the warp total, bit-identical across lanes (commutativity).
+    #pragma unroll
+    for (int w = 16; w >= 1; w >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, w);
+    }
+
+    // ---- the CTA fold: the warps in fixed ascending warp order ------
+    __shared__ float red[kTqNormThreads / 32];
+    if ((tid & 31) == 0) {
+        red[tid >> 5] = acc;  // lane 0 publishes (every lane holds it)
+    }
+    __syncthreads();
+    if (tid == 0) {
+        // red[0] + red[1] + ... + red[7], left-associated ascending --
+        // kernel_gemv_splitk.cu:338-339's red[row][0..3] fold's shape.
+        float cta = red[0];
+        #pragma unroll
+        for (int w = 1; w < kTqNormThreads / 32; ++w) {
+            cta += red[w];
+        }
+        // the EXCLUSIVE slot: CTA (unit, part) is the only writer of
+        // partials[part*M + unit]; every slot is written exactly once
+        // (the grid covers (M, 64) fully), so no zeroing is ever needed.
+        partials[static_cast<int64_t>(part) * M + unit] = cta;
+    }
+    // No trailing barrier: the CTA exits, and the fold launch that
+    // reads partials is ordered after it by the stream (this family's
+    // only cross-CTA synchronization).
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 -- the finalizer fold (the banner's contract, stage 2): one
+// thread per unit, the fixed ascending partial order, the root. The
+// workspace is partial-major ((64, M), slot = p*M + m) so a warp's 32
+// consecutive units read one 128 B line per partial index -- coalesced.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(kTqNormThreads)
+tq_quant_norm_fold_kernel(
+    const float* __restrict__ partials,  // (kTqNormPartials, M)
+    float* __restrict__ norms,           // (M,) out
+    int M, int num_partials) {
+    const int unit = blockIdx.x * kTqNormThreads + threadIdx.x;
+    if (unit >= M) {
+        return;  // the tail CTA's overrun
+    }
+    // the fixed ascending partial fold: start at p = 0, left-associate.
+    // The unroll again overlaps loads only -- each add consumes acc, so
+    // the association order is pinned.
+    float acc = partials[unit];
+    #pragma unroll 8
+    for (int p = 1; p < num_partials; ++p) {
+        acc += partials[static_cast<int64_t>(p) * M + unit];
+    }
+    // __fsqrt_rn: the IEEE correctly-rounded root -- the flag-independent
+    // form (a plain sqrtf would lower to sqrt.approx under the build's
+    // --use_fast_math, setup.py:171). Deterministic either way; _rn also
+    // matches torch's final sqrt round-for-round on the same bits.
+    norms[unit] = __fsqrt_rn(acc);
+}
+
+// ---------------------------------------------------------------------------
+// Argument validation -- the family's loud TORCH_CHECK discipline
+// (fht_large_check_args's shape, the norm's own envelope).
+// ---------------------------------------------------------------------------
+void tq_quant_norm_check_args(const torch::Tensor& x) {
+    TORCH_CHECK(x.is_cuda(), "tq_quant_norm: x must be a CUDA tensor");
+    TORCH_CHECK(x.dim() == 2,
+                "tq_quant_norm: x must be 2-D (M, K) - the batched unit "
+                "matrix (the caller flattens (..., K) to rows)");
+    TORCH_CHECK(x.is_contiguous(), "tq_quant_norm: x must be contiguous");
+    TORCH_CHECK(x.scalar_type() == at::kFloat ||
+                x.scalar_type() == at::kHalf ||
+                x.scalar_type() == at::kBFloat16,
+                "tq_quant_norm: x dtype must be "
+                "float32/float16/bfloat16, got ", x.scalar_type());
+    TORCH_CHECK(static_cast<int64_t>(x.size(0)) <= INT32_MAX,
+                "tq_quant_norm: M must fit a grid.x launch (got M=",
+                x.size(0), ")");
+
+    const int K = static_cast<int>(x.size(1));
+    TORCH_CHECK(K > 0 && (K & (K - 1)) == 0,
+                "tq_quant_norm: K must be a power of two (the tq_quant "
+                "family envelope - the FHT rotation the norm feeds "
+                "requires it), got K=", K);
+    TORCH_CHECK(K >= kTqNormPartials,
+                "tq_quant_norm: K=", K, " is below the partial-CTA floor "
+                "(", kTqNormPartials, ")");
+}
+
+// ---------------------------------------------------------------------------
+// tq_quant_norm_rows -- the INTERNAL host wrapper (anonymous namespace;
+// W20.7.4 builds the public tq_quant_batched on top of this chain).
+// Allocates the (64, M) workspace, launches stage 1 then stage 2 (the
+// second-launch finalizer), returns the (M,) fp32 norms on x's device.
+// The host NEVER reads the device values: no .item(), no .cpu(), no
+// D2H sync (turboquant.py:490-497's encode discipline).
+// ---------------------------------------------------------------------------
+torch::Tensor tq_quant_norm_rows(const torch::Tensor& x) {
+    tq_quant_norm_check_args(x);
+    const int M = static_cast<int>(x.size(0));
+    const int K = static_cast<int>(x.size(1));
+    const int chunk = K / kTqNormPartials;
+
+    // (M,) fp32 on x's device: element m is unit m's norm.
+    torch::Tensor norms =
+        torch::empty({x.size(0)}, x.options().dtype(at::kFloat));
+    if (M == 0) {
+        return norms;  // nothing to reduce; a zero-size grid is not a
+                       // legal launch (the family's discipline)
+    }
+
+    // the partial workspace: (64, M) fp32, wrapper-allocated, one
+    // EXCLUSIVELY-OWNED slot per partial CTA (stage 1 writes each slot
+    // exactly once; no zeroing). Allocation, both launches, and the
+    // scope exit all ride the same stream -- the caching allocator's
+    // stream-ordered discipline; a later launch on this stream cannot
+    // observe the freed block.
+    torch::Tensor partials = torch::empty(
+        {static_cast<int64_t>(kTqNormPartials), x.size(0)},
+        x.options().dtype(at::kFloat));
+
+    auto stream = at::cuda::getCurrentCUDAStream();  // the house kernels' stream
+
+    // ---- stage 1: the partial sum-of-squares --------------------------
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf, at::kBFloat16, x.scalar_type(),
+        "tq_quant_norm_rows", [&] {
+            dim3 grid(M, kTqNormPartials);  // grid.x = units, grid.y = partials
+            tq_quant_norm_partial_kernel<scalar_t>
+                <<<grid, kTqNormThreads, 0, stream>>>(
+                    x.data_ptr<scalar_t>(),
+                    partials.data_ptr<float>(), M, K, chunk);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+
+    // ---- stage 2: the second-launch finalizer (dtype-independent) ----
+    const int fold_blocks = (M + kTqNormThreads - 1) / kTqNormThreads;
+    tq_quant_norm_fold_kernel
+        <<<fold_blocks, kTqNormThreads, 0, stream>>>(
+            partials.data_ptr<float>(), norms.data_ptr<float>(),
+            M, kTqNormPartials);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return norms;
+}
+
+}  // namespace
