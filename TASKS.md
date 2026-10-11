@@ -77,7 +77,7 @@ recorded) and stand up the audit + test-guard infrastructure every later
 wave depends on. No production code is touched.
 
 #### W20.0.1 — CPU-box toolchain audit + latest-stable provisioning
-- [ ] done
+- [x] done
 ROLE task-writer · READ `PROMPT.md §6`; `PROPOSAL.md §8` · WRITE
 `env/W20_ENV.md` (new), `.gitignore` (only if env artifacts must be
 excluded)
