@@ -96,8 +96,8 @@ DOUBLE_ROUND_GATE = 0.10
 
 
 def _rel_mse(a, b) -> float:
-    a = np.asarray(a, dtype=np.float64).reshape(-1)
-    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    a = np.asarray(a.cpu() if torch.is_tensor(a) else a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b.cpu() if torch.is_tensor(b) else b, dtype=np.float64).reshape(-1)
     return float(((a - b) ** 2).sum() / max(((b ** 2).sum()), 1e-30))
 
 

@@ -167,7 +167,7 @@ def test_config_route_full_cache_api_roundtrip():
     # the no-fp16 invariant + uint8 codes hold on the config route too
     assert dict.get(layer.conv_states, 0) is None
     assert dict.get(layer.recurrent_states, 0) is None
-    assert layer.s_codes.idx_lo.dtype == np.uint8
+    assert layer.s_codes.idx_lo.dtype == torch.uint8
 
     # the inherited transformers error contracts
     with pytest.raises(ValueError):

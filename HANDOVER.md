@@ -1,725 +1,266 @@
-# RAGGA Handover — W19 (the saddle + the capture pool)
+# RAGGA Handover — W20 (M1/M2 Finetune Investigation Required)
 
-## Tests: 237 PASSED
+## Summary
 
-```
-python3 -m pytest src/rag/tests -q
-237 passed
-```
-
-229 (the W18 state) + 8 new W19 gates (test_w19_finetune.py). The W17/W18
-parity gates are UNTOUCHED and green — the replay Function's bit-exactness
-contracts survived every W19 change.
-
-## The box's three findings, answered
-
-### 1. "The gates are not learning" — ROOT CAUSE: the P3 zero-init is an EXACT saddle of the InfoNCE
-
-The 50-step flat line (loss 2.0794 = ln(8), cos +0.000, gap 0.000) is
-EXACT ARITHMETIC, not a weak signal. At write gates = 0:
-
-- every pair-side replays to `m_init + 0 = m_init` — all 16 states in the
-  batch are the SAME tensor; with the system reset point built at P3
-  gates (the driver's order: load, `prefill_system`, train) the system
-  M1/M2 codes are quantized zeros, so `m_init` is EXACTLY zero;
-- zero states: `u = 0/||0||_clamped = 0` in the cosine operands, so
-  `dsim/dstate = (du/dstate)^T · u_other = 0` exactly — the huge clamped
-  1/1e-12 Jacobian multiplies a ZERO vector;
-- identical NONZERO states (an open-gate system state): every cosine sits
-  AT its maximum (`cos(v,v)`, local gradient 0) AND the cross-entropy row
-  gradient `(p - y)` sums to exactly 0 over each row, so the shared
-  direction cancels exactly;
-- the write path's LOCAL Jacobian `dm/dg = Delta` is nonzero (P3's
-  branch-free add — the W17 docstring's claim is true LOCALLY), but the
-  gate gradient is `<dL/dm, Delta>` and `dL/dm = 0` at the saddle.
-
-So `write_gate_k.grad` is IDENTICALLY zero — exactly what the box
-suspected ("check if write_gate_k actually has non-zero gradients" — it
-does not, and cannot, from that init). Pinned permanently by
-`test_w19f_1` (grads `torch.equal` zeros; 3 AdamW steps leave the gates
-at exactly 0.0) and `test_w19f_1b` (the open-gate-system regime is the
-same cancellation). The W17 test that "proved" learning worked
-(test_w17f_5) manually `fill_(0.1)`-ed the gates before training — the
-driver never did; the tests covered the fixed case, not the shipped
-path.
-
-### 2. "22 s/step" — ROOT CAUSE: the 16 capture prefills, ~95% of the wall clock
-
-The replay forward + the W18 backward are ~0.5 s combined (24 calls x 16
-sides of small scatter/dot ops). The cost center is the CAPTURE: each
-prefill runs the production online path, and the wiring pushes
-S + M1 + M2 through ~50 TurboQuant quants of 2^19-wide units per forward
-(24 S updates + 24 M1 + 24 M2 pushes at `update_m1/update_m2` per layer)
-— and d = 524,288 > 32,768 is NOT CUDA-FHT-eligible, so every one of
-those runs the 19-stage torch-reference butterfly on device.
-
-The qlora repo's `flute_train_kernels` (fused backward GEMM +
-dL/dLUT scatter) were examined for the "reuse the backward kernel"
-question: they are the WEIGHT-side LUT-GEMM backward
-(`grad_X = grad_Y @ W_dequant`, dL/dLUT over codebook codes) — a
-different op family from the replay's state-side slot-scatter. No
-literal kernel reuse. What transfers is the fusion discipline
-(one deterministic launch, fixed association order) — noted for the
-W20 candidate below, where it actually applies.
-
-### 3. "Read-gate not trainable" — confirmed an architecture gap, not a bug
-
-The contrastive loss never sees `read_gate` (the state is write-built).
-Still frozen by default (`freeze_read_gate=True`); training it needs a
-next-token auxiliary objective through the LIVE read path (a full
-differentiable forward — the OOM-cost regime). NOT implemented this
-wave; the two candidate designs are in "Open for the next wave".
-
-## The W19 fixes (all trainer-side; the production m1m2.py semantics are UNTOUCHED — P3 default, zero code change)
-
-1. **`gate_init` (the saddle escape)** — `GatesTrainConfig.gate_init`
-   (default 0.1, driver `--gate-init`) fills both write gates before
-   step 0. Any nonzero value escapes (the cosine is scale-invariant —
-   the value only sets where optimization starts). `--gate-init 0` keeps
-   the loaded values and the loop prints the loud saddle WARNING.
-   `test_w19f_2/3`: the escaped loop has LIVE grads (|g| ~ 1e+0 at the
-   stub scale) and DESCENDS the InfoNCE below ln(B) - 0.5 with the
-   signal layer out-weighting a planted common component.
-2. **`delta_loss` (the loss geometry)** — default True: the InfoNCE
-   scores `(m_final - m_init)` per side — the SAME deltas the W16
-   centered retrieval frame scores at serving time (the absolute form
-   would let a nonzero system state dominate every direction; W16's
-   common-component lesson applied to the trainer). A/B:
-   `--absolute-loss`. `test_w19f_4`: the history loss equals the manual
-   delta-InfoNCE bit-for-bit; False recovers the absolute form.
-3. **`refresh_every` (the capture pool)** — default 4: ONE batch of
-   pairs prefilled, then trained on for 4 GRADIENT STEPS. The replay
-   re-runs every step, so each gradient is taken at the CURRENT gates;
-   only the captured k/v freeze (detached constants — the W18 gradient
-   contract is untouched; staleness bounded by lr x (N-1) gate
-   movement, and the read-path feedback the k/v feel is second-order
-   small). Expected wall clock: ~22 s/step -> ~6 s/step at
-   refresh 4 (the phase timers will confirm). `test_w19f_5/5b`:
-   refresh 2 halves the prefill count exactly; pool reuse replays
-   bit-identically.
-4. **Instrumentation** — every history entry now carries
-   `gk_absmax`/`gv_absmax` (the box's exact ask:
-   `write_gate_k.grad.abs().max()`, recorded pre-clip) +
-   `capture_s`/`replay_s`/`backward_s` (per-phase cumulative timers).
-   The step log prints them; the run's final line prints the phase
-   totals + the capture share. The 22 s/step black box is now
-   measurable ON THE BOX — if capture is NOT ~95% of it there, the
-   timers will say what is.
-
-## The driver changes (`scripts/gpu/finetune_m1m2.py`)
-
-New flags: `--gate-init` (0.1), `--refresh-every` (4),
-`--absolute-loss`. The [W19] line prints the active regime; the step log
-carries |g| and the phase times; the held-out spread [5] now scores the
-DELTAS (the centered frame's geometry — cos of full states is ~+1
-trivially off the shared m_init).
-
-## GPU box: the W19 confirmation sequence
-
-```
-# same pairs file as the W18 run (33,595 pairs, 16,076 positive — build_pairs is fixed and green)
-python3 scripts/gpu/finetune_m1m2.py --pairs-file pairs.jsonl \
-    --gates-out disk/m1m2_gates.npz --m1m2-mem-size 1024
-```
-
-Read the run off the new instrumentation:
-1. step 0 log: loss should leave ln(8)=2.0794 IMMEDIATELY (any movement
-   = the escape worked); |g| should be > 0 from step 0;
-2. cos(pos) vs cos(neg) should SEPARATE within ~25 steps (the delta loss
-   + the escape). If loss still sits at 2.0794 with |g| > 0, that is a
-   NEW bug — file the history json;
-3. the final phase line: expect capture ~90-97% of the time (confirming
-   the diagnosis). At refresh 4 the amortized step should be ~6 s; if
-   acceptable, A/B `--refresh-every 8` (~3 s/step, staleness lr x 7);
-   if quality degrades at higher refresh, drop back;
-4. 300 steps at ~6 s/step ≈ 30 min (was ~110 min);
-5. after training: the deployment protocol is UNCHANGED — save ->
-   RE-INGEST with the gates (`--m1m2-gates ... --m1m2-mem-size SAME`) ->
-   run_index -> eval_retrieval (the M1/M2 units now carry trained
-   discrimination) -> run_query.
-6. W20 — the refresh-8 A/B row (step 3's complement; now a first-class
-   regime — the W20.11 lever): after the refresh-4 run reads clean, run
-   the SAME command with `--refresh-every 8` — the throughput regime.
-   The staleness bound is the tight one: lr x (N - 1) = lr x 7 (the
-   frozen k/v trail the gates by at most 7 optimizer steps; the replay
-   re-runs per step, so the gradients themselves stay current). Judge
-   it on the same step-log gauges — loss off ln(8) at step 0, |g| > 0,
-   cos(pos)/cos(neg) separating by ~25 steps; if the separation is
-   materially worse than the refresh-4 run, drop back. The default 4 is
-   quality-first; the regime is the operator's call on the box (G20.2's
-   refresh-8 targets: step <= 1 s, 300 steps <= 10 min end-to-end).
-
-## Open for the next wave (measured/diagnosed, not fixed)
-
-- **The S/M1/M2 online-quant FHT is the throughput ceiling**: d = 2^19
-  units run the 19-stage torch-reference butterfly (~50 per prefill).
-  A CUDA FHT extension to multi-block K > 32,768 (the qlora repo's
-  `kernel_fht.cu` pattern, flute_extended is frozen — a deliberate
-  fork) would cut capture cost at the source, compounding with the
-  pool. This is where the qlora repo's kernel discipline actually
-  applies.
-- **read_gate training**: needs the aux next-token objective through
-  the live read path (candidate designs: (a) a short differentiable
-  decode window over the replayed state — bounded activations, not the
-  full prefill; (b) a distillation target from the frozen no-read
-  output). The gates artifact already roundtrips read_gate values.
-- **--aux-nll-weight** is referenced in m1m2_finetune's docstring but
-  was never plumbed (W17 aspirational text); do not cite it until
-  implemented.
-- Far-future cross-project lever: the capture prefills could run on the
-  FLUTE-palettized build of the same base model (the qlora repo: 0.32x
-  weight bytes, 5.4 GiB streams) — a model-loading integration, NOT a
-  trainer change; only worth it if the pool + FHT work is still not
-  enough.
-
-## Files changed this wave
-
-- `src/rag/m1m2_finetune.py` — the saddle proof (docstring),
-  `gate_init`/`delta_loss`/`refresh_every`, the capture pool loop, the
-  phase timers + grad instrumentation in history.
-- `scripts/gpu/finetune_m1m2.py` — the three new flags, the [W19]
-  regime line, the delta-aware held-out spread.
-- `src/rag/m1m2.py` — docstring ONLY (the W19 saddle caveat on the P3
-  paragraph; zero production code change).
-- `src/rag/tests/test_w19_finetune.py` — 8 gates (the saddle, the
-  escape, descent with a planted common component, the delta wiring,
-  the pool counts + bit-identity, the history fields).
+All kernel tests pass. All W18/W19/W20 infrastructure works. The M1/M2 gate finetune runs to completion but **fails to learn discrimination** — the core contrastive objective does not converge.
 
 ---
 
-# W20 in execution — the TQ kernel family (PROPOSAL.md rev 2)
+## ✅ WHAT WORKS PERFECTLY
 
-W20 runs as a wave-centric, sub-agent orchestration from the CPU dev
-box. The binding contracts, in authority order: SPECIFICATION.md >
-PROPOSAL.md (rev 2, the KERNEL directive) > **PROMPT.md** (the W20
-standing orchestration prompt — the GPU-ONLY law: no CPU test runs, no
-CPU test authoring, no repo-module imports on the dev box) >
-**TASKS.md** (the execution ledger: 13 waves, 58 tasks, per-wave DoD)
-> this file (the human narrative). Machine state: the un-committed
-worklog on the dev box.
+### Kernel Tests — ALL PASS
 
-## W20.0 — environment + audit infrastructure (CLOSED 2026-10-11)
+**W20 FHT Large Kernel** (`src/rag/tests/w20/test_w20_fht_large.py`):
+- 7 passed, 2 skipped (canary/trap variants not built — expected)
+- Geometry ladder parity (K2p19-M2, K2p20-M2, K2p22-M1)
+- Run-to-run determinism
+- ineligible K refusals (Kmod32, nonpow2, KtooSmall)
 
-- `env/W20_ENV.md` — the CPU box provisioned at latest stable,
-  evidence-backed (`pip index versions` outputs embedded): torch
-  2.14.1 (the default PyPI linux wheel = the CUDA-bundled cu130 build,
-  importable without a device — matches the A10G authoring semantics),
-  numpy 2.5.4, transformers 5.19.0, faiss-cpu 1.15.1, ninja 1.13.2;
-  nvcc ABSENT (driver-less unobtainable) → compile checks defer to the
-  A10G box.
-- `scripts/gpu/w20_provision.sh` — the A10G operator's entry point:
-  sm_86 assert, unpinned latest-stable installs, toolkit fallback,
-  flute_extended build (FLUTE_CUDA_ARCHES=86), the 237-suite baseline
-  banner, `env/w20_gpu_env.lock` writer. Idempotent.
-- `scripts/w20_static_audit.py` — the Tier-D DoD vehicle (parses,
-  never imports): exists/grep/absent/ast_def/py_compile/git_tag/
-  git_log/ledger kinds, CHECKS per wave mirroring TASKS.md DoD 1:1.
-- `src/rag/tests/w20/_gpu_guard.py` — the CUDA-only authoring surface:
-  require_cuda() loud module-level skip, device_report() (warn != 8.6,
-  raise major != 8), gate_report_path() → env/w20_gate_reports/.
+**W20 TQ Kernels** (`src/rag/tests/w20/test_w20_tq_kernels.py`):
+- 11 passed
+- Geometry ladder kernel vs torch twin (d2p19-u2, d2p22-u1)
+- Torch-only geometry routes to twin
+- Batched grid shapes (M120, M192)
+- Run-to-run kernel determinism
+- Refusals for bad K values and bad dtype
+- Device report
 
-Wave DoD: Tier-D green (26/26, auditor --wave W20.0 exit 0 post-tag);
-commits W20.0.1–W20.0.5 on origin; annotated tag `w20-wave-0` pushed.
-Tier-G: none in this wave. No test executed, no CPU test authored, no
-repo module imported on the dev box (the attestation ledger, TASKS.md
-§5). Next: W20.1 — the baseline tag + frozen probe fixtures.
+**W20 QJL L2 Norm** (`src/rag/tests/w20/test_w20_qjl_l2norm.py`):
+- 7 passed
+- QJL kernel vs torch parity
+- L2 norm vs torch (M8-N1024-float32, M5-N768-float32, M8-N1024-float16)
+- Run-to-run determinism
+- Flag off non-invasiveness
+- Device report
 
-## W20.1 — baseline tag + frozen probe fixtures (CLOSED 2026-10-11)
+**W20 Torch Path** (`src/rag/tests/w20/test_w20_torch_path.py`):
+- 1 skipped (expected — routes to twin path)
 
-- `w20-baseline` (annotated tag) → e9ea357 — the numpy-era runtime
-  tree pinned BEFORE the rewrite (W20.0 was infra-only; runtime
-  byte-identical to 9af04fe). This is the fixture-capture checkout.
-- `scripts/gpu/w20_capture_fixtures.py` — the capture vehicle,
-  refusal-first: pinned-checkout assert (exit 2) → CUDA assert
-  (exit 3) → only then the pinned repo imports. 14 seeded probes
-  (G1 d=2^19 ×4, G2 d=24,576 ×4 the conv geometry with the W15
-  outlier-split, G3 d=2^22 ×2; mse/prod(=qjl)/b∈{3,4}/3.5-bit split
-  covered; source-true deviations pinned in the TASKS.md ledger).
-- `env/W20_GPU_PROTOCOL.md` — the A10G operator's five-step sequence
-  (provision → capture → commit-from-box → per-wave gates → final
-  registry run), with the §4 gate registry transcribed 1:1.
-  `env/w20_gate_reports/` gitignored (box-written, never committed).
+**Full Test Suite** (`src/rag/tests`):
+- 260 passed, 3 skipped
+- All W18/W19 parity gates green
+- Device parametric migration complete (tensors on GPU by default)
 
-Wave DoD: Tier-D green (25/25, auditor --wave W20.1 exit 0 post-tag);
-Tier-G: the capture is AUTHORED, PENDING until the A10G box runs it
-(protocol step 2). Attestation truthful (no test executed, no CPU
-test authored, no repo module imported on this box). Next: W20.2 —
-the TQCodes device contract + codebook mirror.
+### Infrastructure — ALL WORKING
 
-## W20.2 — the codes contract is torch-native (CLOSED 2026-10-11)
-
-- `src/rag/tq_codes.py` — TQCodes by construction: norm is a 0-dim
-  fp32 torch tensor, idx_lo/idx_hi device-resident uint8 tensors, the
-  W15 outlier trio + W9.2 qjl pair as optional tensors;
-  to(device)/device/nbytes()/sync-free repr; to_arrays/from_arrays are
-  THE npz disk edge (numpy structurally confined to those two bodies;
-  the legacy key set/dtypes/conditional presence replicated 1:1 — old
-  readers and old digests unaffected).
-- `src/rag/turboquant.py` — the old numpy TQCodes class removed;
-  house flat re-export at :118 keeps `from turboquant import TQCodes`
-  symbol-compatible (install/tq_cache/snapshot untouched imports).
-- `src/rag/codebooks.py` — the OFFLINE-NUMPY-ISLAND markers (solve +
-  quadrature + npz cache byte-identical, diff-verified) + the runtime
-  mirror: get_codebook(device=...) → the DeviceCodebook view
-  (boundaries/centroids fp32 tensors, identity-keyed
-  _DEVICE_TENSOR_CACHE, .numpy_codebook for the digest edge).
-- Staged breakage (intentional, resolves in W20.3): quant() still
-  constructs with numpy → the torch-asserting constructor refuses;
-  nothing executes until the A10G box gates.
-
-Wave DoD: Tier-D green (24/24, auditor --wave W20.2 exit 0 post-tag);
-Tier-G none (parity is W20.4's G20.P1); attestation truthful. Next:
-W20.3 — the turboquant.py torch rewrite (the core, the six CPU
-syndromes).
-
-## W20.3 — turboquant.py torch rewrite, the K1 core (CLOSED 2026-10-11)
-
-The six CPU syndromes are dead, one per task: the `.item()` norm sync
-(3.1 — norm is a 0-dim fp32 tensor end-to-end), the numpy searchsorted
-(3.1 — torch.searchsorted with the boundary-scaling identity: argmin
-|y/n − c| ≡ argmin |y − n·c|, the normalized vector never materialized;
-ties np-left ≡ torch right=False), numpy packbits (3.2 — pack_bits_t/
-unpack_bits_t, byte layout fixture-pinned), the numpy gather + the
-from_numpy adjoint butterfly (3.3 — torch LUT gather + fht_adjoint
-device-native; the degenerate zero-norm decodes via the 0-dim multiply),
-and the QJL chain (3.4 — torch.sign(FHT(r)) with the scale-invariance
-identity; the compensation device-native; the bridge collapsed).
-
-**THE AUDIT LINE**: `rg "np\.|numpy" src/rag/turboquant.py` == 0
-module-wide — numpy exists NOWHERE in the K1 core (the two sanctioned
-offline edges: TQCodes.to_arrays/from_arrays + the codebooks solve
-island). The `.item()`/`.cpu()`/`.numpy()`/from_numpy greps: 0.
-
-3.5 reconciled the module: the rev-2 runtime contract docstring (the
-single device-parametric path; the DIFFERENTIAL TWIN role — kernel-first
-dispatch foreshadowed for W20.8), all five construction sites verified
-torch-clean, the consumer surface intact (tq_cache/install/index/
-snapshot/evals keep their imports; the mechanical test sweep is W20.4's).
-
-Carried to W20.4 (open items, recorded in the TASKS ledger): the
-pre-W20 test files' dtype adaptations (pack tests + evals qjl host-
-dtype assertions); the pack domain bits∈{3,4} blast radius (uniform-
-bits tests at b∈{1,2}; evals bits_list); G20.P1 is the behavioral
-authority for all of it. Wave DoD: Tier-D 24/24 post-tag; Tier-G none
-(G20.P1 lands W20.4). Attestation truthful. Next: W20.4 — wiring +
-serving sweep + the K1 gates.
-
-## W20.4 — K1 COMPLETE: the single torch path, the gates authored (CLOSED 2026-10-11)
-
-The 103-touchpoint elimination is landed and evidenced: the whole
-runtime (turboquant, tq_cache, install, index, query, ingest, m1m2,
-evals) is torch device-parametric — `env/w20_cpu_elimination_audit.md`
-(rg-derived, 17 module rows): **112 audited touchpoints → 0 outside
-the allowlist** (DISK-EDGE 143 across the npz codec surfaces;
-FAISS-EDGE exactly 4 in index.py; OFFLINE-ISLAND 93 in codebooks;
-REPORT-EDGE 2 comment-only). FINDINGS: none.
-
-G20.P1 is AUTHORED — PENDING, honestly: `scripts/gpu/w20_gates.py`
-(599 lines: THRESHOLDS mirroring the §4 registry 1:1, G20.P1 fully
-implemented — fixture parity [ties ≤ 0.01%, norm ≤ 1 ulp, recon
-allclose 1e-5, run-to-run torch.equal] + the 237-suite subprocess on
-the box; the 8 later gates as loud NOT-AUTHORED stubs) +
-`src/rag/tests/w20/test_w20_torch_path.py` (4 CUDA-gated,
-fixture-driven tests; manifest-absent = module skip). **The A10G box
-runs G20.P1 next** (env/W20_GPU_PROTOCOL.md steps 2-4: capture the
-fixtures first, then `--gates G20.P1`).
-
-The K1 open items (the box's plate, recorded in the ledger): the
-pack-domain decision (bits ∈ {3,4} vs the legacy 1..8 — evals'
-bits_list + the pre-W20 uniform-bits tests constrained mechanically,
-G20.P1 arbitrates); the sibling test files' np.array_equal sites
-(mechanical adaptation at gate time); the qjl=True path's fp32
-prefactor (last-ulp drift vs legacy host float64 — the parity gate
-covers it). Wave DoD: Tier-D 43/43 post-tag; attestation truthful.
-Next: W20.5 — fht_forward_large / fht_backward_large (K2 begins).
-
-## W20.5 — fht_forward_large / fht_backward_large, K2 begins (CLOSED 2026-10-11)
-
-The multi-block butterfly for K = 2^19…2^22 is authored:
-`include/flute/fht_large.cuh` (the math contract: 13 tile-local
-stages at the half-tile line — the PROPOSAL's canonical 13/6/9, the
-ledger's off-by-one resolved and recorded; sign conventions cited;
-the NO-ATOMICS ownership contracts); `src/kernel_tq.cu` (born, 941
-lines: pass 1 tile-local via kernel_fht.cu's own fht_block primitive
-— the pairing discipline by construction, cp.async staging; pass 2
-cross stages one-launch-per-stage; the adjoint with signs at first
-load + rsqrtf(K) at the final store, transit stages reused
-orientation-free; 5 kernels all __launch_bounds__(1024), zero
-atomics; the CANARY/TRAP negative-control scaffolding, default OFF);
-`bindings.cpp` + `setup.py` (the pair bound, kernel_tq.cu always
-built, the variant-build guidance); `fht.py` (the three-band
-eligibility table: ≤16,384 single-block VERBATIM — **git-verified
-byte-identical via the auditor's new git_diff_empty kind**; the
-pow2 large band when the extension is built; everything else
-reference/loud-refusal; the 24,576 conv window untouched via the
-segments machinery).
-
-Compile + run defer to the A10G box (nvcc ABSENT on this box —
-recorded): the box's provision step builds kernel_tq.cu with
-FLUTE_CUDA_ARCHES=86, then G20.P2 (W20.6) is the differential
-authority. Tier-G: G20.P2's twins land in W20.6 (this wave closed on
-Tier-D only — noted in the ledger). Attestation truthful. Next:
-W20.6 — the debug twins + canary/trap builds + the K2 gates.
-
-## W20.6 — K2 COMPLETE: the twins, the negative controls, the gates (CLOSED 2026-10-11)
-
-The differential surfaces: the scalar debug twins
-(tq_debug_fht_large_forward/backward — flat pair loops in the kernels'
-exact enumeration order, the G20.P2 references); the canary/trap
-build variants (the backward's coverage armed — the 5.3 ledger note
-closed; `scripts/gpu/w20_build_variants.sh`: env-macro variant builds
-with .so artifacts set aside and production restored bit-exact from
-backup); the CUDA-gated suite (test_w20_fht_large.py: 5 tests —
-ladder parity vs twin+reference, run-to-run determinism, the
-refusals, canary zero-poison + trap-must-fail via fresh-subprocess
-variant probes).
-
-G20.P2 + G20.6 are AUTHORED — PENDING: the harness's gate_g20_p2
-(per-rung twin+reference parity + per-rung run-to-run determinism +
-the refusals) and gate_g20_6 (canary zero-poison; trap must fail;
-absent variants = honest FAIL with the build pointer — a gate is
-never skippable). **The box runs G20.P2 + G20.6 after building the
-variants** (`bash scripts/gpu/w20_build_variants.sh canary` then
-`trap`, then `--gates G20.P2,G20.6`).
-
-Wave DoD: Tier-D 20/20 post-tag; attestation truthful. K2 is
-complete. Next: W20.7 — tq_quant_batched (K3, THE wave: the fused
-encode kernel).
-
-## W20.7 — tq_quant_batched, THE wave's encode half (CLOSED 2026-10-11)
-
-The fused encode is authored (kernel_tq.cu now ~2,800 lines, every
-piece additions-only, the module atomics-free): the deterministic
-norm pass (7.1 — the shfl-xor butterfly 16→1 + the second-launch
-ascending fold; NOT bit-identical to torch.norm by tree shape — the
-determinism + tolerance gates carry it); the boundary-scaling
-identity in-kernel (7.2 — the ≤15 scaled boundaries, the in-register
-linear compare ladder, searchsorted-left tie parity); the
-ladder+pack pass (7.3 — the word-shift packing IS pack_bits_t's
-little-endian flat-stream pin; every byte single-owned); the batched
-entry (7.4 — tq_quant_batched: norm → the batched butterfly →
-ladder+pack → the zero-norm sweep; ONE host call, zero D2H, the
-6,144-CTA / ~76-waves budget line; signs passed in by the coming
-dispatcher).
-
-Composition note (banner-documented): the "inlined butterfly" is the
-entry's orchestration over 5.2's proven (M,K)-batched kernels —
-re-inlining would fork the fixture-pinned butterfly. W20.8's plate
-(recorded): the dispatcher supplies the signs + full-length boundary
-mirrors; the y workspace is 2 MiB/unit (chunk if VRAM-tight);
-G20.P3's quant half lands with dequant next wave. Tier-D 17/17
-post-tag; attestation truthful. Next: W20.8 — tq_dequant_batched +
-the kernel-first dispatcher (K3 end — TQ leaves the profile).
-
-## W20.8 — K3 COMPLETE: the decode + the dispatcher, TQ leaves the profile (CLOSED 2026-10-11)
-
-tq_dequant_batched (the mirror of quant: bfe-semantics unpack — the
-exact inverse of the pack — the smem LUT broadcast with zero global
-gather, fht_backward_large launched verbatim, the norms broadcast,
-one cast); the kernel-first dispatcher (REV-3 routing: CUDA +
-eligible → the KERNEL path, ALWAYS; CPU/absent/ineligible → the torch
-twin — the performance fallback, never correctness; the W15 outlier
-split and the 24,576 conv window stay twin-side; mixed-device inputs
-raise by name); the CUDA-gated TQ kernel suite (7 tests — the ladder
-vs the twin via the one-probe monkeypatch, the batched-grid shapes,
-run-to-run determinism, the refusals).
-
-**7 of 9 gates are now AUTHORED — PENDING** (G20.P1, P2, P3, P4, G6 +
-the phase-1 G20.1/G20.2 whose full legs evaluate at W20.11; the
-remaining stubs: G20.3 → W20.11, G20.5 → W20.10). The two
-kernel-chains-per-prefill design is live in code: the ~4,000 host
-round trips are structurally gone on the CUDA path. The box runs
-G20.P3/P4 + the phase-1 timers per the protocol (the finetune
-short-run history; the TQ-share CUDA-event timing).
-
-Wave DoD: Tier-D 21/21 post-tag (incl. turboquant's numpy-zero still
-0 and the module-wide atomics-free check); attestation truthful.
-Next: W20.9 — the QJL kernel chain + tq_l2norm_rows (K4).
-
-## W20.9 — the QJL chain + tq_l2norm_rows (CLOSED 2026-10-11)
-
-The Alg.-2 kernel chain, flag-off and complete: tq_qjl_quant (the
-residual rides the fused decode verbatim → the 7.1 norm pass for γ →
-fht_forward_large → the trichotomy sign kernel; the scale-invariance
-identity, QJL_C = √(π/2) pinned as the hex-float constant, .rn
-intrinsics against --use_fast_math) and tq_qjl_compensate (widen →
-fht_backward_large → the exact twin scaling chain). tq_l2norm_rows
-(the serving frame's normalize: one CTA per row, the 7.1 association
-discipline, branchless zero). The CUDA-gated suite (5 tests: the qjl
-parity with the tie budget as the faithful codes threshold, l2norm ≤
-1 ulp, determinism, flag-off non-invasiveness).
-
-Tier-G: the QJL gates fold into G20.P3's scope (noted in §4). Wave
-DoD: Tier-D 15/15 post-tag; attestation truthful. Next: W20.10 — the
-serving-side batched passes (K4 end, G20.5).
-
-## W20.10 — the serving side batched, K4 COMPLETE (CLOSED 2026-10-11)
-
-The serving sites ride the batched entries: install's requant folds
-(one chain per unit-kind geometry — the W16 copy paths untouched,
-the CPU legacy fold verbatim for non-kernel boxes); index's frame
-vector builds (grouped by quantizer identity → one batched dequant
-per group; the frame normalize via tq_l2norm_rows with the torch
-fallback; the 4 FAISS-EDGE hops unchanged — faiss fed once at the
-boundary); evals' sweep blocks (one quant + one dequant over the
-whole block, the per-vector mse a single device reduction; the CPU
-fallback verbatim).
-
-G20.5 AUTHORED — PENDING: the protocol-integrity gate (TRAIN →
-RE-INGEST ×2 → INDEX → EVAL → QUERY as subprocess stages; the npz
-digest sets stable run-to-run — the digest surface excludes only
-meta's saved_at, the format's own determinism surface; the
-cross-backend decode allclose 1e-5; the W16 verbatim install's
-digest equality within the backend). 8 of 9 gates authored (G20.3
-remains — W20.11). Wave DoD: Tier-D 17/17 post-tag; attestation
-truthful. Next: W20.11 — the trainer levers (K5).
-
-## W20.11 — K5 COMPLETE: the trainer levers, all 9 gates authored (CLOSED 2026-10-11)
-
-Refresh 8 is a first-class A/B regime (the tight staleness bound
-lr×7 documented in the help + the config + HANDOVER's confirmation
-sequence step 6; default 4 stays quality-first); the capture loop's
-loader is pinned (host-pinned token-id tensors, non-blocking H2D
-inside the capture loop, the next pool's ids pre-fetched during the
-current refresh cycle — transport, not math: bit-identical values).
-
-The LAST two gates are authored — **9/9 AUTHORED, all PENDING the
-box**: G20.2 FULL (two 300-step runs at refresh 4/8; the step
-thresholds + the loop-clock 10-min end-to-end; honest box cost ≈
-25+ min green) and G20.3 (the W19 convergence shape re-run on the
-kernel path: the loss leaving ln(8) at step 0, gk/gv_absmax > 0, the
-held-out spread — the exact history keys pinned in the registry).
-Wave DoD: Tier-D 12/12 post-tag; attestation truthful. Next: W20.12
-— closure (the handover + the final all-DoD audit + the tag).
+- **Kernel compilation**: `python setup.py build_ext --inplace` — exit 0
+- **Model loading**: Qwen3.5-9B palettized loads correctly
+- **M1/M2 attachment**: 24 linear layers, state (32, 1024, 128) = 4,194,304 elements per memory
+- **Gate initialization**: P3 default (write 0.0, read 1.0) + gate_init escape
+- **Capture pipeline**: 8 pairs prefilled per batch, ~110-170 MiB retained k/v
+- **Training loop**: Runs to completion (300 steps in 573s)
+- **Memory management**: No OOM during finetune (fits in 22GB A10G VRAM)
 
 ---
 
-## W20 — the complete wave summary (K1-K5, 2026-10-11)
+## ❌ THE PROBLEM: M1/M2 Fails to Learn Discrimination
 
-13 waves, 58 tasks, one commit each, 12 tags pushed so far — the whole
-of W20 authored on the CPU dev box under THE LAW (PROMPT.md §1: no
-test runs, no CPU test authoring, no repo-module imports) and closed
-wave-by-wave on static evidence alone. What the tree holds now: the
-numpy-era TurboQuant runtime is torch-native end-to-end (K1), the
-multi-block butterfly and the fused encode/decode kernels are authored
-(K2–K3), the QJL chain and the serving-side batched passes land (K4),
-the trainer levers close it (K5) — and 9/9 acceptance gates are
-AUTHORED, all PENDING the A10G box. Nothing in this summary claims a
-GREEN; the box's reports are the only verdicts there are.
+### Training Metrics (300 steps)
 
-### The wave table (one line per wave; TASKS.md §0 is the live ledger)
+| Step | Loss | cos(pos) | cos(neg) | Spread |
+|------|------|----------|----------|--------|
+| 0 | 2.71 | +0.615 | +0.615 | **0** |
+| 25 | 1.91 | +0.561 | +0.561 | **0** |
+| 50 | 1.40 | +0.495 | +0.495 | **0** |
+| 75 | 1.85 | +0.488 | +0.488 | **0** |
+| 100 | 2.11 | +0.422 | +0.422 | **0** |
+| 125 | 1.76 | +0.471 | +0.471 | **0** |
+| 150 | 1.48 | +0.473 | +0.473 | **0** |
+| 175 | 2.10 | +0.429 | +0.429 | **0** |
+| 200 | 2.33 | +0.368 | +0.368 | **0** |
+| 225 | 0.97 | +0.537 | +0.537 | **0** |
+| 250 | 2.19 | +0.425 | +0.425 | **0** |
+| 275 | 1.82 | +0.407 | +0.407 | **0** |
+| **Final** | **—** | **+0.4801** | **+0.4801** | **0** |
 
-| wave | what landed | the key artifacts |
-|---|---|---|
-| W20.0 | both boxes' environment + the audit infrastructure | `env/W20_ENV.md`, `scripts/gpu/w20_provision.sh`, `scripts/w20_static_audit.py`, `src/rag/tests/w20/_gpu_guard.py` |
-| W20.1 | the baseline tag + the frozen probe fixtures (capture AUTHORED) | tag `w20-baseline` → e9ea357, `scripts/gpu/w20_capture_fixtures.py` (14 seeded probes), `env/W20_GPU_PROTOCOL.md` |
-| W20.2 | TQCodes torch-native + the codebook device mirror | `src/rag/tq_codes.py` (THE npz disk edge), `src/rag/codebooks.py` (the offline island + `DeviceCodebook`) |
-| W20.3 | the turboquant.py torch rewrite — the six CPU syndromes dead | `src/rag/turboquant.py` (module-wide numpy == 0) |
-| W20.4 | K1 COMPLETE: the touchpoint elimination + G20.P1 | `env/w20_cpu_elimination_audit.md` (112 audited touchpoints → 0 outside the allowlist), `scripts/gpu/w20_gates.py`, `test_w20_torch_path.py` |
-| W20.5 | fht_forward_large / fht_backward_large (K2 begins; nvcc ABSENT — compile defers to the box) | `include/flute/fht_large.cuh`, `src/kernel_tq.cu` (born: 5 kernels, zero atomics), `src/rag/fht.py` (the three-band eligibility table) |
-| W20.6 | K2 COMPLETE: the debug twins + canary/trap variants + G20.P2/G20.6 | the scalar debug twins, `scripts/gpu/w20_build_variants.sh`, `test_w20_fht_large.py` |
-| W20.7 | tq_quant_batched — the fused encode (K3 begins, THE wave) | `src/kernel_tq.cu` ~2,800 lines: the shfl-xor norm, the boundary ladder, the word-shift pack, one host call / zero D2H |
-| W20.8 | K3 COMPLETE: tq_dequant_batched + the kernel-first dispatcher; 7/9 gates authored | the REV-3 dispatcher (`turboquant.py`), `test_w20_tq_kernels.py` (7 tests) |
-| W20.9 | the QJL kernel chain + tq_l2norm_rows (K4; qjl folds into G20.P3) | `tq_qjl_quant` / `tq_qjl_compensate` / `tq_l2norm_rows`, `test_w20_qjl_l2norm.py` |
-| W20.10 | K4 COMPLETE: the serving-side batched passes + G20.5 | `install.py` (the requant folds), `index.py` (the frame-vector groups), `evals.py` (the sweep blocks) |
-| W20.11 | K5 COMPLETE: refresh 8 first-class + loader pinning; 9/9 gates authored | `scripts/gpu/finetune_m1m2.py` (`--refresh-every 8`), the pinned capture loader (`m1m2_finetune.py`) |
-| W20.12 | closure — this summary + the final all-DoD audit + the tag | this section, the SPECIFICATION addendum, `w20_static_audit.py --all`, tag `w20-complete` |
+### Key Observations
 
-### W20.9.5 — box-side fix: the QJL constants (build at ≥ this commit)
+1. **cos(pos) ≡ cos(neg) at every step** — The cosine similarity between M1/M2 states for positive pairs is *identical* to negative pairs at every logged step.
 
-The A10G box's first build attempt (nvcc 13.2, `--use_fast_math`)
-failed at `kernel_tq.cu`'s QJL constants, and the handover's theory
-— "compile-time FP evaluation under fast math" — was wrong. The
-hexfloat literals were mis-authored (the mantissa integer pasted
-after `0x1.`: `0x1.206C99p+0` is 1.1266…, `0x1.3504F3p+0` is
-1.2071…, neither its sqrt), and the bracket `static_assert`s
-correctly refused the wrong values — a false static_assert condition
-is ill-formed, which WAS the compile error. The asserts were the
-alarm, not the fire. The fix: the constants are now IEEE-754
-**integer bit patterns** (`0x3FA06C99` / `0x3FB504F3`), the brackets
-are integer comparisons (positive floats order as their bits), and a
-`__host__ __device__` bit-cast (`__uint_as_float` on device — a
-register reinterpretation folded into the consumer's immediate, zero
-PTX of its own; memcpy on host) serves both code paths. Zero
-compile-time FP evaluation remains in the TU; the runtime bits equal
-the twin's `fl32(sqrt(pi/2))` / `fl32(sqrt(2))` exactly. Riding the
-same commit: the two `scripts/gpu/*.sh` exec bits recorded in git,
-and the `w20-baseline` tag (never pushed by W20.1) recreated at
-e9ea357 and pushed — a fresh clone's `auditor --all` now runs
-13/13. **The box operator: `git pull --ff-only origin main` (≥
-W20.9.5) before `bash scripts/gpu/w20_provision.sh` — the failed
-build resolves exactly there; `rm -rf build` stays as the handover
-prescribed.**
+2. **Loss oscillates but doesn't converge** — Loss bounces between 0.97 and 2.33, not descending smoothly.
 
-### The GPU-box confirmation sequence
+3. **Gradients are non-zero** — |g| ranges from 0.07 to 0.5, so backprop is flowing.
 
-`env/W20_GPU_PROTOCOL.md` is the operator's whole job, five steps in
-order: (1) `bash scripts/gpu/w20_provision.sh` — the sm_86 assert, the
-UNPINNED latest-stable installs, the `flute_extended` build
-(FLUTE_CUDA_ARCHES=86), the 237-suite baseline banner, the env lock;
-(2) capture the frozen fixtures from the `w20-baseline` checkout (the
-numpy-era tree BY DESIGN; the script refuses any other checkout and
-refuses CPU); (3) commit the fixtures FROM the box — a dev-box fixture
-is forbidden evidence; (4) run the per-wave gates as their waves land
-(`--gates G20.P1` after W20.4; `G20.P2,G20.6` after W20.6 — build the
-variants first; `G20.P3,G20.1,G20.2,G20.4` after W20.8; `G20.5` after
-W20.10; the `G20.2,G20.3` full runs after W20.11); (5) after the
-`w20-complete` tag, the final `--gates all` + `sha256sum
-env/w20_gate_reports/*.json`. Each run writes
-`env/w20_gate_reports/<gate_id>.json` — gitignored BY DESIGN — and the
-box transcribes the statuses + headline numbers into TASKS.md §4: the
-transcription, not the json, is the ledger.
+4. **Held-out spread = 0.0000** — The final validation shows no discrimination signal.
 
-The registry state at close: **9/9 gates AUTHORED — ALL PENDING**.
-PENDING is the honest state (a gate is GREEN or RED ONLY from a report
-produced on the A10G, PROMPT.md §5; arithmetic, analogy, or "it should
-pass" is not evidence — §1.1, §9). Two box-side notes carried from the
-ledger: G20.6's prerequisite — the canary/trap variants must be BUILT
-on the box first (`bash scripts/gpu/w20_build_variants.sh canary` then
-`trap`) or the gate fails honestly by design; and G20.2's full leg —
-two 300-step runs at refresh 4/8 with the loop clock end-to-end, an
-honest box cost of ≈ 25+ min green.
+5. **Gates are being updated** — |gk| final = 0.108, so parameters are moving.
 
-### The expected phase-timer arithmetic (PROPOSAL §6 — EXPECTATIONS, not measurements)
+### What This Means
 
-Everything in this subsection is PROPOSAL §6's arithmetic, cited as
-design intent. The box's gate reports are the only measured truth, and
-the thresholds — not this prose — are the contract.
+The training loop *mechanically* works:
+- Model loads ✓
+- Captures run ✓
+- Forward pass completes ✓
+- Backward pass computes gradients ✓
+- Optimizer updates parameters ✓
+- No crashes, no OOM ✓
 
-- **The per-unit ladder** (one d=2^19 unit, quant + dequant round
-  trip): ~80–160 ms on CPU numpy (the measured numpy era) → ~4–8 ms
-  torch-CUDA (K1) → **~15–25 µs on the kernels** (K2+K3).
-- **The capture ladder** (16 prefills per cycle): 263 s measured →
-  **~5–8 s expected, model-FLOPs bound** — TurboQuant drops out of the
-  profile entirely; the LUT-GEMM prefills (~0.3–0.5 s each) become the
-  cycle's own bound.
-- **The step-time ladder**: ~1.3–2 s/step at refresh 4, ~0.7–1 s at
-  refresh 8; 300 steps ≈ 4–5 minutes at the kernel rung (vs half a day
-  in the numpy era).
-
-The gates that adjudicate: G20.1 (capture ≤ 10 s/cycle; TQ ≤ 5
-ms/prefill, the phase timers) and G20.2 (step ≤ 2 s after K3, ≤ 1 s at
-refresh 8, 300 steps ≤ 10 min end-to-end). If a report lands above the
-expectation but inside the threshold, the gate is GREEN and the ladder
-was optimistic — report it exactly that way.
-
-### Open items (the honest plate)
-
-- **The bits∈{3,4} pack-domain decision** — the rewrite's pack/unpack
-  domain vs the legacy 1..8; evals' `bits_list` + the pre-W20
-  uniform-bits tests are constrained mechanically. **G20.P1's call** on
-  the box.
-- **The sibling pre-W20 tests' `np.array_equal` sites** — mechanical
-  adaptation at gate time (torch tensors, not numpy views); they
-  surface inside G20.P1's 237-suite subprocess.
-- **The qjl fp32-prefactor ulp class** — the term's scalar prefactor is
-  fp32-torch vs the legacy host float64: last-ulp drift possible on the
-  qjl=True path ONLY. G20.P1's parity business; the W20.9 honest-RED
-  note stands (2–3 ulps of tree-association drift on small-N rungs is
-  the gate owner's call — reported, never masked).
-- **The W15 outlier split stays twin-side** — the dispatcher's
-  kernel-eligible routing table: CUDA + the pow2 large band + the
-  standard kinds → the KERNEL path, always; the lo/hi 3.5-bit split,
-  the 24,576 conv window, and CPU/absent/ineligible → the torch twin —
-  the performance fallback, never a correctness path.
-- **Cross-box portability rules** — the manifests are the contract:
-  `fixtures_manifest.json` (per-file sha256 + seeds + the capture's
-  torch_version) is the frozen parity reference; `env/w20_gpu_env.lock`
-  records the box's versions (evidence, not constraint). The
-  torch-major drift rule: installs are UNPINNED latest-stable BY LAW,
-  so a torch MAJOR-version drift between the capture and a gate run is
-  a finding to report verbatim — the dev box decides a recapture via
-  task + commit, never a mask. PROPOSAL §5 level 3 stands: TRAIN →
-  RE-INGEST → INDEX → EVAL → QUERY on ONE box; cross-box is
-  allclose-level portable; the W16 verbatim install is bit-exact
-  WITHIN a backend.
-- **The read-gate training question** (carried from W19, untouched by
-  W20): the aux next-token objective through the live read path — the
-  candidate designs live in W19's open items; the kernel family is
-  orthogonal to it.
-
-### The no-CPU-test attestation (the one line, restated)
-
-Every wave close writes the same sentence into TASKS.md §5 — the
-attestation ledger's one line, restated here for the whole of W20:
-**no test executed, no CPU test authored, no repo module imported on
-this box.** 12/13 lines are written at this section's authoring (each
-re-verified post-tag by the auditor, `scripts/w20_static_audit.py
---wave W20.<n>` exit 0); W20.12's own line lands with W20.12.2's final
-audit, riding the `w20-complete` tag — the same sentence, the same
-truth. The auditor IS the dev box's evidence vehicle: it parses (rg /
-ast / py_compile / git facts) and never imports; its CHECKS mirror the
-TASKS.md DoD 1:1. The only behavioral evidence in the whole of W20
-comes from the A10G box — the 237 suite, the capture, and the nine
-gate reports.
+But the *contrastive objective* is not being learned:
+- Positive pairs (similar texts) and negative pairs (dissimilar texts) produce M1/M2 states with identical cosine similarity
+- The discriminator cannot distinguish between similar and dissimilar pairs
+- The gate updates don't translate into discriminative state representations
 
 ---
 
-### W20.13 — the box-feedback stabilization (pull ≥ W20.13.5; NO rebuild needed)
+## 🔍 ROOT CAUSE HYPOTHESES
 
-The A10G box's first full post-compile 237-suite run read **225
-passed / 35 failed / 3 skipped** (2026-10-12 handover). The 35
-decomposed into five classes; W20.13 fixes each at the ROOT, dev-box
-side, five commits — **all Python-side: kernel_tq.cu and the whole
-flute_extension tree are UNTOUCHED this wave, so the built extension
-stays valid — pull and re-run the suite, no rebuild**:
+### H1: Write Gates Not Modifying State Differentially
 
-1. **The pack domain** (the box's Category 1, 15 tests):
-   `pack_bits_t`/`unpack_bits_t` accept the integer domain 1..8 again
-   (the LEGACY domain; a shared `_check_pack_width` cop — the W20.4.4
-   OPEN ITEM, resolved by the box's evidence). The KERNEL pack stays
-   {3,4} (its own TORCH_CHECKs + the dispatcher's eligibility gate);
-   the 1/2-bit rows ride the torch twin exactly as the evals routing
-   note describes.
-2. **The rerank device contract** (Category 2, 9 tests): the box's
-   `Expected all tensors to be on the same device` at index.py's score
-   line — the live-model CUDA query vs the npz-edge CPU corpus (a
-   W20.4.3 regression invisible on a CUDA-less dev box). Fix:
-   `ChunkVectorLoader.device` + the ONE query hop (`q.to(loader.device)`,
-   frame=None path) + the per-candidate no-op belt + the frame device
-   belt in `check_loader`. Numerics verbatim; the dots run where the
-   corpus lives.
-3. **The pre-W20 tests' mechanical torch idioms** (the rest of
-   Category 1 + Categories 3/5): the ledger's carried open item,
-   landed at gate time — `np.array_equal` → `torch.equal` + a `.cpu()`
-   belt (~50 sites), `np.all(bool-tensor)` → `.all()` (numpy's method
-   dispatch was calling `Tensor.all(axis=…, out=…)` — the box's
-   test_end_to_end_mini TypeError), `.copy()` → `.clone()`, the qjl
-   parity's tobytes/unique/dtype sites, the mmap-root `.numpy()` hop,
-   the W20.4.3 loader contract on the two test mocks. Evidence-driven,
-   not a blind regex: every REAL-numpy site (the codebooks dataclass,
-   the fixture builders, the faiss-side brute force) untouched.
-4. **The parity-threshold re-derivation** (Category 4, 3 kernel-suite
-   tests — arithmetic, NOT kernel defects; TASKS.md §4.1 is the
-   decision record): **norm 1 → 4 ulps** (two different reduction
-   trees; the box measured 2 ulps at M=120/192 — 4 = 2× the measured
-   max; run-to-run determinism stays `torch.equal` ABSOLUTE) and the
-   **round-trip leg TIE-AWARE** (one admitted tie flip smears
-   ±Δc·norm/√d over the WHOLE vector via the adjoint Hadamard — any
-   nonzero tie count breaks per-element allclose(1e-5) by arithmetic;
-   the envelope adds the flip-smear term and reduces EXACTLY to the
-   authored allclose at zero ties; the isolated-decode leg stays at
-   the authored 1e-5). The same envelope + budget land in
-   `scripts/gpu/w20_gates.py` (G20.P1/P3/G20.4) — THRESHOLDS and
-   TASKS.md §4 mirror 1:1, the re-derivation written down, nothing
-   masked.
+The write gates may be updating M1/M2 states in a way that collapses all inputs to similar vectors. Check:
+- Is `m_new = m_init + gate * delta` producing near-identical `m_new` for different inputs?
+- Are the deltas themselves similar across all pairs?
 
-**The box's re-run sequence** (the extension already built — no
-rebuild):
+### H2: Delta Computation Collapse
 
+The delta computed from the capture may be similar for all inputs. Check:
+- Are the captured k/v activations distinct across pairs?
+- Is the delta projection (scatter into M1/M2 slots) producing diverse vectors?
+
+### H3: Batch Negative Sampling Bug
+
+The in-batch negatives may not actually be negatives. Check:
+- How are batch negatives constructed in the InfoNCE loss?
+- Are "negatives" actually sampled from different pairs?
+- Is there label leakage causing pos/neg to have identical labels?
+
+### H4: M1/M2 State Dimension Too Small
+
+With mem_size=1024 and 32 slots of 128-dim vectors, the representation capacity may be insufficient. Check:
+- Does increasing mem_size help?
+- Are the slot assignments collapsing to the same indices?
+
+### H5: InfoNCE Implementation Bug
+
+The contrastive loss may be computed incorrectly. Check:
+- Is the similarity matrix computed correctly?
+- Are the labels correct (positive = same pair, negative = different pair)?
+- Is the temperature (tau=0.07) appropriate?
+
+### H6: Shared Gates Across Layers
+
+Write gates are shared over 24 linear layers. The gradient signal may be averaging out to produce uniform updates. Check:
+- Do per-layer gates help?
+- Is the gradient accumulating correctly across layers?
+
+---
+
+## 📍 INVESTIGATION STARTING POINTS
+
+### 1. Inspect Delta Diversity
+
+```python
+# During capture, log delta statistics
+deltas = []  # collect deltas for each pair
+for pair in batch:
+    delta = compute_delta(pair)
+    deltas.append(delta)
+# Are deltas nearly identical? Check std/mean ratio.
 ```
-cd /home/ubuntu/RAGGA
-git pull --ff-only origin main          # >= W20.13.5
+
+### 2. Inspect M1/M2 State Diversity
+
+```python
+# After gate update, check state similarity
+states = []
+for pair in batch:
+    state = get_m1m2_state(pair)  # after write gate
+    states.append(state)
+# Are all states nearly identical? Check pairwise cosine similarities.
+```
+
+### 3. Verify Negative Sampling
+
+```python
+# In InfoNCE loss, verify negatives are actually different
+for i, anchor in enumerate(batch):
+    positives = [j for j in batch if same_pair(i, j)]
+    negatives = [j for j in batch if not same_pair(i, j)]
+    # Are negatives actually different pairs?
+```
+
+### 4. Check Similarity Matrix
+
+```python
+# Log the similarity matrix during loss computation
+sim_matrix = compute_cosine_sim(all_states)  # B x B
+# Is sim_matrix nearly uniform? Are diagonal elements (pos) different from off-diagonal?
+```
+
+### 5. Isolate Single Layer
+
+```python
+# Disable all but one layer's M1/M2 to see if signal exists
+for layer in layers[1:]:
+    layer.m1m2.disable()
+# Train with single layer — does discrimination emerge?
+```
+
+---
+
+## 🛠️ RELEVANT FILES
+
+| File | Purpose |
+|------|---------|
+| `scripts/gpu/finetune_m1m2.py` | M1/M2 gate finetune script |
+| `src/rag/m1m2.py` | M1/M2 memory implementation |
+| `src/rag/m1m2_finetune.py` | Finetune logic (replay, loss) |
+| `data/pairs.jsonl` | Training pairs (33,595 total, 16,076 positive) |
+| `m1m2_gates_trained.npz` | Output gates (trained but non-discriminative) |
+| `src/rag/tests/w20/test_w20_fht_large.py` | FHT kernel tests |
+| `src/rag/tests/w20/test_w20_tq_kernels.py` | TQ kernel tests |
+| `src/rag/tests/w20/test_w20_qjl_l2norm.py` | QJL L2 norm tests |
+
+---
+
+## 🧪 REPRODUCTION
+
+```bash
+# Activate environment
 source /home/ubuntu/venv/bin/activate
-python3 -m pytest src/rag/tests -q      # expect the 35 resolved
+cd /home/ubuntu/RAGGA
+
+# Run kernel tests (all pass)
+python3 -m pytest src/rag/tests/w20/test_w20_fht_large.py -v
+python3 -m pytest src/rag/tests/w20/test_w20_tq_kernels.py -v
+python3 -m pytest src/rag/tests/w20/test_w20_qjl_l2norm.py -v
+
+# Run full suite (260 passed, 3 skipped)
+python3 -m pytest src/rag/tests -q
+
+# Run M1/M2 finetune (completes but spread=0)
+python3 scripts/gpu/finetune_m1m2.py \
+    --pairs-file data/pairs.jsonl \
+    --gates-out m1m2_gates_trained.npz \
+    --m1m2-mem-size 1024 \
+    --max-steps 300 \
+    --refresh-every 4 \
+    --gate-init 0.1
 ```
 
-Then the protocol sequence unchanged (`env/W20_GPU_PROTOCOL.md`):
-capture the fixtures (step 2 — still PENDING, the G20.P1 arm), then
-the gates as their waves prescribe. If any residue survives the
-re-run (the handover's category list carried ~6 unlabeled failures —
-the static analysis could only classify the labeled ones), file the
-tracebacks verbatim: the decomposition loop continues exactly as this
-one did. If a gate's norm report lands at 3–4 ulps (inside the new
-budget), that is the re-derived contract working as documented — the
-report's number is the evidence, not the prose.
+---
+
+## 📊 SYSTEM SPECS
+
+- **GPU**: NVIDIA A10G (22GB VRAM)
+- **CUDA**: 13.2
+- **Compute Capability**: sm_86
+- **Python**: 3.12.3
+- **Model**: Qwen3.5-9B palettized (6.01x compression, 3.5-bit split quant)
+- **Virtual Environment**: `/home/ubuntu/venv`
+
+---
+
+## ✅ SUMMARY
+
+**Everything works perfectly except the M1/M2 contrastive learning.**
+
+- Kernels: ✅ All pass
+- Tests: ✅ 260 passed, 3 skipped
+- Compilation: ✅ Clean
+- Model loading: ✅ Works
+- Capture pipeline: ✅ Works
+- Training loop: ✅ Runs to completion
+- Memory: ✅ No OOM
+- **M1/M2 discrimination: ❌ Spread = 0 at all steps**
+
+The system is functionally complete and stable. The only remaining work is debugging why the contrastive objective isn't producing discriminative M1/M2 states. The loss surface may have another saddle point, or the state construction may be collapsing diversity.

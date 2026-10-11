@@ -448,7 +448,7 @@ def test_retrieval_vector_order_and_delta_consistency(tmp_path):
     q_s = resolve_quantizer("S", S_D)
     q_m1 = resolve_quantizer("M1", M_D)
     q_m2 = resolve_quantizer("M2", M_D)
-    seg = lambda a, b: torch.from_numpy(np.ascontiguousarray(v[a:b])).to(DEVICE)
+    seg = lambda a, b: v[a:b].clone()
 
     # ORDER, bit-exact: S layers ascending, then M1, then M2
     for k, L in enumerate(sorted(LINEARS)):

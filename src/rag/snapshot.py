@@ -293,7 +293,13 @@ def _unit_digest_bytes(tag: str, codes: TQCodes) -> bytes:
     # split triple IFF partition == "outlier" — the same presence rule).
     if "mask" in a:
         out += np.ascontiguousarray(a["mask"], dtype=np.uint8).tobytes()
-        out += np.asarray(a["norm_hi"], dtype=np.float32).tobytes()
+        # norm_hi is required when mask is present; missing norm_hi means
+        # a partial/corrupt unit — the load-time validation will reject it.
+        # For digest computation on a partial unit, use zero bytes.
+        if "norm_hi" in a:
+            out += np.asarray(a["norm_hi"], dtype=np.float32).tobytes()
+        else:
+            out += np.zeros(4, dtype=np.float32).tobytes()
         out += np.asarray(int(a.get("group") or 1),
                           dtype=np.int64).tobytes()
     return out

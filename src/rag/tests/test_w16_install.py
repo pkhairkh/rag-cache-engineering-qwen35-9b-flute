@@ -245,6 +245,17 @@ def test_multi_chunk_absolute_sum(rig):
     snaps = [load_chunk(os.path.join(rig["disk_v1"], "snapshots",
                                      f"chunk_{i:05d}.npz"))
              for i in range(3)]
+    # W20.4.2: loaded codes are CPU tensors; move to the system's device
+    dev = rig["system"].s_codes[0].device
+    for snap in snaps:
+        for L in snap.s_codes:
+            snap.s_codes[L] = snap.s_codes[L].to(dev)
+        for L in snap.conv_codes:
+            snap.conv_codes[L] = snap.conv_codes[L].to(dev)
+        if snap.m1_codes is not None:
+            snap.m1_codes = snap.m1_codes.to(dev)
+        if snap.m2_codes is not None:
+            snap.m2_codes = snap.m2_codes.to(dev)
     snaps_abs = [load_chunk(os.path.join(rig["disk_abs"], "snapshots",
                                          f"chunk_{i:05d}.npz"))
                  for i in range(1)]  # disk_abs holds only chunk 0

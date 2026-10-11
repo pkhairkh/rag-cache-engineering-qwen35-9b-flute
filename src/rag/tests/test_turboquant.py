@@ -185,12 +185,11 @@ def test_pack_bits_rejects_out_of_range():
     # — the array-era idx VALUE-range check is gone (searchsorted
     # indices are < 2**bits by construction; the range check cost a host
     # sync), so out-of-range VALUES no longer raise and the legacy
-    # b in (3, 4) rows are unreachable. bits outside {3, 4} raise
-    # ValueError (the domain check) — the b in (1, 2) rows still raise
-    # it, now from the domain side.
+    # b in (3, 4) rows are unreachable. The W20.13.1 domain expansion
+    # accepts bits in {1, 2, ..., 8} — the b in (1, 2) rows now pass.
     for b in (1, 2):
-        with pytest.raises(ValueError):
-            pack_bits_t(torch.tensor([0, 2 ** b], dtype=torch.uint8), b)
+        packed = pack_bits_t(torch.tensor([0, 2 ** b - 1], dtype=torch.uint8), b)
+        assert packed.shape[0] == (2 * b + 7) // 8
     # the bits domain itself is validated loudly too
     for bad in (0, 9):
         with pytest.raises(ValueError):
