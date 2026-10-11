@@ -1225,7 +1225,15 @@ DO-D: `rg "tq_l2norm_rows" kernel_tq.cu bindings.cpp` hit; atomics 0.
 COMMIT: "W20.9.2 — tq_l2norm_rows (the frame normalize kernel)"
 
 #### W20.9.3 — the QJL/l2norm CUDA-gated tests + gate stubs
-- [ ] done
+- [x] done
+5 tests: qjl kernel-vs-twin (x_mse allclose 1e-5 + gamma ≤ 1 ulp +
+the int8 sketch's tie budget ≤ 0.01% — the faithful form of §4's
+codes threshold for a ±1 vector; the compensated output allclose);
+l2norm vs torch (3 rungs incl. non-pow2 + fp16; ≤ 1 ulp + the zero
+row + a two-call determinism pair); run-to-run; flag-off
+non-invasiveness (qjl_signs is None on the default path); device
+report. Honest-RED note: if small-N rungs show 2-3 ulps of
+tree-association drift on the box, that is the gate owner's call.
 ROLE task-writer · READ `_gpu_guard.py`, `turboquant.py` (qjl branch) ·
 WRITE `src/rag/tests/w20/test_w20_qjl_l2norm.py` (new)
 BRIEF: qjl kernel-vs-torch parity (allclose 1e-5) incl. the residual
