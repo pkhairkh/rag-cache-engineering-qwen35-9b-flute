@@ -127,6 +127,27 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> tq_quant_batched(
     torch::Tensor boundaries_lo, torch::Tensor boundaries_hi,
     int64_t n_lo, int64_t bits_lo, int64_t n_hi, int64_t bits_hi);
 
+// W20.8.1 -- the batched TQ decode entry (also defined in src/kernel_tq.cu
+// at global scope, this declaration family's pattern): the fused decode
+// mirror of tq_quant_batched -- the bfe unpack + smem LUT gather pass, the
+// committed fht_backward_large adjoint (signs BEFORE the butterfly,
+// rsqrtf(K) at the final store), the per-unit norm multiply, the single
+// fp16/fp32 cast at the final store. ONE host call over a prefill's whole
+// code batch (the two-chains-per-prefill design's decode half,
+// PROPOSAL.md §3.6); the unpack is pack's EXACT inverse (the
+// fixture-pinned little-endian byte layout, turboquant.py's
+// pack_bits/unpack_bits canonical -- G20.P1's frozen fixtures, G20.P3's
+// kernel-parity gate). Returns the (M, K) reconstruction in `dtype`
+// (float32 default; float16 = the single-cast width); signs are the
+// quantizer's (K,) fp32 rotation vector, centroids the codebook mirrors;
+// the wrapper never reads device memory (no D2H).
+torch::Tensor tq_dequant_batched(
+    torch::Tensor codes_lo, torch::Tensor codes_hi,
+    torch::Tensor norms, torch::Tensor signs,
+    torch::Tensor centroids_lo, torch::Tensor centroids_hi,
+    int64_t n_lo, int64_t bits_lo, int64_t n_hi, int64_t bits_hi,
+    at::ScalarType dtype);
+
 // Unified dispatcher. Accepts either (indices, lut) for the quantized path
 // or (W_dense) for the dense CUTLASS baseline. Pass an empty Tensor for the
 // unused variants. q_layout selects the packed-indices layout:
@@ -390,4 +411,31 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("bits_lo"),
           py::arg("n_hi"),
           py::arg("bits_hi"));
+
+    // W20.8.1 -- the batched TQ decode entry (src/kernel_tq.cu): the
+    // decode chain's ONE host call -- the bfe unpack + smem LUT gather,
+    // the fht_backward_large adjoint (signs BEFORE the butterfly), the
+    // per-unit norm multiply, the single cast. The mirror of
+    // tq_quant_batched (the two-chains-per-prefill design's other half,
+    // PROPOSAL.md §3.6); the packed byte layout is fixture-pinned and the
+    // unpack is pack's exact inverse (G20.P1's frozen fixtures; G20.P3's
+    // kernel-parity gate counts divergences).
+    m.def("tq_dequant_batched", &tq_dequant_batched,
+          "Batched TurboQuant decode: one call over the prefill's packed "
+          "(M, L_lo)/(M, L_hi) uint8 code rows + the (M,) fp32 norms -> "
+          "the (M, K) reconstruction in `dtype` (float32 default; float16 "
+          "= the single cast at the final store); signs are the "
+          "quantizer's (K,) fp32 rotation vector, centroids the codebook "
+          "mirrors; the wrapper never reads device memory (no D2H)",
+          py::arg("codes_lo"),
+          py::arg("codes_hi"),
+          py::arg("norms"),
+          py::arg("signs"),
+          py::arg("centroids_lo"),
+          py::arg("centroids_hi"),
+          py::arg("n_lo"),
+          py::arg("bits_lo"),
+          py::arg("n_hi"),
+          py::arg("bits_hi"),
+          py::arg("dtype") = at::kFloat);
 }

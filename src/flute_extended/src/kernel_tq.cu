@@ -2778,3 +2778,734 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> tq_quant_batched(
     // observe the freed blocks.
     return {codes_lo, codes_hi, norms};
 }
+
+// ===========================================================================
+// W20.8.1 -- tq_dequant_batched: the batched decode entry. TASKS.md:1087-
+// 1102; PROPOSAL.md §3.6's decode half ("two kernel chains per prefill
+// instead of ~4,000 host round trips" -- the encode chain was 7.4's
+// tq_quant_batched; this is the other one). The legacy array-era decode's
+// two syndromes -- the numpy centroid gather and the CPU adjoint (the
+// W20.3.3 rewrite already made the torch twin device-native) -- fuse
+// here into the kernel chain: ONE host call over a prefill's whole code
+// batch.
+//
+// THE MIRROR OF QUANT (each stage the exact inverse / adjoint of its
+// encode twin, composed from the family's committed kernels -- the 7.3
+// composition decision run backward: nothing re-implemented, every
+// launch the fixture-pinned copy, the additions-only law):
+//   (a) tq_dequant_unpack_lut_kernel -- the unpack + LUT gather pass: the
+//       two packed uint8 streams -> the (M, K) fp32 assembled y (row m =
+//       unit m), the exact mirror of 7.3's ladder+pack kernel (same grid,
+//       same 16-coordinate slice ownership, same shift/mask word
+//       arithmetic -- read backward: unpack IS pack's inverse). The b-bit
+//       indices come out of the packed word by bit-field extract -- bfe's
+//       semantics (PTX ISA 9.7.1.19, bfe.u32: the b-bit field at the
+//       fixed offset; with bfe-class extraction unpacking is free, codes
+//       stay packed everywhere -- rev 2's K5 note) -- realized in the
+//       plain C++ shift/mask form, EQUALLY EXACT: pure integer ops,
+//       nothing to round, one statement per property to verify by eye,
+//       and the compiler is free to fuse the extracts into bfe.b32 -- the
+//       7.3 precedent verbatim (kernel_tq.cu:1987-1993, bfi's side of
+//       the same argument). The gathered value is lut[idx]: the <=
+//       16-entry centroid table staged ONCE per CTA into shared memory.
+//   (b) gx = fht_backward_large(y, signs) -- the ADJOINT ORIENTATION: the
+//       decode's un-rotation is the encode rotation's transpose (T =
+//       H D_s / sqrt(K) -- the signs sit on T's columns; T^T = D_s H /
+//       sqrt(K), H symmetric), so the gathered y takes the signs BEFORE
+//       the butterfly (the prologue's cast-then-multiply,
+//       kernel_tq.cu:729-732) and the rsqrtf(K) fold at the final store
+//       (kernel_tq.cu:810-814, 838-839) -- exactly fht_reference_adjoint
+//       (fht.py:225-238) and the torch twin's own call
+//       (turboquant.py:973). THE COMPOSITION REUSE (the 7.3 precedent,
+//       banner-pinned here per the brief): the committed W20.5.3 unit is
+//       ALREADY (M, K)-batched -- pass 1's grid (M, K/16384) and pass 2's
+//       (M, K/2) pair space ARE the batch geometry -- so the decode chain
+//       LAUNCHES IT VERBATIM (the public entry, 7.4's composition
+//       pattern: y = fht_forward_large(units, signs), kernel_tq.cu:2753):
+//       one copy of the butterfly (the W20.5.2 gates own exactly one), no
+//       forked stage arithmetic, the cross stages' launch-boundary
+//       synchronization for free. The price is the same class 7.3 booked
+//       (ONE extra fp32 pass): the adjoint's out-of-place contract ("g is
+//       never written") costs one (M, K) fp32 gx beside the assembled y.
+//   (c) tq_dequant_norm_scale_kernel -- the per-unit norm multiply,
+//       out[m, j] = gx[m, j] * norms[m]: the (M,) fp32 tensor's
+//       0-dim-per-unit contract (turboquant.py:975's `r * codes.norm`) as
+//       the in-kernel broadcast -- row = j >> row_shift (K a power of
+//       two: a shift, never a divide; K is a multiple of 1024, so a
+//       warp's 32 consecutive elements never straddle a row and the
+//       norms[row] load is warp-uniform, served once). The degenerate
+//       zero norm needs NO branch -- 0 x finite = 0 exactly (the twin's
+//       W20.3.3 no-branch discipline, turboquant.py:915-922; the ENCODE
+//       side needed the sweep kernel because it writes packed bytes, the
+//       decode side's multiply IS the branch).
+//   (d) the dtype dispatch rides (c)'s store: fp32 out (no cast), fp16
+//       out ONE cast at the final store -- the family single-cast
+//       contract (the whole chain's state stays fp32;
+//       kernel_fht.cu:93-95's discipline). The multiply is __fmul_rn: the
+//       correctly-rounded single IEEE multiply, the same round torch's
+//       broadcast mul performs (7.2's reason, kernel_tq.cu:1782-1787) --
+//       given the same gx and norms bits, the scaled element is
+//       bit-identical to the twin's. The surface is exactly {float32,
+//       float16}: other output dtypes stay on the torch twin, which casts
+//       at the very end (turboquant.py:975) -- refused loudly here, never
+//       silently re-routed.
+//
+// THE LUT BROADCAST DISCIPLINE (the invariant): EVERY CTA stages the full
+// <= 16-entry centroid table (one predicated load per entry from the
+// codebook mirror, <= 32 B per half per CTA) and every per-coordinate
+// gather hits SHARED memory -- there is NO per-coordinate global-memory
+// gather of centroids anywhere in this chain. The tables are KERNEL-
+// INVARIANT (the codebook is per-half, never per-unit -- unlike 7.3's
+// norm-scaled boundary tables, kernel_tq.cu:2130-2163), so the broadcast
+// happens ONCE per CTA before the grid-stride loop and no table-lifetime
+// barrier rides the loop (the pack kernel's trailing __syncthreads(),
+// kernel_tq.cu:2230-2238, has no analog here).
+//
+// THE LAYOUT PIN (the 7.3 invariant, cited per the brief): unpack =
+// pack's EXACT INVERSE. The byte layout is IDENTICAL to pack_bits_t /
+// unpack_bits_t (turboquant.py:212-245 / :276-327, the W20.3.2 canonical
+// pair; _packed_len, turboquant.py:998), fixture-pinned by G20.P1's
+// frozen fixtures and counted by G20.P3's kernel-parity gate: little-
+// endian flat stream (bit k of index i at flat i*bits + k, each index's
+// LSB first), bytes LSB-first (byte m holds flat bits 8m..8m+7, flat bit
+// 8m in the LSB), stream length tq_packed_len(n, bits), the final
+// partial byte's high flat bits zero on pack and the pad bits beyond
+// n*bits DROPPED on unpack (exactly n indices out). The word formulation
+// is 7.3's, read backward: pack folded the slice's 16 indices into
+// word = sum_c idx[c] << (c*bits) and stored its bytes word >> (8w)
+// (kernel_tq.cu:2198-2227); unpack reads the slice's 6 (b=3) / 8 (b=4)
+// whole bytes back into word = sum_w byte[w] << (8w) and extracts
+// idx[c] = (word >> (c*bits)) & (2^bits - 1) -- the same little-endian
+// integer, the same field positions, the exact inverse. The lo/hi split:
+// two streams unpacked to their halves and CONCATENATED (the geometry
+// from n_lo/n_hi/bits -- the twin's y[:n_lo] / y[n_lo:] slice-writes,
+// turboquant.py:967-969): the per-thread half selection picks the stream
+// and the LUT, and the gathered value lands at the GLOBAL coordinate --
+// the concatenation is by construction.
+//
+// THE PARITY CLAIM (stronger than the encode side's, documented because
+// G20.P3 counts on it): stage (a) is pure data movement (the integer
+// extraction is exact, the gather an fp32 copy), so the assembled y is
+// BIT-IDENTICAL to the twin's unpack_bits_t + tensor LUT gather
+// (turboquant.py:959-969); stage (b) is the SAME KERNEL the twin's
+// fht_adjoint routes to on CUDA at large K (fht.py:446-467:
+// _raw_kernel_apply -> C.fht_backward_large, auto backend) -- the
+// butterfly bits are identical BY CONSTRUCTION, not by tolerance; stage
+// (c) is one mul.rn on both sides. The kernel decode is bit-equal to the
+// torch twin end-to-end wherever the twin's auto-backend picks the large
+// kernel; where the twin falls to its reference butterfly (extension
+// absent, non-CUDA codes), the association-level tolerance owns the
+// diff -- the 5.2 class, G20.P2's allclose, never a parity question.
+//
+// THE SIGNS CONTRACT (the 7.4 mirror): the (K,) fp32 +-1 rotation vector
+// is the QUANTIZER's (fht.rotation_signs), passed IN by the caller
+// (W20.8's dispatcher); this C++ owns no RNG and no seed.
+//
+// DETERMINISM CONTRACT: run-to-run torch.equal assertable. Every y/out
+// element has exactly one owner (the slices partition the coordinates,
+// the CTAs partition the (unit, tile) space, the grid-stride loop is the
+// R20.6 guard whose values are grid-independent); the extraction and the
+// gather are pure functions of (codes, centroids, geometry); the adjoint
+// is the committed deterministic unit; the scale is one __fmul_rn + one
+// cast per element. Every grid is a pure function of (M, K) -- no device
+// query feeds any launch. No reduction or synchronization primitive of
+// any kind appears in this section (the module grep stays at zero, the
+// 7.1 invariant, kernel_tq.cu:1447-1455). FLUTE_TQ_CANARY covers stage
+// (b) for free -- the public entry's runner poisons gx (and ws) when
+// armed, and the adjoint's final stage writes every element exactly
+// once; stages (a)/(c) carry the ownership map itself plus G20.P3's
+// parity gate (the codes' byte space is fully reachable, so no poison
+// value exists -- 7.3's note, kernel_tq.cu:2026-2032).
+//
+// THE BUDGET (the brief's line, realized): ~230 KiB of codes in, 1-2 MiB
+// out per 2^19 unit -- at K = 2^19 with the 3.5-bit split the two
+// streams total (n_lo*3 + n_hi*4)/8 = 224 KiB of packed bytes per unit,
+// and the reconstruction is 2 MiB (fp32) / 1 MiB (fp16). The chain's
+// TRANSIENTS: the assembled y and the adjoint's gx, (M, K) fp32 each (2
+// MiB per unit at 2^19) -- the same class 7.4 booked for its y
+// (kernel_tq.cu:2483-2486), freed at scope exit on the same stream (the
+// caching allocator's stream-ordered discipline, kernel_tq.cu:1652-1657).
+//
+// THE M == 0 BRANCH: the entry's (the launchers refuse M == 0 loudly) --
+// the correctly-shaped empty (0, K) tensor, no launch (a zero-size grid
+// is not a legal launch, kernel_tq.cu:577-580).
+//
+// Resource accounting (sm_86): the gather pass is 1024 threads
+// (FHT_LARGE_THREADS), grid = M x K/16384 CTAs (6,144 at the 192-unit
+// 2^19 prefill -- the same grid the encode's ladder+pack booked,
+// kernel_tq.cu:2053-2058), 128 B of STATIC shared memory (the two LUTs),
+// no dynamic smem, no opt-in; ~6-8 KiB of codes read + 64 KiB of y
+// written per tile (the 16-stride slice map's access shape -- the encode
+// side's y-read pattern mirrored). The adjoint is 5.3's own accounting
+// (the 64 KiB-smem pass 1 + the streaming cross stages). The scale pass
+// is 1024 threads, ceil(M*K/1024) CTAs, no smem: (M, K) fp32 read + the
+// (M,) broadcast + the (M, K) output write.
+//
+// COMPILE RECORD: nvcc is ABSENT on this authoring box (env/W20_ENV.md)
+// -- compile and behavioral verification defer to the A10G box (the
+// W20.5.4 TU registration carries this file; W20.8.3 runs the gates).
+// Authored statically, re-read for review; every defect found here is a
+// box-side discovery.
+// ===========================================================================
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// The centroid table's cardinality, pinned in ONE place (mirroring
+// tq_boundary_count, kernel_tq.cu:1832-1834): C = 2^bits (codebooks.py:220
+// -- the Codebook contract's centroids (2**bits,)). Host+device: the 8.1
+// kernel's runtime C and the entry's TORCH_CHECKs both derive from this
+// one line.
+// ---------------------------------------------------------------------------
+__host__ __device__ constexpr int tq_centroid_count(int bits) {
+    return 1 << bits;
+}
+
+// The LUT's compile-time capacity: the b=4 table (16 entries). The gather
+// kernel declares both halves' arrays [kTqLutMaxC] regardless of b -- the
+// b=3 half uses the first 8 slots (kTqLadderMaxB's pattern,
+// kernel_tq.cu:1836-1839).
+constexpr int kTqLutMaxC = tq_centroid_count(4);
+
+static_assert(tq_centroid_count(3) == 8, "the b=3 (lo half) centroid count");
+static_assert(kTqLutMaxC == 16, "the b=4 (hi half) centroid count");
+static_assert(kTqLutMaxC < 32,
+              "the LUT staging rides the CTA's first warp (tid < C)");
+
+// ---------------------------------------------------------------------------
+// tq_stage_centroid_lut_smem -- the LUT broadcast's staging step: the
+// CTA's first C threads each copy ONE centroid from the codebook mirror
+// into shared memory, and the barrier publishes the table to the whole
+// CTA -- THE LUT BROADCAST DISCIPLINE's device half (the banner's
+// invariant: the full table enters the CTA exactly once; every
+// per-coordinate gather below hits smem, never global).
+//
+// CONTRACT (tq_scale_boundaries_smem's, kernel_tq.cu:1851-1865, minus the
+// scaling multiply -- the gather's table is the codebook verbatim, no
+// norm rides it): EVERY thread of the CTA calls this (the
+// __syncthreads() is cooperative -- a divergent call is UB, exactly like
+// every other barrier in this family); blockDim.x >= C (the family
+// geometry is 1024 threads, C <= 16); centroids[0..C-1] live fp32 in
+// global memory (the 2.2 device mirror); smem_lut has capacity >= C
+// (declare [kTqLutMaxC]).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void tq_stage_centroid_lut_smem(
+    const float* __restrict__ centroids,  // global: (C,) fp32, C = 2^bits
+    int C,                                // 8 or 16
+    float* smem_lut) {                    // shared: [>= C] out
+    if (threadIdx.x < C) {
+        smem_lut[threadIdx.x] = centroids[threadIdx.x];
+    }
+    __syncthreads();  // the LUT is CTA-visible from here on
+}
+
+// ---------------------------------------------------------------------------
+// tq_dequant_unpack_lut_kernel -- the unpack + LUT gather pass (the
+// banner's stage (a)). One CTA per (unit, tile), grid-stride over the
+// flattened M * (K/16384) space (the R20.6 guard); per CTA: the LUT
+// broadcast (ONCE -- the tables are kernel-invariant), then each thread's
+// 16-coordinate slice: the byte run -> the uint64 word -> the b-bit
+// indices -> the smem LUT gather -> the (M, K) fp32 y. The mirror of
+// tq_quant_ladder_pack_kernel (kernel_tq.cu:2106-2240) -- the same map,
+// the data flow reversed.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(flute::FHT_LARGE_THREADS)
+tq_dequant_unpack_lut_kernel(
+    // (M, tq_packed_len(n_lo, bits_lo)) uint8: unit m's packed lo stream
+    // (TQCodes' idx_lo rows, batched; a null base is legal when n_lo == 0
+    // -- the empty half is never dereferenced)
+    const uint8_t* __restrict__ codes_lo,
+    // (M, tq_packed_len(n_hi, bits_hi)) uint8: unit m's packed hi stream
+    const uint8_t* __restrict__ codes_hi,
+    // (2^bits_lo,) fp32: the lo codebook's centroid table (the 2.2 mirror)
+    const float* __restrict__ centroids_lo,
+    // (2^bits_hi,) fp32: the hi codebook's centroid table
+    const float* __restrict__ centroids_hi,
+    // (M, K) fp32 OUT: the assembled gather y, row m = unit m -- stage
+    // (b)'s input (the twin's y, turboquant.py:967-969)
+    float* __restrict__ y,
+    int M, int K,            // units; coords (a power of two > 16384)
+    int n_lo, int bits_lo,   // the lo half: coords [0, n_lo) at bits_lo
+    int n_hi, int bits_hi,   // the hi half: coords [n_lo, K) at bits_hi
+    int tile_shift) {        // log2(K) - 14; tiles per row = 1 << tile_shift
+    const int tiles = 1 << tile_shift;
+    const int64_t total_ctas = static_cast<int64_t>(M) * tiles;
+    const int64_t grid_stride = static_cast<int64_t>(gridDim.x);
+
+    // ---- the LUT broadcast (the invariant; the banner's discipline) ---
+    // Both live halves' tables stage ONCE per CTA, BEFORE the grid-stride
+    // loop: the tables are KERNEL-INVARIANT (the codebook is per-half,
+    // never per-unit), so no table-lifetime barrier rides the loop below
+    // (7.3's trailing __syncthreads(), kernel_tq.cu:2230-2238, has no
+    // analog here). The n_lo > 0 / n_hi > 0 conditions are GRID-UNIFORM
+    // kernel parameters, so the cooperative barrier inside the staging
+    // helper is uniform at every call (the pack kernel's precedent,
+    // kernel_tq.cu:2130-2163).
+    __shared__ float lut_lo[kTqLutMaxC];  // 8 live slots at b=3
+    __shared__ float lut_hi[kTqLutMaxC];  // 16 live slots at b=4
+    if (n_lo > 0) {
+        tq_stage_centroid_lut_smem(centroids_lo,
+                                   tq_centroid_count(bits_lo), lut_lo);
+    }
+    if (n_hi > 0) {
+        tq_stage_centroid_lut_smem(centroids_hi,
+                                   tq_centroid_count(bits_hi), lut_hi);
+    }
+
+    const int lo_bytes = tq_packed_len(n_lo, bits_lo);
+    const int hi_bytes = tq_packed_len(n_hi, bits_hi);
+
+    for (int64_t cta = static_cast<int64_t>(blockIdx.x);
+         cta < total_ctas; cta += grid_stride) {
+        // unit-major flat map (the pack kernel's, kernel_tq.cu:2148-2152):
+        // consecutive CTAs walk one unit's tiles; tiles is a power of two,
+        // so the split is shift/mask only.
+        const int unit = static_cast<int>(cta >> tile_shift);
+        const int tile = static_cast<int>(cta & (tiles - 1));
+        const int tile_start = tile * flute::FHT_LARGE_TILE;
+
+        // ---- this thread's slice: 16 contiguous coords, ONE half -----
+        // j0 <= K - 16 always (the tile lives inside the row); the
+        // alignment contract (launcher-checked: n_lo % 16 == 0)
+        // guarantees no slice straddles the split, so the WHOLE slice
+        // unpacks from ONE stream and gathers against ONE LUT.
+        const int j0 = tile_start + threadIdx.x * kTqPackSlice;
+        const bool hi = j0 >= n_lo;
+        const int bits = hi ? bits_hi : bits_lo;
+        const int n_half = hi ? n_hi : n_lo;       // the half's coord count
+        const float* lut = hi ? lut_hi : lut_lo;   // its smem LUT
+        const int i0 = hi ? (j0 - n_lo) : j0;  // slice base, half-LOCAL (a multiple of 16)
+        if (i0 < n_half) {  // vacuous in the checked geometry (j0 <= K-16
+                            // and the half selection pin i0 below its
+                            // half's end) -- kept as the boundary belt
+            const int64_t ybase = static_cast<int64_t>(unit) * K + j0;
+
+            // ---- the unpack: the slice's 6 (b=3) / 8 (b=4) bytes ------
+            // word = sum_w byte[w] << (8w) IS the flat-stream segment
+            // [i0*bits, (i0+16)*bits) read as a little-endian integer --
+            // the SAME integer 7.3's pack folded the indices into
+            // (kernel_tq.cu:2198-2227), so the extraction below is its
+            // exact inverse. The byte clip is the belt (the checked
+            // geometry's runs are whole and in-bounds: n_half is an exact
+            // 16-slice multiple, so byte0 + n_bytes <= L_half exactly);
+            // a clipped byte contributes nothing, matching the pack
+            // side's clipped-store belt.
+            const uint8_t* src = (hi ? codes_hi : codes_lo)
+                + static_cast<int64_t>(unit) * (hi ? hi_bytes : lo_bytes);
+            const int byte0 = (i0 * bits) >> 3;  // 16*bits % 8 == 0 -> integral
+            const int n_bytes = (kTqPackSlice * bits) >> 3;  // 6 or 8
+            uint64_t word = 0;
+            for (int w = 0; w < n_bytes; ++w) {
+                const int byte_idx = byte0 + w;
+                if (byte_idx < (hi ? hi_bytes : lo_bytes)) {
+                    word |= static_cast<uint64_t>(src[byte_idx])
+                            << (8 * w);
+                }
+            }
+
+            // ---- the bfe extraction + the smem LUT gather -------------
+            // idx[c] = (word >> (c*bits)) & (2^bits - 1): bfe.u32's
+            // semantics (PTX ISA 9.7.1.19 -- the b-bit field at the fixed
+            // offset c*bits) in the plain C++ shift/mask form -- equally
+            // exact, the 7.3 precedent (the banner). The mask guarantees
+            // idx < 2^bits <= kTqLutMaxC, so the smem gather is in-bounds
+            // by construction. cnt clips the tail -- the pin's pad-drop
+            // clause (the pad bits beyond n*bits are never gathered;
+            // vacuous under the alignment contract, belt-kept, the pack
+            // side's cnt mirror).
+            const int rem = n_half - i0;
+            const int cnt = (rem < kTqPackSlice) ? rem : kTqPackSlice;
+            #pragma unroll
+            for (int c = 0; c < kTqPackSlice; ++c) {
+                if (c < cnt) {
+                    const uint8_t idx = static_cast<uint8_t>(
+                        (word >> (c * bits)) & ((1u << bits) - 1u));
+                    y[ybase + c] = lut[idx];
+                }
+            }
+        }
+        // No trailing barrier: the LUTs are kernel-invariant and the
+        // writes above are global-only -- nothing a later iteration does
+        // can race this iteration's reads (the pack kernel's trailing
+        // barrier exists for its smem TABLE lifetime alone).
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tq_dequant_unpack_lut_run -- the INTERNAL raw-pointer launcher (the
+// 7.3 launcher's mirror: integer geometry + pointer hygiene checked
+// loudly; the host never touches device memory content -- no readback, no
+// D2H sync anywhere). The FULL grid by default (every CTA walks exactly
+// one (unit, tile)); the kernel's grid-stride loop is the R20.6 guard
+// that keeps any future cap value-correct.
+// ---------------------------------------------------------------------------
+void tq_dequant_unpack_lut_run(
+    const uint8_t* codes_lo, const uint8_t* codes_hi,
+    const float* centroids_lo, const float* centroids_hi,
+    float* y,
+    int M, int K, int n_lo, int bits_lo, int n_hi, int bits_hi,
+    cudaStream_t stream) {
+    // the family envelope (the pack launcher's checks, mirrored -- the
+    // (M, K)-batched adjoint downstream owns exactly this K).
+    TORCH_CHECK(K > flute::FHT_LARGE_TILE && (K & (K - 1)) == 0,
+                "tq_dequant_unpack: K must be a power of two > 16384 (the "
+                "fht_large envelope the decode chain rides), got K=", K);
+    TORCH_CHECK(M > 0,
+                "tq_dequant_unpack: M must be > 0 (a zero-size grid is not "
+                "a legal launch -- the M == 0 branch is the entry's)");
+    TORCH_CHECK(bits_lo == 3 || bits_lo == 4,
+                "tq_dequant_unpack: bits_lo must be 3 or 4 (the TQ index "
+                "stream widths, codebooks.py:219-228), got ", bits_lo);
+    TORCH_CHECK(bits_hi == 3 || bits_hi == 4,
+                "tq_dequant_unpack: bits_hi must be 3 or 4 (the TQ index "
+                "stream widths, codebooks.py:219-228), got ", bits_hi);
+    TORCH_CHECK(n_lo >= 0 && n_hi >= 0 && n_lo + n_hi == K,
+                "tq_dequant_unpack: the lo/hi split must partition K "
+                "(n_lo=", n_lo, ", n_hi=", n_hi, ", K=", K, ")");
+    // THE ALIGNMENT CONTRACT (the pack launcher's): misaligned splits are
+    // REFUSED, never silently mis-unpacked; the caller routes them to the
+    // torch twin.
+    TORCH_CHECK(n_lo % kTqPackSlice == 0,
+                "tq_dequant_unpack: n_lo must be a multiple of ",
+                kTqPackSlice, " (the 16-coordinate slice ownership; got "
+                "n_lo=", n_lo, ") -- misaligned splits stay on the torch "
+                "twin");
+    // the int-arithmetic belt: tq_packed_len and the byte0 arithmetic ride
+    // int inside the kernel, so a half's flat bit count must fit BEFORE
+    // those are trusted (the realized envelope K <= 2^22 never exercises
+    // it, but the entry's check bound goes to 2^31 -- constructible by
+    // arithmetic, not faith).
+    TORCH_CHECK(static_cast<int64_t>(n_lo) * bits_lo
+                    <= static_cast<int64_t>(INT32_MAX) &&
+                static_cast<int64_t>(n_hi) * bits_hi
+                    <= static_cast<int64_t>(INT32_MAX),
+                "tq_dequant_unpack: a half's flat bit count exceeds the "
+                "kernel's int arithmetic (n_lo*bits_lo=",
+                static_cast<int64_t>(n_lo) * bits_lo,
+                ", n_hi*bits_hi=", static_cast<int64_t>(n_hi) * bits_hi,
+                ")");
+    // raw-pointer hygiene: a null pointer where the half is live is a
+    // binding bug, not a silent device fault.
+    TORCH_CHECK(y != nullptr,
+                "tq_dequant_unpack: y must be a live device pointer");
+    TORCH_CHECK(n_lo == 0 ||
+                (codes_lo != nullptr && centroids_lo != nullptr),
+                "tq_dequant_unpack: the live lo half needs its code stream "
+                "and centroid table pointers");
+    TORCH_CHECK(n_hi == 0 ||
+                (codes_hi != nullptr && centroids_hi != nullptr),
+                "tq_dequant_unpack: the live hi half needs its code stream "
+                "and centroid table pointers");
+
+    // the launch geometry: a pure function of (M, K) -- the pack
+    // launcher's arithmetic, mirrored (checked, not assumed).
+    const int tiles = K / flute::FHT_LARGE_TILE;
+    const int tile_shift = flute::fht_large_log2_floor(K)
+                         - flute::fht_large_log2_floor(flute::FHT_LARGE_TILE);
+    TORCH_CHECK((1 << tile_shift) == tiles,
+                "tq_dequant_unpack: the shift/mask (unit, tile) map must "
+                "be exact (tile_shift=", tile_shift, ", tiles=", tiles,
+                ")");
+    const int64_t total_ctas = static_cast<int64_t>(M) * tiles;
+    TORCH_CHECK(total_ctas <= INT32_MAX,
+                "tq_dequant_unpack: M*tiles = ", total_ctas,
+                " exceeds the grid.x launch bound");
+    const int blocks = static_cast<int>(total_ctas);
+    tq_dequant_unpack_lut_kernel
+        <<<blocks, flute::FHT_LARGE_THREADS, 0, stream>>>(
+            codes_lo, codes_hi, centroids_lo, centroids_hi, y,
+            M, K, n_lo, bits_lo, n_hi, bits_hi, tile_shift);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------
+// tq_dequant_norm_scale_kernel -- the banner's stage (c)+(d): the
+// per-unit norm multiply and the chain's ONE dtype cast, one element per
+// grid-stride iteration (the family's flat streaming shape -- pass 2's
+// 1024 threads, no shared memory; the poison kernel's map,
+// kernel_tq.cu:391-403). row = j >> row_shift: K is a power of two (the
+// entry checked it), so the row split is a shift, never a divide, and K
+// is a multiple of 1024, so a warp's 32 consecutive elements never
+// straddle a row -- the norms[row] load is warp-uniform (the (M,)
+// broadcast discipline: the VALUE feeds the multiply, never re-reduced).
+// __fmul_rn is the one rounding: the same single IEEE multiply torch's
+// broadcast `r * codes.norm` performs (the banner's (d) note), so the
+// element is bit-identical to the twin's given the same gx and norms
+// bits; the cast at the same store is the chain's only dtype conversion.
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void __launch_bounds__(flute::FHT_LARGE_THREADS)
+tq_dequant_norm_scale_kernel(
+    const float* __restrict__ r,       // (M, K) fp32: stage (b)'s output
+    const float* __restrict__ norms,   // (M,) fp32: the per-unit norms
+    scalar_t* __restrict__ out,        // (M, K): the output dtype
+    int64_t n,                         // M * K elements
+    int row_shift) {                   // log2(K)
+    const int64_t stride =
+        static_cast<int64_t>(gridDim.x) * flute::FHT_LARGE_THREADS;
+    const int64_t tid =
+        static_cast<int64_t>(blockIdx.x) * flute::FHT_LARGE_THREADS
+        + threadIdx.x;
+    for (int64_t j = tid; j < n; j += stride) {
+        const int row = static_cast<int>(j >> row_shift);
+        // 0 x finite = 0 exactly: the degenerate zero-norm unit needs no
+        // branch (the twin's W20.3.3 discipline, turboquant.py:915-922).
+        out[j] = static_cast<scalar_t>(__fmul_rn(r[j], norms[row]));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tq_dequant_norm_scale_run -- the scale pass's launcher (the family's
+// raw-pointer pattern). The block count is the poison kernel's idiom
+// (fht_large_cross_blocks's ceil over 1024-thread CTAs,
+// kernel_tq.cu:411-418) computed in int64 HERE, with the belt the
+// committed helper's int cast lacks.
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+void tq_dequant_norm_scale_run(
+    const float* r, const float* norms, scalar_t* out,
+    int M, int K, cudaStream_t stream) {
+    TORCH_CHECK(M > 0,
+                "tq_dequant_scale: M must be > 0 (a zero-size grid is not "
+                "a legal launch -- the M == 0 branch is the entry's)");
+    TORCH_CHECK(r != nullptr && norms != nullptr && out != nullptr,
+                "tq_dequant_scale: r, norms and out must be live device "
+                "pointers");
+    const int row_shift = flute::fht_large_log2_floor(K);
+    TORCH_CHECK((1 << row_shift) == K,
+                "tq_dequant_scale: K must be a power of two (the entry's "
+                "envelope check), got K=", K);
+    const int64_t n = static_cast<int64_t>(M) << row_shift;  // M * K
+    const int64_t blocks64 =
+        (n + flute::FHT_LARGE_THREADS - 1) / flute::FHT_LARGE_THREADS;
+    TORCH_CHECK(blocks64 <= static_cast<int64_t>(INT32_MAX),
+                "tq_dequant_scale: M*K = ", n, " needs ", blocks64,
+                " CTAs -- over the grid.x launch bound");
+    tq_dequant_norm_scale_kernel<scalar_t>
+        <<<static_cast<int>(blocks64), flute::FHT_LARGE_THREADS, 0, stream>>>(
+            r, norms, out, n, row_shift);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------
+// Argument validation -- the entry's loud TORCH_CHECK family (the 7.4
+// entry's mirror: metadata only, never content -- the launchers re-check
+// their own integer geometry as the belt, so a failure surfaces with the
+// entry's prefix first).
+// ---------------------------------------------------------------------------
+void tq_dequant_batched_check_args(
+    const torch::Tensor& codes_lo, const torch::Tensor& codes_hi,
+    const torch::Tensor& norms, const torch::Tensor& signs,
+    const torch::Tensor& centroids_lo, const torch::Tensor& centroids_hi,
+    int64_t n_lo, int64_t bits_lo, int64_t n_hi, int64_t bits_hi) {
+    TORCH_CHECK(codes_lo.is_cuda(),
+                "tq_dequant_batched: codes_lo must be a CUDA tensor");
+    TORCH_CHECK(codes_lo.dim() == 2,
+                "tq_dequant_batched: codes_lo must be 2-D (M, L_lo) - the "
+                "batched packed streams (the dispatcher stacks TQCodes' "
+                "per-unit 1-D code rows)");
+    TORCH_CHECK(codes_lo.is_contiguous(),
+                "tq_dequant_batched: codes_lo must be contiguous");
+    TORCH_CHECK(codes_lo.scalar_type() == at::kByte,
+                "tq_dequant_batched: codes_lo dtype must be uint8 (the "
+                "packed bit streams), got ", codes_lo.scalar_type());
+    TORCH_CHECK(codes_hi.is_cuda() && codes_hi.dim() == 2 &&
+                codes_hi.is_contiguous() &&
+                codes_hi.scalar_type() == at::kByte,
+                "tq_dequant_batched: codes_hi must be a contiguous 2-D "
+                "(M, L_hi) uint8 CUDA tensor (codes_lo's twin), got dim=",
+                codes_hi.dim(), ", dtype=", codes_hi.scalar_type());
+    TORCH_CHECK(codes_lo.size(0) == codes_hi.size(0),
+                "tq_dequant_batched: the two streams must carry the same "
+                "batch (codes_lo M=", codes_lo.size(0), ", codes_hi M=",
+                codes_hi.size(0), ")");
+    // the split's cardinals (the mirror of the 7.4 entry's d checks: K is
+    // DERIVED here -- the decode reads the split, never a redundant d).
+    TORCH_CHECK(bits_lo == 3 || bits_lo == 4,
+                "tq_dequant_batched: bits_lo must be 3 or 4 (the TQ index "
+                "stream widths, codebooks.py:219-228), got ", bits_lo);
+    TORCH_CHECK(bits_hi == 3 || bits_hi == 4,
+                "tq_dequant_batched: bits_hi must be 3 or 4 (the TQ index "
+                "stream widths, codebooks.py:219-228), got ", bits_hi);
+    TORCH_CHECK(n_lo >= 0 && n_hi >= 0,
+                "tq_dequant_batched: the split halves must be non-negative "
+                "(n_lo=", n_lo, ", n_hi=", n_hi, ")");
+    const int64_t d = n_lo + n_hi;
+    TORCH_CHECK(d > 0 && d <= static_cast<int64_t>(INT32_MAX),
+                "tq_dequant_batched: d = n_lo + n_hi must be a positive "
+                "int-sized count (got d=", d, ")");
+    const int K = static_cast<int>(d);
+    // The adjoint's envelope, mirrored (fht_large_check_args's family,
+    // kernel_tq.cu:490-531 -- a power of two above 16384 is necessarily
+    // 32-aligned; the clause mirrors the family's refusal order).
+    TORCH_CHECK(K > flute::FHT_LARGE_TILE,
+                "tq_dequant_batched: d=", K, " <= 16384 - one 64 KiB tile "
+                "or less; the small-K paths own it");
+    TORCH_CHECK((K & (K - 1)) == 0,
+                "tq_dequant_batched: d must be a power of two (the FHT "
+                "un-rotation the decode chain rides), got d=", K);
+    TORCH_CHECK(K % 32 == 0,
+                "tq_dequant_batched: d must be divisible by 32 (the "
+                "kernel_fht.cu:21 discipline), got d=", K);
+    // THE ALIGNMENT CONTRACT (the 7.4 mirror): refuse loudly, route to
+    // the torch twin.
+    TORCH_CHECK(n_lo % kTqPackSlice == 0,
+                "tq_dequant_batched: n_lo must be a multiple of ",
+                kTqPackSlice, " (the 16-coordinate slice ownership; got "
+                "n_lo=", n_lo, ") - misaligned fractions stay on the "
+                "torch twin");
+    // the _packed_len parity (turboquant.py:998's formula, computed in
+    // int64 at the entry's check bound; the kernel's tq_packed_len rides
+    // int at the realized envelope -- the launcher's int belt guards the
+    // parity's coherence).
+    const int64_t L_lo = (n_lo * bits_lo + 7) / 8;
+    const int64_t L_hi = (n_hi * bits_hi + 7) / 8;
+    TORCH_CHECK(codes_lo.size(1) == L_lo,
+                "tq_dequant_batched: codes_lo's row length must equal "
+                "tq_packed_len(n_lo, bits_lo) = ", L_lo, " (the "
+                "_packed_len parity, turboquant.py:998), got ",
+                codes_lo.size(1));
+    TORCH_CHECK(codes_hi.size(1) == L_hi,
+                "tq_dequant_batched: codes_hi's row length must equal "
+                "tq_packed_len(n_hi, bits_hi) = ", L_hi, " (the "
+                "_packed_len parity, turboquant.py:998), got ",
+                codes_hi.size(1));
+    // the norms contract: the units' 0-dim fp32 norms stacked into the
+    // (M,) vector (the dispatcher's torch.cat -- TQCodes' 0-dim-per-unit
+    // contract, batched; the host never reads a value back).
+    TORCH_CHECK(norms.is_cuda() && norms.dim() == 1 &&
+                norms.scalar_type() == at::kFloat &&
+                norms.is_contiguous() &&
+                norms.numel() == codes_lo.size(0),
+                "tq_dequant_batched: norms must be a contiguous (M,) "
+                "float32 CUDA tensor (the units' 0-dim fp32 norms, "
+                "stacked), got numel=", norms.numel(), ", M=",
+                codes_lo.size(0));
+    // the signs contract (the 7.4 mirror): the quantizer's (d,) fp32
+    // rotation vector, passed IN by the caller.
+    TORCH_CHECK(signs.is_cuda() && signs.dim() == 1 &&
+                signs.scalar_type() == at::kFloat && signs.is_contiguous() &&
+                signs.numel() == d,
+                "tq_dequant_batched: signs must be a contiguous (K,) "
+                "float32 CUDA tensor - the quantizer's rotation vector "
+                "(fht.rotation_signs, supplied by the caller), got "
+                "numel=", signs.numel(), ", K=", d);
+    // the centroid mirrors: 1-D fp32 CUDA, length 2^bits -- UNCONDITION-
+    // ALLY (bits validated above; the 7.4 boundary-check mirror's
+    // reasoning, kernel_tq.cu:2446-2454: the length is a property of
+    // bits, and an empty half's table is never dereferenced -- the
+    // kernel's own n_half > 0 guards). CONTENT is never host-checked (a
+    // banned D2H); the 2.2 device mirrors are the cited precondition.
+    const int64_t want_lo = tq_centroid_count(static_cast<int>(bits_lo));
+    const int64_t want_hi = tq_centroid_count(static_cast<int>(bits_hi));
+    TORCH_CHECK(centroids_lo.is_cuda() && centroids_lo.dim() == 1 &&
+                centroids_lo.scalar_type() == at::kFloat &&
+                centroids_lo.is_contiguous() &&
+                centroids_lo.numel() == want_lo,
+                "tq_dequant_batched: centroids_lo must be a contiguous (",
+                want_lo, ",) float32 CUDA tensor (the 2^bits_lo codebook "
+                "mirror), got numel=", centroids_lo.numel());
+    TORCH_CHECK(centroids_hi.is_cuda() && centroids_hi.dim() == 1 &&
+                centroids_hi.scalar_type() == at::kFloat &&
+                centroids_hi.is_contiguous() &&
+                centroids_hi.numel() == want_hi,
+                "tq_dequant_batched: centroids_hi must be a contiguous (",
+                want_hi, ",) float32 CUDA tensor (the 2^bits_hi codebook "
+                "mirror), got numel=", centroids_hi.numel());
+    // the launch bounds (the 7.4 mirror: grid.x everywhere in the chain;
+    // the butterfly's launch arithmetic, kernel_tq.cu:514-520).
+    TORCH_CHECK(codes_lo.size(0) <= static_cast<int64_t>(INT32_MAX),
+                "tq_dequant_batched: M must fit a grid.x launch (got M=",
+                codes_lo.size(0), ")");
+    TORCH_CHECK(codes_lo.size(0) * d <= (int64_t{1} << 41),
+                "tq_dequant_batched: M*d = ", codes_lo.size(0) * d,
+                " exceeds the butterfly launch grid's addressable pairs");
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// tq_dequant_batched -- the public entry (bound by src/bindings.cpp in
+// W20.8.1; the decode chain's ONE host call). The mirror of
+// tq_quant_batched: the wrapper allocates the output, launches the chain
+// (gather -> adjoint -> scale) on the current CUDA stream, and NEVER
+// reads device memory content (no .item(), no .cpu(), no D2H sync
+// anywhere -- the twin's decode never read a value back either,
+// turboquant.py:930-950).
+// ---------------------------------------------------------------------------
+torch::Tensor tq_dequant_batched(
+    torch::Tensor codes_lo, torch::Tensor codes_hi,
+    torch::Tensor norms, torch::Tensor signs,
+    torch::Tensor centroids_lo, torch::Tensor centroids_hi,
+    int64_t n_lo, int64_t bits_lo, int64_t n_hi, int64_t bits_hi,
+    at::ScalarType dtype) {
+    tq_dequant_batched_check_args(codes_lo, codes_hi, norms, signs,
+                                  centroids_lo, centroids_hi,
+                                  n_lo, bits_lo, n_hi, bits_hi);
+
+    const int M = static_cast<int>(codes_lo.size(0));
+    const int K = static_cast<int>(n_lo + n_hi);  // the derived unit width
+    const int in_lo = static_cast<int>(n_lo);     // range-checked above
+    const int in_hi = static_cast<int>(n_hi);
+    const int ibits_lo = static_cast<int>(bits_lo);
+    const int ibits_hi = static_cast<int>(bits_hi);
+
+    // the output surface: exactly the two widths (the banner's (d)); the
+    // torch twin serves every other dtype with its final .to(dtype)
+    // (turboquant.py:975) -- never silently re-routed here.
+    TORCH_CHECK(dtype == at::kFloat || dtype == at::kHalf,
+                "tq_dequant_batched: dtype must be float32 or float16 (the "
+                "kernel decode's output widths; other dtypes stay on the "
+                "torch twin, which casts at the very end), got ", dtype);
+
+    // ---- the output (allocation only) ---------------------------------
+    torch::Tensor out = torch::empty({codes_lo.size(0),
+                                      static_cast<int64_t>(K)},
+                                     codes_lo.options().dtype(dtype));
+
+    // The M == 0 branch (the launchers' TORCH_CHECKs document it as this
+    // entry's): the correctly-shaped empty tensor, no launch (the family
+    // discipline, kernel_tq.cu:577-580).
+    if (M == 0) {
+        return out;
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream();  // the house kernels'
+                                                     // stream
+
+    // ---- (a) the unpack + LUT gather: the (M, K) fp32 assembled y ------
+    // (the twin's y, turboquant.py:967-969, batched).
+    torch::Tensor y = torch::empty({codes_lo.size(0),
+                                    static_cast<int64_t>(K)},
+                                   codes_lo.options().dtype(at::kFloat));
+    tq_dequant_unpack_lut_run(
+        codes_lo.data_ptr<uint8_t>(), codes_hi.data_ptr<uint8_t>(),
+        centroids_lo.data_ptr<float>(), centroids_hi.data_ptr<float>(),
+        y.data_ptr<float>(),
+        M, K, in_lo, ibits_lo, in_hi, ibits_hi, stream);
+
+    // ---- (b) the adjoint: 5.3's public entry, launched verbatim (the
+    // composition reuse -- the banner): signs at the first load, the SAME
+    // butterfly, rsqrtf(K) at the final store; y is read-only ("g is
+    // never written"). The entry's own check_args re-validates y (the
+    // belt) and allocates gx, the chain's second transient. ------------
+    torch::Tensor gx = fht_backward_large(y, signs);
+
+    // ---- (c)+(d) the norm multiply + the single cast. The dispatch is
+    // the explicit two-width surface (checked above; the AT_DISPATCH
+    // family would admit dtypes this surface does not serve). ----------
+    if (dtype == at::kFloat) {
+        tq_dequant_norm_scale_run<float>(
+            gx.data_ptr<float>(), norms.data_ptr<float>(),
+            out.data_ptr<float>(), M, K, stream);
+    } else {
+        tq_dequant_norm_scale_run<at::Half>(
+            gx.data_ptr<float>(), norms.data_ptr<float>(),
+            out.data_ptr<at::Half>(), M, K, stream);
+    }
+
+    // y and gx free at scope exit on the same stream -- the caching
+    // allocator's stream-ordered discipline (kernel_tq.cu:1652-1657): a
+    // later launch on this stream cannot observe the freed blocks.
+    return out;
+}

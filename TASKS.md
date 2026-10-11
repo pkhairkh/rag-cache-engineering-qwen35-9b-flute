@@ -1085,7 +1085,14 @@ and the §3.7 kernel-first dispatcher wiring TQCodes to the kernels;
 the CUDA-gated TQ kernel suite; gates G20.P3, G20.1, G20.2, G20.4.
 
 #### W20.8.1 — tq_dequant_batched (syndromes: numpy gather + the CPU adjoint)
-- [ ] done
+- [x] done
+The mirror of 7.4: (a) the unpack+LUT kernel (word = Σ src[b0+w]<<8w,
+idx = (word>>(c·bits))&mask — the exact inverse of 7.3's pack, bfe
+semantics; smem LUT broadcast, zero global gather); (b) fht_backward
+large launched VERBATIM (the same kernel the twin's auto-backend
+routes to — bit-equal on CUDA); (c) the norms broadcast (one
+mul.rn); the single cast at the store. Parity: stage (a) bit-exact
+data movement, (b) the same kernel, (c) one mul — documented.
 ROLE task-writer · READ `kernel_tq.cu` (the family so far),
 `turboquant.py:765-780` (the decode semantics) · WRITE `kernel_tq.cu`
 BRIEF: unpack each packed byte via `bfe.u32` (PTX §9.7.1.19 — b-bit
