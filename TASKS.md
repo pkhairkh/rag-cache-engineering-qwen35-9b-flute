@@ -804,7 +804,7 @@ COMMIT: "W20.5.3 — fht_backward_large (adjoint orientation, same
 discipline)"
 
 #### W20.5.4 — bindings + build registration + canary/trap macros
-- [ ] done
+- [x] done
 ROLE task-writer · READ `src/flute_extended/src/bindings.cpp:76-100`
 (the FHT binding pattern), `setup.py` (the TU list + FLUTE_CUDA_ARCHES) ·
 WRITE `bindings.cpp`, `setup.py`

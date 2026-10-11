@@ -89,6 +89,15 @@ torch::Tensor fht_inplace(torch::Tensor x, torch::Tensor signs);
 torch::Tensor fht_forward_awq(torch::Tensor x, torch::Tensor signs,
                               torch::Tensor s);
 
+// Large-K FHT entrypoints (defined in src/kernel_tq.cu — GLOBAL-scope
+// plain torch::Tensor signatures, the kernel_fht.cu surface pattern;
+// NOT in flute/entrypoints.h because kernel_tq.cu declares them at
+// global scope. Contract: include/flute/fht_large.cuh — the multi-block
+// butterfly for rows one CTA's shared memory cannot hold; the small-K
+// path (kernel_fht.cu, K <= 16384) keeps everything it accepts).
+torch::Tensor fht_forward_large(torch::Tensor x, torch::Tensor signs);
+torch::Tensor fht_backward_large(torch::Tensor g, torch::Tensor signs);
+
 // Unified dispatcher. Accepts either (indices, lut) for the quantized path
 // or (W_dense) for the dense CUTLASS baseline. Pass an empty Tensor for the
 // unused variants. q_layout selects the packed-indices layout:
@@ -293,4 +302,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fht_forward_awq", &fht_forward_awq,
           "FHT with folded AWQ compensation: out = ((x*s) @ T) / s",
           py::arg("x"), py::arg("signs"), py::arg("s"));
+
+    // Large-K FHT pair (src/kernel_tq.cu, contract: include/flute/
+    // fht_large.cuh): the multi-block butterfly for K > 16384.
+    // K eligibility (refused loudly inside, "fht_large: " prefix):
+    // K > 16384, K % 32 == 0, K a power of two (the 2^15..2^22
+    // envelope); 2-D contiguous (M, K) CUDA fp32/fp16/bf16 in and out
+    // (identical dtype, dispatch inside), (K,) fp32 signs.
+    m.def("fht_forward_large", &fht_forward_large,
+          "Large-K FHT (K > 16384, power of two, % 32 == 0): "
+          "out = x @ T, out-of-place, fp32 butterfly (contract: "
+          "include/flute/fht_large.cuh)",
+          py::arg("x"), py::arg("signs"));
+    m.def("fht_backward_large", &fht_backward_large,
+          "Large-K FHT adjoint (K > 16384, power of two, % 32 == 0): "
+          "gx = g @ T^T, out-of-place, signs before the butterfly "
+          "(contract: include/flute/fht_large.cuh)",
+          py::arg("g"), py::arg("signs"));
 }

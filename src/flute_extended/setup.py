@@ -114,6 +114,7 @@ sources = [
     "src/gemv_host.cpp",             # the shared split-K workspace TU
     "src/kernel_cutlass_dense.cu",   # compiles to a stub when FLUTE_HAVE_CUTLASS is not defined
     "src/kernel_fht.cu",              # FLUTE Extension: Fast Hadamard Transform
+    "src/kernel_tq.cu",              # FLUTE Extension: large-K FHT (fht_forward_large / fht_backward_large; always built like kernel_fht.cu)
     "src/bindings.cpp",
 ]
 
@@ -199,6 +200,19 @@ nvcc_flags += [
     # required because cpp_extension runs nvcc from a scratch build dir.
     f"-I{INCLUDE_DIR}",
 ]
+
+# ---------------------------------------------------------------------------
+# W20.6 canary/trap variants (src/kernel_tq.cu's FLUTE_TQ_CANARY /
+# FLUTE_TQ_TRAP — #ifdef blocks in the kernel, default OFF): these are
+# deliberate one-off diagnostic builds for the A10G box, NOT a
+# configuration surface, so they are appended by hand for that build
+# only — uncomment (or retype) the line, rebuild, run the W20.6 gate,
+# then rebuild WITHOUT it. The default list above is unchanged: no new
+# flags are active in a normal build.
+#   W20.6 variants:
+#     nvcc_flags += ["-DFLUTE_TQ_CANARY"]   # NaN-poison every output byte (write-coverage)
+#     nvcc_flags += ["-DFLUTE_TQ_TRAP"]     # flip the pair arithmetic on a timing bit (negative control)
+# ---------------------------------------------------------------------------
 
 cxx_flags = [
     "-O3",
