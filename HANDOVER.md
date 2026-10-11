@@ -173,3 +173,42 @@ Read the run off the new instrumentation:
 - `src/rag/tests/test_w19_finetune.py` — 8 gates (the saddle, the
   escape, descent with a planted common component, the delta wiring,
   the pool counts + bit-identity, the history fields).
+
+---
+
+# W20 in execution — the TQ kernel family (PROPOSAL.md rev 2)
+
+W20 runs as a wave-centric, sub-agent orchestration from the CPU dev
+box. The binding contracts, in authority order: SPECIFICATION.md >
+PROPOSAL.md (rev 2, the KERNEL directive) > **PROMPT.md** (the W20
+standing orchestration prompt — the GPU-ONLY law: no CPU test runs, no
+CPU test authoring, no repo-module imports on the dev box) >
+**TASKS.md** (the execution ledger: 13 waves, 58 tasks, per-wave DoD)
+> this file (the human narrative). Machine state: the un-committed
+worklog on the dev box.
+
+## W20.0 — environment + audit infrastructure (CLOSED 2026-10-11)
+
+- `env/W20_ENV.md` — the CPU box provisioned at latest stable,
+  evidence-backed (`pip index versions` outputs embedded): torch
+  2.14.1 (the default PyPI linux wheel = the CUDA-bundled cu130 build,
+  importable without a device — matches the A10G authoring semantics),
+  numpy 2.5.4, transformers 5.19.0, faiss-cpu 1.15.1, ninja 1.13.2;
+  nvcc ABSENT (driver-less unobtainable) → compile checks defer to the
+  A10G box.
+- `scripts/gpu/w20_provision.sh` — the A10G operator's entry point:
+  sm_86 assert, unpinned latest-stable installs, toolkit fallback,
+  flute_extended build (FLUTE_CUDA_ARCHES=86), the 237-suite baseline
+  banner, `env/w20_gpu_env.lock` writer. Idempotent.
+- `scripts/w20_static_audit.py` — the Tier-D DoD vehicle (parses,
+  never imports): exists/grep/absent/ast_def/py_compile/git_tag/
+  git_log/ledger kinds, CHECKS per wave mirroring TASKS.md DoD 1:1.
+- `src/rag/tests/w20/_gpu_guard.py` — the CUDA-only authoring surface:
+  require_cuda() loud module-level skip, device_report() (warn != 8.6,
+  raise major != 8), gate_report_path() → env/w20_gate_reports/.
+
+Wave DoD: Tier-D green (26/26, auditor --wave W20.0 exit 0 post-tag);
+commits W20.0.1–W20.0.5 on origin; annotated tag `w20-wave-0` pushed.
+Tier-G: none in this wave. No test executed, no CPU test authored, no
+repo module imported on the dev box (the attestation ledger, TASKS.md
+§5). Next: W20.1 — the baseline tag + frozen probe fixtures.

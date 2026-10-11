@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: OPEN — 0/13 waves closed.
+Status: IN EXECUTION — 1/13 waves closed (W20.0).
 
 ---
 
@@ -16,7 +16,7 @@ Status: OPEN — 0/13 waves closed.
 
 | wave | phase (PROPOSAL §8) | title | tasks | gates authored | status |
 |---|---|---|---|---|---|
-| W20.0 | pre-K | environment + audit infrastructure | 5 | — | OPEN |
+| W20.0 | pre-K | environment + audit infrastructure | 5 | — | CLOSED |
 | W20.1 | K1 | baseline tag + frozen probe fixtures | 4 | (capture) | OPEN |
 | W20.2 | K1 | TQCodes device contract + codebook mirror | 3 | — | OPEN |
 | W20.3 | K1 | turboquant.py torch rewrite (the core) | 6 | — | OPEN |
@@ -167,7 +167,7 @@ COMMIT: "W20.0.4 — the W20 GPU guard (loud CUDA skip + Ampere device
 report)"
 
 #### W20.0.5 — wave close W20.0
-- [ ] done
+- [x] done
 ROLE orchestrator · READ TASKS.md W20.0 DoD · WRITE
 `scripts/w20_static_audit.py` (append CHECKS W20.0), `HANDOVER.md`
 (append a "W20 in execution" stub: pointer to PROMPT.md/TASKS.md +
@@ -1204,7 +1204,7 @@ truthful (PROMPT.md §1.4):
 
 | wave | attestation |
 |---|---|
-| W20.0 | — (pending) |
+| W20.0 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.0 exit 0 (26/26, re-verified post-tag); push w20-wave-0 |
 | W20.1 | — (pending) |
 | W20.2 | — (pending) |
 | W20.3 | — (pending) |
