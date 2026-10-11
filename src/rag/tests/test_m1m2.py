@@ -65,16 +65,16 @@ cache-free path. A.2/A.3 compare single forwards where all routes agree
 bit-exactly, so the plain-cache baseline from A.1 is the honest
 reference there.
 
-WIRING NOTE (reported to the W3.2 owner, not pinned here): the modeling
-block calls `_m1m2(_q, _k, _v, ...)` WITHOUT `positions`, so every call
-scatters into slots arange(T) mod mem — decode steps (T=1) all write
-slot 0 and a second chunk re-uses slots 0..T-1 instead of T..2T-1.
-Invisible at zero gates (writes are no-ops) and irrelevant to every
-parity gate here (the baselines carry no m1m2 at all), but per SPEC
-§2.2 ("slot = position mod mem_size") the production open-gate path
-should pass past_seen_tokens + arange(T). Do not "fix" it by editing
-this file's expectations when the wiring is corrected — delete this
-note instead.
+WIRING NOTE (W21 update — the pre-W21 note is now historical): the
+modeling block passes per-cache positions to the module, but with the
+W21 default `write_addr="content"` the slot is the key's content hash
+(the positions are validated, not used for addressing; a T=1 decode
+call writes its centered zero and is a no-op — the memory freezes at
+prefill end, which the v1 counter hack only approximated). The
+`write_addr="positional"` A/B still uses slot = p mod mem_size and
+the positions exactly as v1 did — D.5 below pins THAT reference path
+bit-exactly (its numpy loop is the positional slot rule), and the W21
+content-path contracts live in test_w21_content_addr.py.
 
 Codebook note: the tiny geometries here flatten to power-of-two units
 already carrying solved codebooks in the tree (M1/M2/conv at d=512,
@@ -402,10 +402,16 @@ def test_d5_write_reference_numpy():
     m1[h, 0] == g*(k0 + k1) holds bit-exactly (sum-then-gate — gates
     0.37/-0.61 are not powers of two); sequential [0,1]+[2,3] equals the
     single [0,1,2,3] call bit-identically; zero gates leave a nonzero
-    state untouched and nothing is mutated in place; forward composes."""
+    state untouched and nothing is mutated in place; forward composes.
+
+    W21: this pins the POSITIONAL reference path
+    (write_addr="positional", center_write=False — the v1 semantics,
+    bit-exact); the content-addressed default has its own contracts in
+    test_w21_content_addr.py."""
     H, D, M = REF_H, REF_D, REF_MEM
     torch.manual_seed(32)
-    mod = M1M2(num_heads=H, head_dim=D, mem_size=M, num_linear_layers=2).to(DEVICE)
+    mod = M1M2(num_heads=H, head_dim=D, mem_size=M, num_linear_layers=2,
+               write_addr="positional", center_write=False).to(DEVICE)
     mod = mod.to(DEVICE)
     with torch.no_grad():
         mod.write_gate_k[0] = 0.37
@@ -460,7 +466,8 @@ def test_d5_write_reference_numpy():
     # -- zero gates: a NONZERO state comes back bit-identical; no mutation --
     torch.manual_seed(36)
     mod_zero = M1M2(num_heads=H, head_dim=D, mem_size=M,
-                    num_linear_layers=2).to(DEVICE)
+                    num_linear_layers=2,
+                    write_addr="positional", center_write=False).to(DEVICE)
     mod_zero = mod_zero.to(DEVICE)
     st1 = torch.randn(H, M, D, device=DEVICE); st2 = torch.randn(H, M, D, device=DEVICE)
     st1c, st2c = st1.clone(), st2.clone()

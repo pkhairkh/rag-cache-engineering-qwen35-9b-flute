@@ -192,15 +192,17 @@ def test_w18f_5_gate_grads_accumulate_across_calls():
     (m1.sum() + m2.sum()).backward()
     grad_memopt = model_grads["k"].clone()
 
-    # the manual exact answer: sum over BOTH calls' deltas
+    # the manual exact answer: sum over BOTH calls' deltas, PER HEAD
+    # (W21: the gates are (L, H) — the Jacobian row is one inner
+    # product per head: <ones[h], Delta[h]> summed over slots+dims)
     module.write_gate_k.grad = None
     with torch.no_grad():
         d1_1, _ = module.write_deltas(k1, v1, 0, state=m1_i)
         d1_2, _ = module.write_deltas(k2, v2, 0, state=m1_i)
-        want = ((torch.ones_like(d1_1) * d1_1).sum()
-                + (torch.ones_like(d1_2) * d1_2).sum())
-    # grad wrt g = <dL/dm1, Delta> with dL/dm1 = ones -> sum of both deltas
-    assert torch.allclose(grad_memopt, want.view(1), atol=0, rtol=0)
+        want = d1_1.sum(dim=(1, 2)) + d1_2.sum(dim=(1, 2))
+    # grad wrt g[L, h] = <dL/dm1[h], Delta[h]> with dL/dm1 = ones ->
+    # the per-head sums over both calls' deltas
+    assert torch.allclose(grad_memopt, want.view(1, -1), atol=0, rtol=0)
     # and equal to the plain chain's gradient on the same setup
     module.write_gate_k.grad = None
     m1p, m2p = ft.replay_states(module, calls, m1_i, m2_i,

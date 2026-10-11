@@ -272,9 +272,14 @@ def test_w17f_7_gates_artifact_roundtrip(model, tmp_path):
     """save/load roundtrip: values land exactly; geometry drift is loud;
     the loader's _load_m1m2_gates path consumes the same artifact."""
     with torch.no_grad():
-        model.m1m2.write_gate_k.uniform_(-0.2, 0.2, generator=None) \
-            if False else model.m1m2.write_gate_k.copy_(
-                torch.linspace(-0.2, 0.2, model.m1m2.num_linear_layers))
+        # W21: the write gates are (L, H) per-head — linspace across the
+        # full vector, viewed to the gate shape (the roundtrip below
+        # then checks every element lands)
+        model.m1m2.write_gate_k.copy_(
+            torch.linspace(-0.2, 0.2,
+                           model.m1m2.num_linear_layers
+                           * model.m1m2.num_heads).view_as(
+                               model.m1m2.write_gate_k))
         model.m1m2.write_gate_v.fill_(0.1)
     want = {k: getattr(model.m1m2, k).detach().clone()
             for k in ("write_gate_k", "write_gate_v", "read_gate")}
