@@ -628,7 +628,14 @@ test file + the mechanical pre-W20 test adaptation). Same DoD union,
 two commits.
 
 #### W20.4.6.a — the gate harness (`scripts/gpu/w20_gates.py`)
-- [ ] done
+- [x] done
+599 lines; `--report` takes a DIR (per-gate JSONs inside); extra
+integrity prechecks (fixture sha256, input-rebuild bit-exactness,
+pack-layout pin, config consistency) — strictly tighter than the §4
+contract, each recorded in metrics. The guard's import-time
+pytest-skip makes a direct `_gpu_guard` import unusable from a
+standalone script — the assert is replicated inline (discipline kept,
+cited by name).
 ROLE task-writer · READ the guard, the fixtures manifest layout
 (W20.1.2), TASKS.md §4 (the registry + thresholds) · WRITE
 `scripts/gpu/w20_gates.py` (new)
