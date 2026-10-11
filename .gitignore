@@ -22,3 +22,5 @@ disk/
 # editor
 .idea/
 .vscode/
+# W20 A10G gate reports (box-written, never committed)
+env/w20_gate_reports/

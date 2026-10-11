@@ -237,7 +237,7 @@ COMMIT: "W20.1.2 — the frozen-probe capture script (GPU-box, pinned to
 w20-baseline)"
 
 #### W20.1.3 — the A10G execution protocol doc
-- [ ] done
+- [x] done
 ROLE task-writer · READ `PROMPT.md §0, §5`; `HANDOVER.md` (the W19
 confirmation-sequence style) · WRITE `env/W20_GPU_PROTOCOL.md` (new)
 BRIEF: the ordered, copy-pasteable A10G sequence: (1) run
