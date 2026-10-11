@@ -1909,3 +1909,421 @@ __device__ __forceinline__ uint8_t tq_ladder_index(
 }
 
 }  // namespace
+
+// ===========================================================================
+// W20.7.3 -- tq_quant_ladder_pack: the ladder + packing pass, the encode
+// chain's third and final kernel stage (PROPOSAL.md:156-165, §3.3 step 3;
+// TASKS.md:1010-1028). Per (unit, tile): 7.2's smem boundary scaling, the
+// per-coordinate compare ladder, and the b-bit index packing into the
+// packed uint8 code streams -- the "syndrome: np.packbits" unit: the
+// legacy array era's np.packbits call (and W20.3.2's torch-native
+// pack_bits_t) become one fused device pass over the ROTATED coordinates.
+//
+// THE COMPOSITION DECISION -- batched butterfly reuse, not a re-inline.
+// PROPOSAL.md:156-157 sketches step 3 as "the multi-tile butterfly (§3.2
+// inline), then per coordinate the ladder, then pack" -- one fused
+// per-unit encode kernel. It is realized here as an ORCHESTRATION, and
+// the split is deliberate:
+//   * 5.2's two-pass butterfly is ALREADY (M, K)-batched: pass 1's grid
+//     is (M rows, K/16384 tiles) -- fht_large_local_kernel,
+//     kernel_tq.cu:203-205 -- and pass 2's pair space is the whole
+//     (M, K/2) -- fht_large_cross_kernel, kernel_tq.cu:269-276. The 7.4
+//     entry drives those EXACT launches over the prefill's (M, K) unit
+//     matrix and hands this kernel the rotated y; the "inlined
+//     butterfly" of §3.3 step 3 is realized as that batched reuse plus
+//     THIS fused ladder/pack pass -- the fusion that carries the paper's
+//     vectorization claim (the ladder + pack run per coordinate in
+//     registers; no intermediate index tensor is ever materialized).
+//   * Why not literally re-inline the butterfly into this kernel: the
+//     cross stages NEED kernel-launch boundaries -- they are this
+//     family's ONLY cross-CTA synchronization (fht_large.cuh:106-108) --
+//     so one fused kernel would have to re-invent that ordering as
+//     persistent-CTA machinery (tickets, fences) that 7.1's banner
+//     explicitly bans from this file (kernel_tq.cu:1447-1455); and
+//     duplicating the stage arithmetic + cp.async staging into a second
+//     copy would fork the fixture-pinned butterfly (W20.5.2's gates own
+//     exactly ONE copy of it). The price of the reuse is ONE extra fp32
+//     read pass of y (64 KiB per tile) -- a fraction of the butterfly's
+//     own (log2 K - 12) fp32 round-trips of the row
+//     (kernel_tq.cu:115-120).
+//   * The chain count still lands where the proposal wants it: ONE host
+//     entry, ONE stream-ordered chain per prefill (the norm launches +
+//     the butterfly's launches + this pack launch) -- PROPOSAL.md:189-
+//     193's "two kernel chains per prefill instead of ~4,000 host round
+//     trips" (the encode chain here; the decode chain is W20.8's).
+//   * The math ordering is preserved exactly: the FULL butterfly (local
+//     + cross) completes BEFORE the ladder -- quant's bucketize consumes
+//     the FINAL rotated coordinates (turboquant.py:530-545: y =
+//     fht.fht_apply(...), then searchsorted over y), and the stream's
+//     launch boundaries order that for free.
+//
+// THE LAYOUT PIN -- the byte layout is IDENTICAL to today's pack_bits
+// (turboquant.py:212-245, pack_bits_t, the W20.3.2 canonical) --
+// fixture-pinned: G20.P1's frozen fixtures are the pinning gate, G20.P3's
+// kernel-parity gate counts divergences (the same pin as W20.3.2,
+// restated here per the 7.3 invariant). Bit-precise, all four clauses:
+//   * bit order: LITTLE-ENDIAN -- bit k of index i sits at flat stream
+//     position i*bits + k (each index's LSB first);
+//   * byte assembly: byte m holds flat bits 8m..8m+7 with flat bit 8m in
+//     the LSB (bytes LSB-first); stream length = ceil(n*bits/8) =
+//     tq_packed_len(n, bits) -- turboquant.py:998's _packed_len,
+//     replicated bit-for-bit below;
+//   * tail padding: the final partial byte's unused high flat bits are
+//     zero;
+//   * the b=4 nibble fast path (byte j = idx[2j] | (idx[2j+1] << 4),
+//     the earlier index in the LOW nibble) and the b=3 general path
+//     (turboquant.py:256-262 vs :263-273) COINCIDE under the word
+//     formulation below -- the torch path's two paths are an
+//     optimization, never a semantic fork.
+//
+// THE PACKING FORMULATION -- one uint64 word per thread. Each thread
+// owns a fixed 16-coordinate slice of its tile (PROPOSAL.md:159; 16 =
+// FHT_LARGE_TILE / FHT_LARGE_THREADS); the slice's 16 laddered indices
+// fold into ONE uint64:
+//     word = sum_c idx[c] << (c * bits)
+// -- which IS the flat-stream segment [i0*bits, (i0+16)*bits) read as a
+// little-endian integer: flat position i0*bits + c*bits + k lands at
+// word bit c*bits + k, and byte w of the run is word >> (8*w).
+// PROPOSAL.md:160-161 cites PTX's bfi (PTX ISA 9.7.1.20) for the field
+// inserts; this implementation uses the plain C++ shift/mask
+// OR-accumulation -- equally exact (pure integer ops, nothing to round),
+// one statement per property to verify by eye, and the compiler is free
+// to fuse the inserts; a hand-bfi.b32 version would split the 48-bit
+// b=3 run across two 32-bit halves for zero determinism benefit (the
+// layout is bits, not instructions). THE SPLIT: the lo/hi halves pack
+// into SEPARATE streams with their own bits and their own lengths
+// (TQCodes' idx_lo/idx_hi, turboquant.py:549-550) -- per half, the
+// coordinate's half-LOCAL index i (lo: i = j; hi: i = j - n_lo) drives
+// the flat arithmetic; the entry (7.4) passes the split geometry (n_lo,
+// bits_lo, n_hi, bits_hi), exactly the signature sketch 7.4 binds.
+//
+// THE OWNERSHIP MAP -- no cross-tile dependencies (the 7.3 invariant, as
+// a construction, not a hope): 16*bits is a whole number of bytes for
+// both TQ widths (static_asserts below), so a slice's flat segment is
+// BYTE-ALIGNED and spans EXACTLY 6 (b=3) or 8 (b=4) whole bytes; the
+// slices partition each half's index space, and tiles are disjoint
+// contiguous coordinate ranges -- therefore every output byte has
+// EXACTLY ONE owning thread, no byte is shared across threads, tiles, or
+// units, and no synchronization of ANY kind rides the packing (the
+// single-writer discipline the whole file carries; the module grep for
+// reduction primitives stays at zero). The grid-stride loop below
+// (R20.6's overshoot guard, for 7.4's capped grids) keeps it: a byte's
+// VALUE is a pure function of (y, norms, boundaries, geometry) -- which
+// CTA computes it changes nothing, so run-to-run torch.equal holds for
+// any grid the entry chooses.
+//
+// THE ALIGNMENT CONTRACT: the 16-slice ownership needs every slice
+// wholly inside ONE half -- the hi half's slice bases anchor at n_lo --
+// so n_lo must be a multiple of 16. The launcher REFUSES misaligned
+// splits LOUDLY (a TORCH_CHECK, never a silently mis-packed stream); the
+// realized production geometry always satisfies it (group=1, K =
+// 2^15..2^22, frac in {0, .25, .5, .75} -> n_hi = round(frac*K) is a
+// multiple of 16), and an exotic frac (e.g. bits=3.1) falls back to the
+// torch twin -- the auto-backend discipline (fht.py's
+// kernel-when-eligible, torch-otherwise, lifted to the TurboQuant level
+// by 7.4's entry).
+//
+// THE CANARY NOTE: FLUTE_TQ_CANARY does not extend to the codes -- the
+// fht_large control poisons fp outputs with a NaN no finite result can
+// equal, but the packed byte space is FULLY reachable (any uint8 is a
+// legal packing of b-bit indices), so no poison value exists; this
+// pass's coverage control is the ownership map itself (every byte of the
+// (M, L) batches written exactly once) plus W20.6's parity gates on the
+// values.
+//
+// WHAT 7.4 OWES (the binding surface: raw pointers in, tensors out):
+//   * y: the butterfly's fp32 (M, K) output (5.2's forward epilogue --
+//     signs and 1/sqrt(K) INCLUDED; the norm NEVER divided out, 7.2's
+//     identity), contiguous, row m = unit m;
+//   * norms: 7.1's (M,) fp32, norms[m] > 0 (the zero-norm degenerate is
+//     7.4's device-side branch, never this kernel's -- 7.2's banner);
+//   * boundaries_{lo,hi}: the 2.2 device mirrors' fp32 tables, ASCENDING,
+//     lengths 2^bits - 1 (tensor-level asserts are 7.4's; this launcher
+//     takes raw pointers and checks the integer geometry only);
+//   * codes_{lo,hi}: (M, tq_packed_len(n_half, bits_half)) contiguous
+//     uint8 batches, row m = unit m's packed half-stream -- 7.4 slices
+//     the rows into TQCodes' per-unit 1-D streams (zero-copy views); the
+//     EMPTY half (uniform bits: n_hi = 0, a (M, 0) tensor whose
+//     data_ptr may be null) is legal and never dereferenced. (The
+//     sketch's single out_codes pointer widens to codes_lo + codes_hi:
+//     the halves are separate tensors end-to-end with different lengths;
+//     two passed pointers verify better than one base plus two derived
+//     offsets.)
+//
+// Resource accounting (sm_86): 1024 threads (FHT_LARGE_THREADS), grid =
+// M * K/16384 CTAs (6,144 at the 2^19 / 192-unit prefill -- PROPOSAL
+// §3.6's ~6,100), 120 B of STATIC shared memory (the two scaled tables),
+// no dynamic shared memory (no cudaFuncSetAttribute opt-in -- the 64 KiB
+// request is 5.2's, not this pass's), ~64 KiB of y read + 6-8 KiB of
+// codes written per tile, 16 fp32 + one uint64 in flight per thread.
+//
+// COMPILE RECORD: nvcc is ABSENT on this authoring box (env/W20_ENV.md)
+// -- compile and behavioral verification defer to the A10G box (the
+// W20.5.4 TU registration carries this file; W20.6/W20.7.5 run the
+// gates). Authored statically, re-read for review; every defect found
+// here is a box-side discovery.
+// ===========================================================================
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// The packed-stream length, pinned in ONE place: turboquant.py:998's
+// _packed_len(n, bits) = (n*bits + 7)//8, replicated bit-for-bit in C++
+// (Python floor division on non-negative ints == C++ integer division).
+// Host+device: the kernel derives its byte bounds and 7.4's wrapper
+// derives its tensor shapes from this one line.
+// ---------------------------------------------------------------------------
+__host__ __device__ constexpr int tq_packed_len(int n, int bits) {
+    return (n * bits + 7) / 8;
+}
+
+static_assert(tq_packed_len(16, 3) == 6,
+              "the b=3 16-coordinate slice packs to 6 bytes (PROPOSAL 3.3)");
+static_assert(tq_packed_len(16, 4) == 8,
+              "the b=4 16-coordinate slice packs to 8 bytes (PROPOSAL 3.3)");
+
+// The per-thread coordinate slice: PROPOSAL.md:159's "fixed 16-coordinate
+// slice" = the tile / the CTA width (16384 / 1024). 16 * bits is a whole
+// number of bytes for both TQ widths -- the property that makes every
+// output byte single-owned (the ownership map in the banner).
+constexpr int kTqPackSlice = flute::FHT_LARGE_TILE / flute::FHT_LARGE_THREADS;
+
+static_assert(kTqPackSlice == 16, "PROPOSAL.md:159's 16-coordinate slice");
+static_assert((kTqPackSlice * 3) % 8 == 0,
+              "the b=3 slice is byte-aligned in the flat stream");
+static_assert((kTqPackSlice * 4) % 8 == 0,
+              "the b=4 slice is byte-aligned in the flat stream");
+static_assert(kTqPackSlice * 4 <= 64,
+              "the slice's indices fold into ONE uint64 word");
+
+// ---------------------------------------------------------------------------
+// tq_quant_ladder_pack_kernel -- the ladder + packing pass. One CTA per
+// (unit, tile), grid-stride over the flattened M * (K/16384) space (the
+// R20.6 guard); per CTA: the unit's norm (ONE broadcast read), 7.2's smem
+// boundary scaling, then each thread's 16-coordinate slice: ladder ->
+// indices -> the 6/8-byte packed word -> its EXCLUSIVE byte run.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(flute::FHT_LARGE_THREADS)
+tq_quant_ladder_pack_kernel(
+    // (M, K) fp32: the units' ROTATED rows -- 5.2's forward epilogue
+    // output (signs + 1/sqrt(K) INCLUDED; the norm NEVER divided out,
+    // 7.2's identity), contiguous, row m = unit m
+    const float* __restrict__ y,
+    // (M,) fp32: 7.1's output; norms[unit] > 0 (7.4's contract)
+    const float* __restrict__ norms,
+    // (2^bits_lo - 1,) fp32 ASCENDING, UNSCALED (the 2.2 device mirror)
+    const float* __restrict__ boundaries_lo,
+    // (2^bits_hi - 1,) fp32 ASCENDING, UNSCALED
+    const float* __restrict__ boundaries_hi,
+    // (M, tq_packed_len(n_lo, bits_lo)) uint8: row m = unit m's lo stream
+    uint8_t* __restrict__ codes_lo,
+    // (M, tq_packed_len(n_hi, bits_hi)) uint8: row m = unit m's hi stream
+    uint8_t* __restrict__ codes_hi,
+    int M, int K,            // units; coords (a power of two > 16384)
+    int n_lo, int bits_lo,   // the lo half: coords [0, n_lo) at bits_lo
+    int n_hi, int bits_hi,   // the hi half: coords [n_lo, K) at bits_hi
+    int tile_shift) {        // log2(K) - 14; tiles per row = 1 << tile_shift
+    const int tiles = 1 << tile_shift;
+    const int64_t total_ctas = static_cast<int64_t>(M) * tiles;
+    const int64_t grid_stride = static_cast<int64_t>(gridDim.x);
+
+    // 7.2's smem scaled-boundary tables (the call pattern 7.2's banner
+    // pinned). The scaling conditions -- n_lo > 0 / n_hi > 0 -- are
+    // GRID-UNIFORM kernel parameters, invariant across the grid-stride
+    // loop, so the cooperative barrier inside the helper is uniform at
+    // every call. (7.2's banner sketched per-tile conditions; the
+    // grid-uniform form wastes <= 22 multiplies on a wholly-one-half
+    // tile -- noise against the tile's 16384 loads -- and keeps the
+    // barrier conditions iteration-invariant: one less per-iteration
+    // property to re-verify.)
+    __shared__ float b_lo[kTqLadderMaxB];  // 7 live slots at b=3
+    __shared__ float b_hi[kTqLadderMaxB];  // 15 live slots at b=4
+    const int B_lo = tq_boundary_count(bits_lo);
+    const int B_hi = tq_boundary_count(bits_hi);
+    const int lo_bytes = tq_packed_len(n_lo, bits_lo);
+    const int hi_bytes = tq_packed_len(n_hi, bits_hi);
+
+    for (int64_t cta = static_cast<int64_t>(blockIdx.x);
+         cta < total_ctas; cta += grid_stride) {
+        // unit-major flat map: consecutive CTAs walk one unit's tiles;
+        // tiles is a power of two, so the split is shift/mask only.
+        const int unit = static_cast<int>(cta >> tile_shift);
+        const int tile = static_cast<int>(cta & (tiles - 1));
+        const int tile_start = tile * flute::FHT_LARGE_TILE;
+
+        // ONE broadcast read per CTA-visit: every thread loads the same
+        // (M,) element (the sector is served once); the VALUE feeds the
+        // ladder, never re-reduced (7.2's call pattern).
+        const float nrm = norms[unit];
+        if (n_lo > 0) {
+            tq_scale_boundaries_smem(boundaries_lo, nrm, B_lo, b_lo);
+        }
+        if (n_hi > 0) {
+            tq_scale_boundaries_smem(boundaries_hi, nrm, B_hi, b_hi);
+        }
+
+        // ---- this thread's slice: 16 contiguous coords, ONE half -----
+        // j0 < K always (the tile lives inside the row); the alignment
+        // contract (launcher-checked: n_lo % 16 == 0) guarantees no
+        // slice straddles the split, so the WHOLE slice ladders against
+        // ONE table and packs into ONE contiguous byte run.
+        const int j0 = tile_start + threadIdx.x * kTqPackSlice;
+        const bool hi = j0 >= n_lo;
+        const int bits = hi ? bits_hi : bits_lo;
+        const int n_half = hi ? n_hi : n_lo;       // the half's coord count
+        const int B = hi ? B_hi : B_lo;            // its boundary count
+        const float* tbl = hi ? b_hi : b_lo;       // its SCALED table (smem)
+        const int i0 = hi ? (j0 - n_lo) : j0;  // slice base, half-LOCAL (a multiple of 16)
+        if (i0 < n_half) {  // vacuous in the checked geometry (j0 <= K-16
+                            // and the half selection pin i0 below its
+                            // half's end) -- kept as the boundary belt
+            const int64_t ybase = static_cast<int64_t>(unit) * K + j0;
+            // coords this slice OWNS. Under the alignment contract (n_lo
+            // a multiple of 16) every slice of BOTH halves is full -- each
+            // half's index range is an exact 16-slice multiple, so the
+            // packed streams come out whole-byte (no partial byte at
+            // all). The rem/clip machinery is the general-layout belt,
+            // kept so the pin's tail clauses (the zero pad, the clipped
+            // overrun) are enforced by the code that owns them should
+            // the contract ever be relaxed.
+            const int rem = n_half - i0;
+            const int cnt = (rem < kTqPackSlice) ? rem : kTqPackSlice;
+
+            // ---- the ladder (7.2): 16 coords -> 16 uint8 cells --------
+            // v arrives UNSCALED; the norm lives in the boundaries (the
+            // identity). The tail slice's phantom coords never ladder --
+            // their flat bits are the stream's zero pad (the pin's tail
+            // clause), so they contribute nothing to the word (cnt < 16
+            // keeps word's high fields at zero).
+            uint64_t word = 0;
+            #pragma unroll
+            for (int c = 0; c < kTqPackSlice; ++c) {
+                if (c < cnt) {
+                    const uint8_t idx =
+                        tq_ladder_index(y[ybase + c], tbl, B);
+                    word |= static_cast<uint64_t>(idx) << (c * bits);
+                }
+            }
+
+            // ---- the pack: the slice's 6 (b=3) / 8 (b=4) bytes -------
+            // word IS the flat-stream segment [i0*bits, (i0+16)*bits)
+            // as a little-endian integer; byte w of the run is
+            // word >> (8*w), stored to this thread's EXCLUSIVE range
+            // [byte0, byte0 + n_bytes). A full slice's range ends at or
+            // below the stream length; a partial slice's overrun bytes
+            // (a belt case -- whole-byte in the checked envelope) are
+            // exactly the stream's end, clipped here, and their phantom
+            // flat bits were never set: the zero tail.
+            uint8_t* out = (hi ? codes_hi : codes_lo)
+                + static_cast<int64_t>(unit) * (hi ? hi_bytes : lo_bytes);
+            const int byte0 = (i0 * bits) >> 3;   // 16*bits % 8 == 0 -> integral
+            const int n_bytes = (kTqPackSlice * bits) >> 3;  // 6 or 8
+            for (int w = 0; w < n_bytes; ++w) {
+                const int byte_idx = byte0 + w;
+                if (byte_idx < (hi ? hi_bytes : lo_bytes)) {
+                    out[byte_idx] =
+                        static_cast<uint8_t>(word >> (8 * w));
+                }
+            }
+        }
+
+        // ---- the table-lifetime barrier --------------------------------
+        // The next iteration may carry a DIFFERENT unit -> a different
+        // norm -> different scaled tables, and the scaling helper
+        // writes b_lo/b_hi BEFORE its own barrier: this trailing
+        // __syncthreads() orders every thread's table READS of this
+        // iteration before the next iteration's writes. The cta
+        // sequence is CTA-uniform, so the trip count -- and every
+        // barrier here -- is cooperative.
+        __syncthreads();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tq_quant_ladder_pack_run -- the INTERNAL raw-pointer launcher (anonymous
+// namespace; 7.4 binds the tensors and owns the tensor-level asserts -- y
+// fp32 (M, K) contiguous CUDA, norms (M,) fp32, boundary tables
+// (2^bits-1,) fp32 ASCENDING, codes (M, L) uint8 contiguous -- plus the
+// output allocation; this launcher checks the INTEGER geometry only,
+// loudly). The host never touches device memory content: no readback, no
+// D2H sync anywhere (turboquant.py:490-497's encode discipline).
+// ---------------------------------------------------------------------------
+void tq_quant_ladder_pack_run(
+    const float* y, const float* norms,
+    const float* boundaries_lo, const float* boundaries_hi,
+    uint8_t* codes_lo, uint8_t* codes_hi,
+    int M, int K, int n_lo, int bits_lo, int n_hi, int bits_hi,
+    cudaStream_t stream) {
+    // the family envelope: the (M, K)-batched butterfly upstream (5.2)
+    // owns exactly this K, and the tile arithmetic below rides it.
+    TORCH_CHECK(K > flute::FHT_LARGE_TILE && (K & (K - 1)) == 0,
+                "tq_quant_ladder_pack: K must be a power of two > 16384 "
+                "(the fht_large envelope the encode chain rides), got K=",
+                K);
+    TORCH_CHECK(M > 0,
+                "tq_quant_ladder_pack: M must be > 0 (a zero-size grid is "
+                "not a legal launch -- the M == 0 branch is 7.4's)");
+    TORCH_CHECK(bits_lo == 3 || bits_lo == 4,
+                "tq_quant_ladder_pack: bits_lo must be 3 or 4 (the TQ "
+                "index stream widths, codebooks.py:219-228), got ",
+                bits_lo);
+    TORCH_CHECK(bits_hi == 3 || bits_hi == 4,
+                "tq_quant_ladder_pack: bits_hi must be 3 or 4 (the TQ "
+                "index stream widths, codebooks.py:219-228), got ",
+                bits_hi);
+    TORCH_CHECK(n_lo >= 0 && n_hi >= 0 && n_lo + n_hi == K,
+                "tq_quant_ladder_pack: the lo/hi split must partition K "
+                "(n_lo=", n_lo, ", n_hi=", n_hi, ", K=", K, ")");
+    // THE ALIGNMENT CONTRACT, checked loudly (the banner's reasoning):
+    // misaligned splits are REFUSED, never silently mis-packed; the
+    // caller (7.4) routes them to the torch twin.
+    TORCH_CHECK(n_lo % kTqPackSlice == 0,
+                "tq_quant_ladder_pack: n_lo must be a multiple of ",
+                kTqPackSlice, " (the 16-coordinate slice ownership; got "
+                "n_lo=", n_lo, ") -- misaligned splits stay on the torch "
+                "twin");
+    // raw-pointer hygiene: a null pointer where the half is live is a
+    // binding bug, not a silent device fault.
+    TORCH_CHECK(y != nullptr && norms != nullptr,
+                "tq_quant_ladder_pack: y and norms must be live device "
+                "pointers");
+    TORCH_CHECK(n_lo == 0 ||
+                (boundaries_lo != nullptr && codes_lo != nullptr),
+                "tq_quant_ladder_pack: the live lo half needs its "
+                "boundary table and code stream pointers");
+    TORCH_CHECK(n_hi == 0 ||
+                (boundaries_hi != nullptr && codes_hi != nullptr),
+                "tq_quant_ladder_pack: the live hi half needs its "
+                "boundary table and code stream pointers");
+
+    // the launch geometry: a pure function of (M, K) -- no device query
+    // feeds it (the determinism contract). tiles = K/16384 (a power of
+    // two, K checked above); tile_shift = log2(K) - 14, so the kernel's
+    // unit-major shift/mask map is exact -- checked, not assumed (the
+    // "constructible by arithmetic, not faith" discipline,
+    // fht_large_check_args's grid hygiene).
+    const int tiles = K / flute::FHT_LARGE_TILE;
+    const int tile_shift = flute::fht_large_log2_floor(K)
+                         - flute::fht_large_log2_floor(flute::FHT_LARGE_TILE);
+    TORCH_CHECK((1 << tile_shift) == tiles,
+                "tq_quant_ladder_pack: the shift/mask (unit, tile) map "
+                "must be exact (tile_shift=", tile_shift, ", tiles=",
+                tiles, ")");
+    const int64_t total_ctas = static_cast<int64_t>(M) * tiles;
+    TORCH_CHECK(total_ctas <= INT32_MAX,
+                "tq_quant_ladder_pack: M*tiles = ", total_ctas,
+                " exceeds the grid.x launch bound");
+
+    // the FULL grid by default (every CTA walks exactly one (unit,
+    // tile)); the kernel's grid-stride loop is the R20.6 guard that lets
+    // 7.4 cap this without touching the kernel -- the byte values are
+    // grid-independent (the ownership map in the banner).
+    const int blocks = static_cast<int>(total_ctas);
+    tq_quant_ladder_pack_kernel
+        <<<blocks, flute::FHT_LARGE_THREADS, 0, stream>>>(
+            y, norms, boundaries_lo, boundaries_hi, codes_lo, codes_hi,
+            M, K, n_lo, bits_lo, n_hi, bits_hi, tile_shift);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace

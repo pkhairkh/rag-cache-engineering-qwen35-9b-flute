@@ -1008,7 +1008,21 @@ COMMIT: "W20.7.2 — the scaled-boundary compare ladder (the
 vectorization the paper demands)"
 
 #### W20.7.3 — the multi-tile butterfly + bfi packing (syndrome: np.packbits)
-- [ ] done
+- [x] done
+Composition decision (banner-documented): the "inlined butterfly" is
+realized as 7.4's ORCHESTRATION — 5.2's existing (M,K)-batched
+butterfly passes run over the unit batch, then the new kernel is a
+pure post-butterfly pass (norm broadcast → 7.2's smem scaling →
+ladder → pack). Cross stages require launch boundaries (the family's
+only cross-CTA sync) — a single fused kernel would need banned
+persistent-CTA machinery; re-inlining would fork the
+fixture-pinned butterfly. Packing: word = Σ idx[c]<<(c·bits) — the
+flat-stream segment as a little-endian integer (the pack_bits_t pin;
+b=4 nibble and b=3 general COINCIDE); 16·bits ≡ 0 (mod 8) ⇒ every
+byte single-owned (no cross-tile deps); plain shift/mask over PTX bfi
+(cited, simpler to verify). codes_lo/codes_hi separate streams. The
+launcher refuses n_lo % 16 ≠ 0 loudly (the alignment contract —
+misaligned fractions route to the torch twin).
 ROLE task-writer · READ `kernel_tq.cu` (5.2's butterfly inline),
 `turboquant.py:159-186` (the pinned byte layout), the PTX ISA refs in
 `PROPOSAL.md §Sources` · WRITE `kernel_tq.cu`
