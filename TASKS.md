@@ -622,30 +622,57 @@ auditor carries the corresponding grep checks.
 COMMIT: "W20.4.5 — the CPU-elimination audit report (rg-derived)"
 
 #### W20.4.6 — the CUDA-gated K1 test file + the gate harness (G20.P1)
+SPLIT (context budget, PROMPT.md §2): W20.4.6 → W20.4.6.a (the gate
+harness `scripts/gpu/w20_gates.py`) + W20.4.6.b (the CUDA-gated K1
+test file + the mechanical pre-W20 test adaptation). Same DoD union,
+two commits.
+
+#### W20.4.6.a — the gate harness (`scripts/gpu/w20_gates.py`)
 - [ ] done
-ROLE task-writer · READ `src/rag/tests/w20/_gpu_guard.py`, the
-fixtures manifest layout (W20.1.2), `PROPOSAL.md §5` (the three-level
-parity contract) · WRITE `scripts/gpu/w20_gates.py` (new),
+ROLE task-writer · READ the guard, the fixtures manifest layout
+(W20.1.2), TASKS.md §4 (the registry + thresholds) · WRITE
+`scripts/gpu/w20_gates.py` (new)
+BRIEF: `--gates <csv|all> --report env/w20_gate_reports/<id>.json`;
+asserts CUDA (the guard discipline), records the device report; each
+gate = a function returning {gate, pass, metrics, thresholds};
+THRESHOLDS dict mirroring TASKS.md §4 1:1 (drift = wave-close
+failure). G20.P1 IMPLEMENTED (the torch path vs the frozen fixtures —
+codes equal except boundary ties ≤ 0.01%, norm ≤ 1 ulp, recon
+allclose ≤ 1e-5 rel; run-to-run torch.equal on CUDA; the 237-suite
+regression via pytest subprocess ON THE BOX). The other 8 gates
+registered as NOT-AUTHORED stubs (their waves author them; invoking a
+stub exits with a loud NOT-AUTHORED-YET error — the registry grows
+per wave).
+INVARIANTS: every test the harness runs is CUDA-gated; thresholds
+mirror §4 exactly; no CPU fallback.
+DO-D: file exists; `rg "G20.P1|THRESHOLDS|--gates" scripts/gpu/
+w20_gates.py` hit; py_compile; the guard import present.
+COMMIT: "W20.4.6.a — the G20 gate harness (THRESHOLDS 1:1, G20.P1
+implemented)"
+
+#### W20.4.6.b — the CUDA-gated K1 tests + mechanical pre-W20 adaptation
+- [ ] done
+ROLE task-writer · READ `_gpu_guard.py`, the fixtures layout,
+PROPOSAL.md §5 (the three-level parity contract), test_turboquant.py +
+test_tq_cache.py (the TQ-contract test surfaces) · WRITE
 `src/rag/tests/w20/test_w20_torch_path.py` (new), the mechanical
-adaptation of pre-W20 TQ-contract tests (test_turboquant*.py,
-test_tq_cache*.py: imports/constructors ONLY — no new CPU assertions)
-BRIEF: the gate harness: `--gates <csv> --report
-env/w20_gate_reports/<id>.json`; asserts CUDA (via the guard's
-discipline), records the device report; each gate = a function
-returning {gate, pass, metrics, thresholds}; thresholds live in a
-documented THRESHOLDS dict mirroring TASKS.md §4 1:1. Gate G20.P1
-(K1): the torch path vs the frozen fixtures — codes equal except
-boundary ties (tie fraction ≤ 0.01%), norm ≤ 1 ulp, reconstruction
-allclose ≤ 1e-5 rel; run-to-run `torch.equal` on CUDA (both codes and
-recon); plus the 237-suite regression (the harness invokes pytest as a
-subprocess ON THE BOX). The pytest surface: `test_w20_torch_path.py`
-— CUDA-gated (module skip per the guard), fixture-driven, asserting
-the same thresholds.
-INVARIANTS: every test in the file imports `_gpu_guard`; no test body
-can pass on CPU (module-level skip); thresholds mirror §4 exactly.
-DO-D: both files exist; `rg "G20.P1|THRESHOLDS|--gates" scripts/gpu/w20_gates.py` hit; `rg "def test_" src/rag/tests/w20/test_w20_torch_path.py` > 0 and every such file imports `_gpu_guard`; the pre-W20 test diffs are mechanical (auditor: `git diff w20-wave-3..HEAD -- src/rag/tests/test_turboquant.py` contains no new `def test_`); py_compile all touched.
-COMMIT: "W20.4.6 — G20.P1 authored (gate harness + CUDA-gated torch-path
-tests)"
+adaptation of test_turboquant.py / test_tq_cache.py (imports/
+constructors/dtypes ONLY — no new CPU assertions; no new `def test_`
+in pre-W20 files)
+BRIEF: the pytest surface — test_w20_torch_path.py is CUDA-gated
+(module skip per the guard), fixture-driven, asserting G20.P1's
+thresholds; the pre-W20 TQ-contract tests get the mechanical
+adaptation the rewrite forces (torch constructors, renamed symbols,
+dtype expectations).
+INVARIANTS: every test in the W20 file imports `_gpu_guard`; no test
+body can pass on CPU (module-level skip); thresholds mirror §4
+exactly; pre-W20 diffs mechanical (auditor: no new `def test_`).
+DO-D: both files exist; `rg "def test_" src/rag/tests/w20/test_w20_
+torch_path.py` > 0; every such file imports `_gpu_guard`; `git diff
+w20-wave-3..HEAD -- src/rag/tests/test_turboquant.py src/rag/tests/
+test_tq_cache.py` contains no new `def test_`; py_compile all touched.
+COMMIT: "W20.4.6.b — G20.P1's pytest surface (CUDA-gated torch-path
+tests + mechanical pre-W20 adaptation)"
 
 #### W20.4.7 — wave close W20.4 (K1 complete)
 - [ ] done
