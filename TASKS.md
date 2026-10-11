@@ -2234,6 +2234,110 @@ before serving with it); the loss temperature at the new negative-pool
 size (tau 0.07 was tuned for large-batch SimCLR — try 0.1); coverage
 (4.2% at 300 steps — the runbook's re-run raises steps, not width).
 
+## WAVE W23 — the generation repair: the proven context build (prefill answer mode)
+
+The user's box paste (run_query on ragga_ingested_test100): retrieval
+returns [70, 80, 82] at scores 0.63/0.60/0.59 and the answer is
+multilingual word salad. Root cause is NOT the model, NOT the TQ
+quantization, NOT the decode loop — the W14/W15 true-doc control
+measured conf 0.895 answering over a text-prefilled state on this exact
+machinery. It is the §6 INSTALL: a gated-delta-net state is a
+SEQUENCE state, S_t = (I − β k kᵀ)·S_{t−1} + β k vᵀ with per-head decay
+— NON-ADDITIVE. sum_absolute_codes(sys, [abs₁..absₙ]) = Σabs −
+(n−1)·sys is exact arithmetic on the codes but NOT a valid state
+composition: it superposes n chunks' associations (each at full
+strength, no decay, no conflict resolution) — the linear-attention
+readout then returns the superposed mush, and the answer is garbage.
+This is the same finding the CacheBlend (EMNLP 2024) / Block-Attention
+(2024) line published for KV caches: reused chunk caches still need
+the TEXT (or a recompute fraction) to rebuild coherent cross-chunk
+state. A second, smaller bug: run_query.py fed the model a 1-D token
+tensor (the user's sed hack worked around it — the crash, plus a lost
+`.to(dev)`); now the repo's proper fix.
+
+#### W23.1 — query.py: the prefill answer mode (`context_token_ids`)
+- [x] done
+ROLE core author · WRITE `src/rag/query.py`: `answer_query(...,
+context_token_ids)` — one 2-D tensor per retrieved chunk, ascending
+corpus order (the ingest stream order). The branch: fresh
+`cache_factory()` cache (or the passed cache, reseeded — semantically
+fresh), `reseed_cache`, sequential context prefills, the W16
+`_reset_full_attention` (docs ride the LINEAR state, full-attn fresh —
+spec §2.4), then the existing [7]/[8]. Steps 5-6 (codes load +
+install) skipped: `t["context_prefill"]` replaces load_codes/install
+in the §9 ledger; `install_report = {"mode": "prefill",
+"n_chunks", "context_tokens"}`. Loud refusal: contexts without
+retrieved_ids. `None` (default) = the §6 install flow VERBATIM (the
+A/B, bit-identical).
+DO-D: `python3 -m py_compile src/rag/query.py` exit 0.
+COMMIT: "W23.1 — the prefill answer mode: context_token_ids rebuilds
+the answer state from the retrieved chunks' text (the proven build)"
+
+#### W23.2 — the m1m2 answer-time A/B (`enabled`)
+- [x] done
+ROLE core author · WRITE `src/rag/m1m2.py` (`self.enabled = True` — a
+runtime flag, never a parameter, never serialized) +
+`src/scripts/modeling.py` (the block guard gains
+`getattr(_m1m2, "enabled", True)`). The memory's GENERATION effect
+(trained gates reading into the stream during prefill+decode) is now
+a measured A/B, not an assumption — the true-doc control (0.895) ran
+without M1/M2, and the finetune trained retrieval discrimination,
+never generation quality.
+DO-D: `python3 -m py_compile src/rag/m1m2.py src/scripts/modeling.py`
+exit 0.
+COMMIT: "W23.2 — the m1m2 enabled knob: the answer-time memory A/B
+(the true-doc regime is one flag away)"
+
+#### W23.3 — run_query.py: the 2-D fix + the driver knobs
+- [x] done
+ROLE driver author · WRITE `scripts/gpu/run_query.py`: query ids are
+2-D (1, T) long on the model's device (the proper fix of the box's sed
+hack); `--answer-mode {prefill,install}` (DEFAULT prefill — the
+proven path); `--corpus` (documents.jsonl, chunk i = line i, the
+ingest convention; missing file/lines fail LOUDLY);
+`--no-answer-m1m2` (disables the M1/M2 block for the ANSWER phase
+only — after the retrieval prefill, so the §4 query vector keeps the
+M1/M2 codes); the gen-gate printout (mean conf + repetition, the
+bisect's own bar: conf >= 0.20, rep <= 0.6; the true-doc control
+measured 0.895).
+DO-D: `python3 -m py_compile scripts/gpu/run_query.py` exit 0.
+COMMIT: "W23.3 — run_query: 2-D ids (the sed hack's proper fix),
+--answer-mode prefill (default), --corpus, --no-answer-m1m2, the gen
+gate printout"
+
+#### W23.4 — the box-run regression gates (AUTHORED, PENDING)
+- [x] done
+ROLE test author · WRITE `src/rag/tests/test_query.py` (the 6e
+section): single-context (steps 5-6 skipped — the timings prove the
+path; the argmax is the context chunk's topic; the W12 confidences
+flow), multi-context sequential composition (majority topic wins —
+ordering the install-sum cannot express), no-disk (a loader without
+.disk_dir is FINE in prefill mode — the install path refuses that
+exact case), the loud refusal.
+DO-D: `python3 -m py_compile src/rag/tests/test_query.py` exit 0 (the
+suite executes on the box, W22.4's precedent).
+COMMIT: "W23.4 — the W23 contracts (AUTHORED, PENDING): the prefill
+answer-mode gates"
+
+#### W23.5 — the wave close: docs, auditor, handover
+- [x] done
+ROLE orchestrator · WRITE `TASKS.md` (this section + the §5 row),
+`scripts/w20_static_audit.py` (CHECKS W23), `HANDOVER.md` (the W23 box
+section: the honest verdict, the OOM recap, the re-run commands, the
+decision tree).
+DO-D: `python3 scripts/w20_static_audit.py --wave W23` exit 0 AND
+`--all` exit 0; tag `w23-prefill-answer` pushed.
+COMMIT: "W23.5 — wave W23 closed: the generation repair — the proven
+prefill context build (the install sum stays the A/B)"
+
+Box open items carried (NOT this wave's scope, recorded for the next):
+the prefill vs install gen-gate comparison on the real corpus (the
+A/B the flags exist for); the M1/M2 on/off answer A/B (one run each
+with --no-answer-m1m2); retrieval still needs the re-ingest with the
+trained gates (the corpus codes were written under the OLD gates
+regime — M1/M2 carry ~zeros; the W22 decision tree's re-ingest step);
+the ladder's held-out spread (the W22 box sequence owns it).
+
 ## 5. The attestation ledger (the no-CPU-test law, per wave)
 
 One line per wave close, written by the orchestrator, only when
@@ -2260,6 +2364,7 @@ truthful (PROMPT.md §1.4):
 | W21 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile/static-audit vehicles only; the uploaded HANDOVER.md training log read as data); auditor --wave W21 exit 0 (36/36, re-verified post-tag) AND --all exit 0 (the full 17-wave re-check in one pass — the W20.15 "curated negatives" vocabulary pin held after the driver rewrite); push w21-content-addr |
 | W21.6 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile + the static auditor only; the pure-numpy segment-sum verification in /home/z/my-project/scripts/w21_6_segment_check.py imports nothing from the repo); auditor --wave W21.6 exit 0 AND --all exit 0 (the W21 pins re-verified post-edit); push main (a62ffa8..W21.6) |
 | W22 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile + the static auditor only; the uploaded HANDOVER.md box log read as data); auditor --wave W22 exit 0 AND --all exit 0 (the full 18-wave re-check in one pass); push w22-proven-memory |
+| W23 | CLOSED 2026-10-12 — no test executed, no CPU test authored on this box (the 6e gates authored + py_compile'd only, W22.4's precedent — the suite executes on the box), no repo module imported on this box; auditor --wave W23 exit 0 AND --all exit 0 (the full 19-wave re-check in one pass); push w23-prefill-answer |
 
 Line format: `CLOSED <date> — no test executed, no CPU test authored,
 no repo module imported on this box; auditor --wave W20.<n> exit 0;

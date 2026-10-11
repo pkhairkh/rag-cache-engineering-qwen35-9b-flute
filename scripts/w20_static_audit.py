@@ -1158,6 +1158,69 @@ CHECKS = {
         {"kind": "git_log", "target": "W22.5 —"},
         {"kind": "git_tag", "target": "w22-proven-memory"},
     ],
+
+    # W23 — the generation-repair wave: the proven prefill context build
+    # (the install-by-sum stays the A/B), the 2-D ids fix, the answer-time
+    # m1m2 A/B
+    "W23": [
+        # W23.1 — query.py: the prefill answer mode
+        {"kind": "grep", "target": "src/rag/query.py",
+         "pattern": r"context_token_ids: Optional\[Sequence\[torch\.Tensor\]\] = None"},
+        {"kind": "grep", "target": "src/rag/query.py",
+         "pattern": r"context_token_ids requires retrieved_ids"},
+        {"kind": "grep", "target": "src/rag/query.py",
+         "pattern": r"t\[\"context_prefill\"\]"},
+        {"kind": "grep", "target": "src/rag/query.py",
+         "pattern": r"\"mode\": \"prefill\""},
+        {"kind": "grep", "target": "src/rag/query.py",
+         "pattern": "THE PREFILL CONTEXT BUILD"},
+        {"kind": "grep", "target": "src/rag/query.py",
+         "pattern": "NON-ADDITIVE"},
+        {"kind": "py_compile", "target": "src/rag/query.py"},
+        # W23.2 — the m1m2 answer-time A/B (enabled)
+        {"kind": "grep", "target": "src/rag/m1m2.py",
+         "pattern": r"self\.enabled = True"},
+        {"kind": "grep", "target": "src/scripts/modeling.py",
+         "pattern": r"getattr\(_m1m2, \"enabled\", True\)"},
+        {"kind": "py_compile", "target": "src/rag/m1m2.py"},
+        {"kind": "py_compile", "target": "src/scripts/modeling.py"},
+        # W23.3 — run_query.py: the 2-D fix + the driver knobs
+        {"kind": "grep", "target": "scripts/gpu/run_query.py",
+         "pattern": r"--answer-mode"},
+        {"kind": "grep", "target": "scripts/gpu/run_query.py",
+         "pattern": r"--no-answer-m1m2"},
+        {"kind": "grep", "target": "scripts/gpu/run_query.py",
+         "pattern": r"--corpus"},
+        {"kind": "grep", "target": "scripts/gpu/run_query.py",
+         "pattern": r"def _context_token_ids"},
+        {"kind": "grep", "target": "scripts/gpu/run_query.py",
+         "pattern": r"dtype=torch\.long, device=dev\)"},
+        {"kind": "grep", "target": "scripts/gpu/run_query.py",
+         "pattern": r"gen gate"},
+        {"kind": "py_compile", "target": "scripts/gpu/run_query.py"},
+        # W23.4 — the box-run regression gates (AUTHORED, PENDING)
+        {"kind": "grep", "target": "src/rag/tests/test_query.py",
+         "pattern": "test_prefill_mode_single_context"},
+        {"kind": "grep", "target": "src/rag/tests/test_query.py",
+         "pattern": "test_prefill_mode_multi_context_composes"},
+        {"kind": "grep", "target": "src/rag/tests/test_query.py",
+         "pattern": "test_prefill_mode_needs_no_disk"},
+        {"kind": "grep", "target": "src/rag/tests/test_query.py",
+         "pattern": "test_prefill_mode_requires_retrieved_ids"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_query.py"},
+        # W23.5 — the wave close: docs
+        {"kind": "grep", "target": "HANDOVER.md",
+         "pattern": r"## W23"},
+        {"kind": "grep", "target": "TASKS.md",
+         "pattern": r"## WAVE W23"},
+        {"kind": "ledger", "target": "W23"},
+        {"kind": "git_log", "target": "W23.1 —"},
+        {"kind": "git_log", "target": "W23.2 —"},
+        {"kind": "git_log", "target": "W23.3 —"},
+        {"kind": "git_log", "target": "W23.4 —"},
+        {"kind": "git_log", "target": "W23.5 —"},
+        {"kind": "git_tag", "target": "w23-prefill-answer"},
+    ],
 }
 
 

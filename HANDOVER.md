@@ -803,3 +803,121 @@ python3 scripts/gpu/eval_retrieval.py ...        # vs a dense-read ingest
 - **If anything OOMs in [6] again:** paste the traceback verbatim — the
   ladder is now bounded by construction, so a failure there is new
   information, not a repeat.
+
+## W23 — the generation repair: the proven context build (2026-10-12)
+
+**Your paste, read honestly.** Retrieval works (top-3 [70, 80, 82] at
+0.63/0.60/0.59 — weakly separated but functional). The answer is
+multilingual word salad. You also hit a crash in run_query.py and
+sed-hacked a batch dimension in — that was a real bug (1-D token
+tensor into a model that reshapes (B, T)); the repo now carries the
+proper fix (2-D, long, on the model's device — restore the file from
+git, the sed edits conflict with the pull).
+
+**The root cause of the garbage — measured, not argued.** The answer
+context was built by the §6 INSTALL: sum the top-k chunks' cached
+states (`sum_absolute_codes`: Σabsᵢ − (n−1)·sys — one requant). That
+algebra is exact ARITHMETIC on the codes but it is not a valid STATE
+composition. A gated-delta-net recurrent state is a SEQUENCE state —
+S_t = (I − β k kᵀ)·S_{t−1} + β k vᵀ with per-head decay — which is
+NON-ADDITIVE: the sum superposes 3 chunks' associations (each at full
+strength, no decay between them, no conflict resolution, the −2·sys
+term on top), and the linear-attention readout returns the mush. The
+proof is already in the repo's own numbers: the W14/W15 true-doc
+control — the SAME model, the SAME TQ cache machinery, answering over
+a state built by PREFILLING the doc text — measured **conf 0.895**;
+the summed install answers word salad. This is also exactly what the
+KV-cache reuse literature found (CacheBlend EMNLP 2024,
+Block-Attention 2024): reused chunk caches still need the text (or a
+recompute fraction) for coherent generation. The RAG concept is
+untouched — ingest → capture codes → retrieve on them → answer over
+the retrieved chunks; only the context BUILD changes (text prefill,
+the proven path, vs codes-sum, kept as the A/B).
+
+**The fix (W23, in this pull):**
+- `answer_query(..., context_token_ids)` — the prefill mode: fresh
+  reseeded cache → the retrieved chunks' text prefilled sequentially
+  (ascending chunk id = the ingest stream order) → full-attn reset
+  (spec §2.4, the docs ride the LINEAR state) → query prefill →
+  decode. Steps 5-6 (codes load + install) skipped entirely.
+- `run_query.py`: `--answer-mode {prefill,install}` (DEFAULT prefill),
+  `--corpus` (documents.jsonl — chunk i = line i, the ingest
+  convention), `--no-answer-m1m2` (the answer-time memory A/B), the
+  2-D ids fix, and a gen-gate printout (mean confidence +
+  repetition — bisect_install's own bar: conf ≥ 0.20, rep ≤ 0.6).
+- `m1m2.enabled` (modeling.py guard): the memory's GENERATION effect
+  is now one flag — the true-doc control ran WITHOUT M1/M2, and the
+  fine-tune trained retrieval discrimination, never generation
+  quality. Do not assume the read helps the answer; measure it.
+
+**The OOM, answered (you asked):** two OOMs, both already root-caused
+and fixed in W22 — (1) the W21 held-out ladder kept everything on the
+GPU (~2.6 GiB retained capture k/v + four (64, 4.19M) fp32 unit stacks
++ ~6 GiB transient python lists on top of the 9B model — every [6]
+row died at a 16 MiB request against a full 22 GiB) and then CRASHED
+with `UnboundLocalError: val_group`; W22 made the ladder HOST-STAGED
+(pinned host memory, one side at a time, bounded under ~1 GiB GPU at
+any pair count), saves artifacts BEFORE the reports, and rebinds
+instead of `del`. (2) The earlier held-out-control OOM (4 × 1.07 GiB
+stacked states) — same fix class (artifact-first). Your pasted query
+run has NO OOM, and the prefill mode does not add one: it REPLACES
+~18 MiB of code loads with transient forward passes.
+
+**Did training succeed? The honest shape (unchanged from W22, plus
+the new consequence):** in-train, YES — the first real signal (spread
++0.20..0.35 sustained, cos(pos) +0.30..0.46 vs cos(neg) +0.07..0.16,
+gates opened, zero OOM). Held-out, UNMEASURED (the ladder OOM ate it —
+now runnable). Coverage 4.2%. And end-to-end the system did NOT work
+— retrieval scores clustered 0.59-0.63 partly because this corpus was
+ingested under the OLD gates regime (its M1/M2 codes ≈ zeros — the
+W21 semantic component is absent at retrieval time; re-ingest with
+the trained artifact), and generation was broken by the install sum
+(fixed by this wave). The training data itself is good and valuable —
+33,595 pairs / ~48% positive, 17,519 curated label-0 non-pairs, a
+held-out control slice; its limitation is coverage-at-300-steps, a
+steps knob, not a data problem.
+
+**The box sequence:**
+
+```
+cd /home/ubuntu/RAGGA
+git checkout -- scripts/gpu/run_query.py   # drop the sed edits FIRST
+git pull --ff-only origin main             # >= W23
+source /home/ubuntu/venv/bin/activate
+python3 -m pytest src/rag/tests -q         # + the 4 new W23 gates
+
+# THE W23 RUN — your exact query, on the proven answer path:
+python3 scripts/gpu/run_query.py \
+    --disk-dir /home/ubuntu/ragga_ingested_test100 \
+    --question "How do I deploy perf-canary?" \
+    --m1m2-gates m1m2_gates_trained.npz \
+    --top-k 3 --max-new-tokens 128 \
+    --corpus /home/ubuntu/enterprise_rag_bench/documents/documents.jsonl
+# (--answer-mode prefill is the DEFAULT; pass the documents.jsonl the
+#  corpus was ingested from — the first 100 lines are the 100 chunks)
+
+# the A/Bs, one variable each:
+python3 scripts/gpu/run_query.py ... --answer-mode install      # the old world (expect the salad — the negative control)
+python3 scripts/gpu/run_query.py ... --no-answer-m1m2           # the true-doc regime exactly (no memory reads)
+```
+
+**What to expect / the decision tree:**
+- **The [gen gate] line is now printed per query** — read it before
+  reading the text: conf ≥ 0.20 / rep ≤ 0.6 is the bar; the true-doc
+  control measured 0.895.
+- **prefill coherent (conf ≥ ~0.5, on-topic):** generation unblocked.
+  Next blocker is retrieval quality: re-ingest the corpus with the
+  trained gates (`run_ingestion.py ... --m1m2-gates
+  m1m2_gates_trained.npz`) so the M1/M2 codes carry the W21 semantic
+  component, then the W22 ladder for the held-out number.
+- **prefill coherent only with `--no-answer-m1m2`:** the trained
+  gates' read injects too much into the stream at answer time — the
+  gates need generation-side calibration (a follow-up wave: scale the
+  read gate, or gate the read by a norm budget). Not an architecture
+  failure — a knob with a number now.
+- **prefill STILL garbage with --no-answer-m1m2:** that is new
+  information — run `bisect_install.py` (its true-doc row is the
+  control) and paste both outputs verbatim.
+- **install mode salad:** expected — that is the documented root
+  cause, kept as the A/B. The npz store and the install path stay
+  (retrieval still runs on the captured codes).
