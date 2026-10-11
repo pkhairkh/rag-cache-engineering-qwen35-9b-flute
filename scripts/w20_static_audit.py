@@ -896,6 +896,62 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.14.5 —"},
         {"kind": "git_tag", "target": "w20-wave-14"},
     ],
+    # W20.15 — the fine-tune regime: the sawtooth decomposed (between-
+    # block loss variance 7,595x within; 4.1% pair coverage; the
+    # position-locked write's ceiling made measurable)
+    "W20.15": [
+        # W20.15.1 — the trainer observability (where the gates ARE)
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"def _gate_value_stats"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r'"batch": batch_idx'},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": "gk_absmean"},
+        {"kind": "py_compile", "target": "src/rag/m1m2_finetune.py"},
+        # W20.15.2 — the regime: per-epoch re-batching
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"def epoch_batches"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": "seed \\* 100003 \\+ epoch"},
+        {"kind": "grep", "target": "scripts/gpu/finetune_m1m2.py",
+         "pattern": r"--fixed-batches"},
+        {"kind": "grep", "target": "scripts/gpu/finetune_m1m2.py",
+         "pattern": r"--shuffle-seed"},
+        {"kind": "grep", "target": "scripts/gpu/finetune_m1m2.py",
+         "pattern": "coverage: \\{consumed"},
+        {"kind": "py_compile", "target": "scripts/gpu/finetune_m1m2.py"},
+        # W20.15.3 — the instruments: overlap buckets + the label-0 control
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"def lexical_overlap"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"def bucketed_spread"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": "POSITION-ALIGNED"},
+        {"kind": "grep", "target": "scripts/gpu/finetune_m1m2.py",
+         "pattern": "curated negatives"},
+        {"kind": "grep", "target": "scripts/gpu/finetune_m1m2.py",
+         "pattern": r"--val-pairs"},
+        # W20.15.4 — the box-run regression gates (AUTHORED, PENDING)
+        {"kind": "grep", "target": "src/rag/tests/test_w20_15_regime.py",
+         "pattern": "test_w20_15a_epoch_batches_rebatch_per_epoch"},
+        {"kind": "grep", "target": "src/rag/tests/test_w20_15_regime.py",
+         "pattern": "test_w20_15b_epoch_batches_contracts"},
+        {"kind": "grep", "target": "src/rag/tests/test_w20_15_regime.py",
+         "pattern": "test_w20_15c_lexical_overlap_math"},
+        {"kind": "grep", "target": "src/rag/tests/test_w20_15_regime.py",
+         "pattern": "test_w20_15d_bucketed_spread_splits_the_rigged_rig"},
+        {"kind": "grep", "target": "src/rag/tests/test_w20_15_regime.py",
+         "pattern": "test_w20_15e_history_carries_batch_ordinal_and_gate"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_w20_15_regime.py"},
+        # W20.15.5 — the wave close
+        {"kind": "ledger", "target": "W20.15"},
+        {"kind": "git_log", "target": "W20.15.1 —"},
+        {"kind": "git_log", "target": "W20.15.2 —"},
+        {"kind": "git_log", "target": "W20.15.3 —"},
+        {"kind": "git_log", "target": "W20.15.4 —"},
+        {"kind": "git_log", "target": "W20.15.5 —"},
+        {"kind": "git_tag", "target": "w20-wave-15"},
+    ],
 }
 
 
