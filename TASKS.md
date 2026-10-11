@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: IN EXECUTION — 7/13 waves closed (W20.0–W20.6).
+Status: IN EXECUTION — 8/13 waves closed (W20.0–W20.7).
 
 ---
 
@@ -23,7 +23,7 @@ Status: IN EXECUTION — 7/13 waves closed (W20.0–W20.6).
 | W20.4 | K1 | wiring + serving sweep + K1 gates | 7 | G20.P1 | CLOSED |
 | W20.5 | K2 | fht_forward_large / fht_backward_large | 6 | — | CLOSED |
 | W20.6 | K2 | debug twins + canary/trap builds | 4 | G20.P2, G20.6 | CLOSED |
-| W20.7 | K3 | tq_quant_batched (the fused encode) | 5 | — | OPEN |
+| W20.7 | K3 | tq_quant_batched (the fused encode) | 5 | — | CLOSED |
 | W20.8 | K3 | tq_dequant_batched + dispatcher | 4 | G20.P3, G20.1, G20.2, G20.4 | OPEN |
 | W20.9 | K4 | QJL kernel chain + tq_l2norm_rows | 4 | — | OPEN |
 | W20.10 | K4 | serving-side batched passes | 4 | G20.5 | OPEN |
@@ -1068,7 +1068,7 @@ COMMIT: "W20.7.4 — the batched quant entry (two kernel chains per
 prefill, not 4,000 round trips)"
 
 #### W20.7.5 — wave close W20.7
-- [ ] done
+- [x] done
 ROLE orchestrator · standard close-out.
 Tier-D: 7.1–7.4 sets; the atomics-free grep; compile record.
 Tier-G: G20.P3's quant half authored in W20.8 (with dequant).
@@ -1425,7 +1425,7 @@ truthful (PROMPT.md §1.4):
 | W20.4 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.4 exit 0 (43/43, re-verified post-tag); push w20-wave-4 |
 | W20.5 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.5 exit 0 (27/27, re-verified post-tag; incl. the kernel_fht.cu byte-identical git fact via the new git_diff_empty kind); compile deferred to the A10G box (nvcc ABSENT, recorded); push w20-wave-5 |
 | W20.6 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.6 exit 0 (20/20, re-verified post-tag); push w20-wave-6 |
-| W20.7 | — (pending) |
+| W20.7 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.7 exit 0 (17/17, re-verified post-tag; the module-wide atomics-free absent-check green); compile deferred to the A10G box; push w20-wave-7 |
 | W20.8 | — (pending) |
 | W20.9 | — (pending) |
 | W20.10 | — (pending) |

@@ -374,3 +374,28 @@ variants** (`bash scripts/gpu/w20_build_variants.sh canary` then
 Wave DoD: Tier-D 20/20 post-tag; attestation truthful. K2 is
 complete. Next: W20.7 — tq_quant_batched (K3, THE wave: the fused
 encode kernel).
+
+## W20.7 — tq_quant_batched, THE wave's encode half (CLOSED 2026-10-11)
+
+The fused encode is authored (kernel_tq.cu now ~2,800 lines, every
+piece additions-only, the module atomics-free): the deterministic
+norm pass (7.1 — the shfl-xor butterfly 16→1 + the second-launch
+ascending fold; NOT bit-identical to torch.norm by tree shape — the
+determinism + tolerance gates carry it); the boundary-scaling
+identity in-kernel (7.2 — the ≤15 scaled boundaries, the in-register
+linear compare ladder, searchsorted-left tie parity); the
+ladder+pack pass (7.3 — the word-shift packing IS pack_bits_t's
+little-endian flat-stream pin; every byte single-owned); the batched
+entry (7.4 — tq_quant_batched: norm → the batched butterfly →
+ladder+pack → the zero-norm sweep; ONE host call, zero D2H, the
+6,144-CTA / ~76-waves budget line; signs passed in by the coming
+dispatcher).
+
+Composition note (banner-documented): the "inlined butterfly" is the
+entry's orchestration over 5.2's proven (M,K)-batched kernels —
+re-inlining would fork the fixture-pinned butterfly. W20.8's plate
+(recorded): the dispatcher supplies the signs + full-length boundary
+mirrors; the y workspace is 2 MiB/unit (chunk if VRAM-tight);
+G20.P3's quant half lands with dequant next wave. Tier-D 17/17
+post-tag; attestation truthful. Next: W20.8 — tq_dequant_batched +
+the kernel-first dispatcher (K3 end — TQ leaves the profile).

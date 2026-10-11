@@ -630,7 +630,43 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.6.4 —"},
         {"kind": "git_tag", "target": "w20-wave-6"},
     ],
-    # W20.7 … W20.12 — appended by each wave's close-out task.
+    # W20.7 — tq_quant_batched (appended at W20.7.5)
+    "W20.7": [
+        # W20.7.1 — the deterministic norm pass
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "shfl"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "finalizer|last-ticket|fold"},
+        # W20.7.2 — boundary scaling + the compare ladder
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "boundary-scaling"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "ladder"},
+        # W20.7.3 — butterfly + bfi packing
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "n_lo"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "pack_bits"},
+        # W20.7.4 — the batched entry + bindings
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "tq_quant_batched"},
+        {"kind": "grep", "target": "src/flute_extended/src/bindings.cpp",
+         "pattern": "tq_quant_batched"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "grid-stride|grid_stride|overshoot"},
+        # The determinism contract, module-wide (all of W20.7)
+        {"kind": "absent", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "atomic"},
+        # W20.7.5 — wave close: ledger + git facts
+        {"kind": "ledger", "target": "W20.7"},
+        {"kind": "git_log", "target": "W20.7.1 —"},
+        {"kind": "git_log", "target": "W20.7.2 —"},
+        {"kind": "git_log", "target": "W20.7.3 —"},
+        {"kind": "git_log", "target": "W20.7.4 —"},
+        {"kind": "git_log", "target": "W20.7.5 —"},
+        {"kind": "git_tag", "target": "w20-wave-7"},
+    ],
+    # W20.8 … W20.12 — appended by each wave's close-out task.
 }
 
 
