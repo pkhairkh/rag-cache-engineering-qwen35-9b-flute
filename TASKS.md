@@ -190,7 +190,11 @@ box protocol doc. Nothing here executes on this box (the capture is a
 GPU-box act — THE LAW).
 
 #### W20.1.1 — tag the pre-rewrite tree
-- [ ] done
+- [x] done
+Ledger: `w20-baseline` → e9ea357 (2026-10-11) — the numpy-era runtime
+tree (W20.0 landed infra only: env/, scripts/, the test guard; the
+runtime modules are untouched since 9af04fe; the doc commits above it
+are irrelevant to the capture, as specified).
 ROLE orchestrator · READ `git log --oneline -5` · WRITE TASKS.md §3
 (ledger note: tag → SHA)
 BRIEF: create annotated tag `w20-baseline` at current HEAD (the tree
