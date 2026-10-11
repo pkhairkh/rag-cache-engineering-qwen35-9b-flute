@@ -527,7 +527,14 @@ DO-D: greps; ast_def TQCache intact; py_compile.
 COMMIT: "W20.4.1 — TQCache torch-native (the round-trip wiring)"
 
 #### W20.4.2 — install.py requant path
-- [ ] done
+- [x] done
+Finding: the file was already numpy-free by construction (W16 authored
+it against the quant/dequant surface; W20.2/3 moved the substrate to
+torch beneath). The landing: explicit W16-verbatim/CODE-COPY
+docstrings + two new co-residency guards (loud ValueError on
+cross-device folds — inputs that would otherwise crash late inside
+torch's add). install.py opens NO npz — snapshot.py's load_chunk→
+from_arrays is the disk edge.
 ROLE task-writer · READ `src/rag/install.py:1-260` (sum_turboquant_
 codes :53, install_snapshot :150, install_from_disk :245), the W16
 verbatim-install notes in `src/rag/tests/test_w16_install.py` (READ

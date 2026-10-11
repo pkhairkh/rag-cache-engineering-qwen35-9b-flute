@@ -33,6 +33,26 @@ extra quantization at ingest). The §6 sum contract translates exactly:
   legacy   protocol="delta-v1" snapshots keep the original path below,
            bit-identical (backward compat for every pre-W16 corpus).
 
+W20.4.2 — THE TORCH-NATIVE INSTALL: TQCodes are device tensors now
+(tq_codes rev-1 — NumPy lives only in to_arrays/from_arrays, the npz
+edge) and this module never names a host array: every dequant is
+device-parametric (W20.3.3 — each codes decodes ON ITS OWN DEVICE; no
+forced transfer, no host round trip, no `.item` read); the §6 fold
+keeps the legacy accumulation order and dtype EXACTLY (fp32:
+dequant(sys) first, then + dequant(addend_i) in retrieval order — one
+left fold); the single requant rides TurboQuant.quant on the
+accumulation device and returns a torch TQCodes. The npz loads ride
+snapshot.py's edge (load_chunk rebuilds every unit through the
+from_arrays hop; ingest's load_system_state delegates to the same
+loader), so install.py opens no npz itself — the NumPy zero-audit
+holds by construction. The W16 verbatim install is preserved EXACTLY:
+CODE-COPY, never recompute — bit-exact within a backend (the n==0/n==1
+paths hand the codes OBJECT over; zero tensor traffic). One new
+torch-era guard: a unit's frame must be co-resident on ONE device —
+the device analogue of the d/seed frame guards (a mixed-device fold
+would die deep inside torch's add; it dies HERE, loudly, naming the
+addend).
+
 Frame guard: every code must carry the kind's D3 seed — a mismatched frame
 would silently corrupt the sum (PROPOSAL D3); it raises loudly here.
 """
@@ -62,7 +82,15 @@ def sum_turboquant_codes(system: TQCodes, deltas: Iterable[TQCodes],
     W15 `qjl`: when the cache runs the Alg.-2 A/B (TQCache(qjl=True)), the
     requantized SUM re-attaches the residual sketch (the deltas' own
     sketches are consumed by their dequants; the sum's fresh sketch
-    covers the sum's residual)."""
+    covers the sum's residual).
+
+    W20.4.2 torch: each codes dequantizes on ITS OWN device (the
+    device-parametric decode — no forced transfer, no host hop); the
+    fold is the legacy accumulation EXACTLY (fp32, system first, then
+    the deltas in order); the requant lands on the accumulation device
+    as a torch TQCodes. The frame must be co-resident — a delta on
+    another device raises HERE (a metadata-only check, the device
+    analogue of the d/seed guards), not deep inside torch's add."""
     q = resolve_quantizer(kind, system.d, bits, qjl=qjl)
     if system.seed != q.seed:
         raise ValueError(
@@ -78,6 +106,12 @@ def sum_turboquant_codes(system: TQCodes, deltas: Iterable[TQCodes],
             raise ValueError(
                 f"sum_turboquant_codes({kind}): delta {i} seed {d.seed} != "
                 f"frame seed {system.seed} — frame drift (PROPOSAL D3)")
+        if d.device != system.device:
+            raise ValueError(
+                f"sum_turboquant_codes({kind}): delta {i} sits on {d.device} "
+                f"but the frame's system codes sit on {system.device} — a "
+                f"mixed-device frame; move the unit's codes to ONE device "
+                f"(one sanctioned .to) before installing")
         acc = acc + q.dequant(d)
     return q.quant(acc)
 
@@ -109,7 +143,16 @@ def sum_absolute_codes(system: TQCodes, absolutes: Sequence[TQCodes],
     same unit d as the system codes; the bits must match the frame's bits
     (the codes are dequantized through the kind's quantizer — a bits
     mismatch would raise in _check_codes at READ time, so it is caught
-    HERE, at the boundary)."""
+    HERE, at the boundary).
+
+    W20.4.2 torch: the verbatim paths are pure OBJECT hand-offs — the
+    codes' tensor streams are neither copied nor recomputed (CODE-COPY,
+    never recompute; bit-exact within a backend by construction); the
+    n>=2 fold dequantizes each codes on its own device and keeps the
+    legacy order (fp32, (1-n)·dequant(sys) first, then the absolutes
+    in order), one requant on the accumulation device. Co-residency is
+    guarded like the delta path (the n<=1 hand-offs are placement-
+    agnostic — the cache's setters own placement)."""
     q = resolve_quantizer(kind, system.d, bits, qjl=qjl)
     if system.seed != q.seed:
         raise ValueError(
@@ -143,6 +186,13 @@ def sum_absolute_codes(system: TQCodes, absolutes: Sequence[TQCodes],
             raise ValueError(
                 f"sum_absolute_codes({kind}): absolute {i} seed {a.seed} != "
                 f"frame seed {system.seed} — frame drift (PROPOSAL D3)")
+        if a.device != system.device:
+            raise ValueError(
+                f"sum_absolute_codes({kind}): absolute {i} sits on "
+                f"{a.device} but the frame's system codes sit on "
+                f"{system.device} — a mixed-device frame; move the unit's "
+                f"codes to ONE device (one sanctioned .to) before "
+                f"installing")
         acc = acc + q.dequant(a)
     return q.quant(acc)
 
@@ -164,7 +214,14 @@ def install_snapshot(cache: TQCache, system: SystemState,
 
     W16: the requant inherits the CACHE's qjl A/B setting (the codes are
     self-describing; a qjl cache requantizes the sum WITH the sketch so
-    the installed state keeps the Alg.-2 compensation)."""
+    the installed state keeps the Alg.-2 compensation).
+
+    W20.4.2 torch: the summed units are torch TQCodes (the requant
+    rides the frame's device); the conv / M1 / M2 verbatim installs are
+    OBJECT hand-offs — CODE-COPY, never recompute, bit-exact within a
+    backend (the W16 gate contract, unchanged); the cache's setters own
+    any placement (the W20.4.1 wiring moves codes at READ time). The
+    report shape is the pinned W16 surface, byte-preserved."""
     bits = system.bits
     # the cache's Alg.-2 setting (any TQ linear layer's S quantizer; the
     # default False is bit-identical to the pre-W15 install)
@@ -246,7 +303,12 @@ def install_from_disk(cache: TQCache, disk_dir: str,
                       retrieved_ids: Sequence[int],
                       bits: float = 3.5) -> dict:
     """Convenience: load the reset point + chunk snapshots from disk and
-    install (spec §6 steps 5–6)."""
+    install (spec §6 steps 5–6).
+
+    W20.4.2: the loads ride snapshot.py's disk edge — load_system_state
+    and load_chunk both rebuild torch TQCodes through the from_arrays
+    hop (the only NumPy in the chain, and it is NOT in this module);
+    this function opens no npz itself."""
     import os
     system = load_system_state(disk_dir)
     if system.bits != bits:
@@ -264,5 +326,8 @@ def install_from_disk(cache: TQCache, disk_dir: str,
 
 
 def load_snapshot(path: str) -> ChunkSnapshot:
+    """The disk-edge delegation (kept for the historical import surface):
+    snapshot.py owns the npz read and the from_arrays hop — this module
+    never touches a host array."""
     from snapshot import load_chunk
     return load_chunk(path)
