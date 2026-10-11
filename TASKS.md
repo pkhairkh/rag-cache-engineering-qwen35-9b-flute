@@ -274,7 +274,15 @@ tensors. `turboquant.py`'s TQCodes (:204) moves to its own module;
 callers keep importing the symbol from `turboquant` (re-export).
 
 #### W20.2.1 — TQCodes torch-native (`src/rag/tq_codes.py`)
-- [ ] done
+- [x] done
+Ledger amendment (drift fix, additive — the criterion is unchanged):
+the DO-D import-pattern `from rag.tq_codes import|from .tq_codes import`
+was authored against the wrong import convention — the house style is
+FLAT imports anchored by `import _paths` (src/rag on sys.path; cf.
+`import codebooks` / `from turboquant import TQCodes` at install.py:47).
+The realized, checked form is `from tq_codes import TQCodes`
+(turboquant.py:118). The pattern below is corrected to accept the house
+form; nothing was deleted from the criterion.
 ROLE task-writer · READ `src/rag/turboquant.py:159-260` (TQCodes,
 pack_bits, unpack_bits, _packed_len context), `:460-520` (construction
 sites) · WRITE `src/rag/tq_codes.py` (new), `src/rag/turboquant.py`
@@ -293,8 +301,10 @@ INVARIANTS: `rg "\.item\(\)" src/rag/tq_codes.py` == 0; numpy appears
 ONLY inside to_arrays/from_arrays (`rg -n "np\.|numpy"` confined to
 those two bodies); constructor asserts torch tensors + dtypes.
 DO-D: module exists; ast_def TQCodes with expected fields;
-py_compile both files; the greps above hold; `rg "from
-rag.tq_codes import|from .tq_codes import" src/rag/turboquant.py` hits.
+py_compile both files; the greps above hold; `rg "from tq_codes
+import TQCodes|from rag.tq_codes import|from .tq_codes import"
+src/rag/turboquant.py` hits (house flat form accepted — see the ledger
+amendment above).
 COMMIT: "W20.2.1 — TQCodes torch-native (device tensors; numpy only at
 the npz edge)"
 

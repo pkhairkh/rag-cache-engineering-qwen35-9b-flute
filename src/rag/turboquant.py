@@ -115,6 +115,7 @@ import torch
 import _paths  # noqa: F401  (anchors src/rag, src/scripts, src/flute_extended)
 import codebooks
 import fht
+from tq_codes import TQCodes  # W20.2.1 — the torch-native codes container (rev-1 contract; re-export for callers)
 
 __all__ = [
     "KINDS", "SEEDS", "TQCodes", "TurboQuant", "get_quantizer",
@@ -197,130 +198,6 @@ def unpack_bits(packed: np.ndarray, bits: int, n: int) -> np.ndarray:
                         bitorder="little")[: n * bits].reshape(n, bits)
     weights = (1 << np.arange(bits, dtype=np.uint8))
     return (raw * weights).sum(axis=-1, dtype=np.uint8)
-
-
-# ----------------------------------------------------------------- codes ---
-@dataclass
-class TQCodes:
-    """Quantized codes for ONE unit (one S layer / one conv layer / M1 / M2).
-
-    Layout: the coordinate split is contiguous by construction — the first
-    `n_lo` coordinates use `bits_lo`, the rest use `bits_hi` (uniform
-    bit-width: bits_hi == bits_lo, n_hi == 0). The split is data-oblivious
-    (PROPOSAL D2 default); the W9 outlier A/B would carry an explicit
-    partition — recorded in `partition` when not the default halves.
-    """
-    kind: str
-    d: int
-    norm: np.float32                       # fp norm, never quantized (paper recipe)
-    bits_lo: int                           # bits for the lo set (1..8)
-    bits_hi: int                           # bits for the hi set (== bits_lo if uniform)
-    n_lo: int                              # coordinate count in the lo set
-    n_hi: int                              # coordinate count in the hi set
-    idx_lo: np.ndarray                     # packed uint8 bit-stream
-    idx_hi: np.ndarray                     # packed uint8 bit-stream
-    seed: int                              # the D3 rotation seed (persisted)
-    partition: str = "half"                # "half" (legacy) | "outlier" (paper §LongBench)
-    # W15 — the paper's outlier split (partition="outlier", conv kind):
-    # group   = coords per channel (the conv kernel width; 1 = flat).
-    #           Present IFF partition == "outlier" (backward compatible).
-    # mask    = packed per-channel outlier membership (ceil(n_ch/8) uint8;
-    #           bit i = 1 -> channel i is an OUTLIER (hi set). Present IFF
-    #           partition == "outlier".
-    # norm_hi = the outlier sub-set's fp32 norm (the regular set's norm is
-    #           `norm`, parallel to idx_lo/idx_hi). Present IFF partition ==
-    #           "outlier". For "half" codes the single `norm` field holds
-    #           the whole unit's norm (unchanged legacy contract).
-    # NOTE: for "outlier" codes, n_lo/n_hi are the PADDED sub-quantizer
-    # unit sizes (power-of-two per sub-set — see TurboQuant._quant_split);
-    # the real-coordinate counts are (n_ch - k)*group and k*group with
-    # k = mask bit-count, n_ch = 8*len(mask).
-    group: Optional[int] = None
-    mask: Optional[np.ndarray] = None
-    norm_hi: Optional[np.float32] = None
-    # W9.2 qjl A/B (DEFAULT None = flag OFF / legacy codes): the structured
-    # QJL residual sketch — (d,) int8 ±1 = sign(FHT(r/γ, seed+7777)) — and
-    # the fp32 residual norm γ. Present IFF quantized with qjl=True;
-    # serialization writes them ONLY when present (backward compatible).
-    qjl_signs: Optional[np.ndarray] = None
-    gamma: Optional[np.float32] = None
-    # ---- serialization ---------------------------------------------------
-    def to_arrays(self) -> Dict[str, np.ndarray]:
-        """Flat array dict for embedding into a larger npz (snapshot.py).
-
-        The qjl fields are written ONLY when present, so codes quantized
-        without the flag produce the EXACT pre-W9.2 key set (old readers
-        and old digests are unaffected)."""
-        out = {
-            "kind": np.array(self.kind),
-            "d": np.array(self.d, dtype=np.int64),
-            "norm": np.array(self.norm, dtype=np.float32),
-            "bits_lo": np.array(self.bits_lo, dtype=np.int64),
-            "bits_hi": np.array(self.bits_hi, dtype=np.int64),
-            "n_lo": np.array(self.n_lo, dtype=np.int64),
-            "n_hi": np.array(self.n_hi, dtype=np.int64),
-            "seed": np.array(self.seed, dtype=np.int64),
-            "partition": np.array(self.partition),
-            "idx_lo": self.idx_lo,
-            "idx_hi": self.idx_hi,
-        }
-        if self.partition == "outlier":
-            if self.group is not None:
-                out["group"] = np.array(int(self.group), dtype=np.int64)
-            if self.mask is not None:
-                out["mask"] = np.ascontiguousarray(self.mask, dtype=np.uint8)
-            if self.norm_hi is not None:
-                out["norm_hi"] = np.array(self.norm_hi, dtype=np.float32)
-        if self.qjl_signs is not None:
-            out["qjl_signs"] = np.ascontiguousarray(self.qjl_signs,
-                                                   dtype=np.int8)
-        if self.gamma is not None:
-            out["gamma"] = np.array(self.gamma, dtype=np.float32)
-        return out
-
-    @classmethod
-    def from_arrays(cls, a: Dict[str, np.ndarray]) -> "TQCodes":
-        """Inverse of to_arrays. BACKWARD COMPATIBLE: an array dict
-        written WITHOUT the qjl keys (pre-W9.2 npz/snapshots) loads with
-        qjl_signs/gamma == None — the flag-off dequant path."""
-        qjl = a.get("qjl_signs") if hasattr(a, "get") else None
-        gam = a.get("gamma") if hasattr(a, "get") else None
-        part = str(a.get("partition", "half")) if hasattr(a, "get") else "half"
-        grp = a.get("group") if hasattr(a, "get") else None
-        msk = a.get("mask") if hasattr(a, "get") else None
-        nhi = a.get("norm_hi") if hasattr(a, "get") else None
-        return cls(
-            kind=str(a["kind"]),
-            d=int(a["d"]),
-            norm=np.float32(a["norm"]),
-            bits_lo=int(a["bits_lo"]),
-            bits_hi=int(a["bits_hi"]),
-            n_lo=int(a["n_lo"]),
-            n_hi=int(a["n_hi"]),
-            idx_lo=np.asarray(a["idx_lo"], dtype=np.uint8),
-            idx_hi=np.asarray(a["idx_hi"], dtype=np.uint8),
-            seed=int(a["seed"]),
-            partition=part,
-            group=(None if grp is None else int(grp)),
-            mask=(None if msk is None
-                  else np.asarray(msk, dtype=np.uint8)),
-            norm_hi=(None if nhi is None else np.float32(nhi)),
-            qjl_signs=(None if qjl is None
-                       else np.asarray(qjl, dtype=np.int8)),
-            gamma=(None if gam is None else np.float32(gam)),
-        )
-
-    def nbytes(self) -> int:
-        n = self.idx_lo.nbytes + self.idx_hi.nbytes + 4  # + fp32 norm
-        if self.partition == "outlier":   # W15: mask + second fp32 norm
-            if self.mask is not None:
-                n += int(self.mask.nbytes)
-            n += 4
-        if self.qjl_signs is not None:      # W9.2 A/B: +1 bit/coordinate
-            n += int(self.qjl_signs.nbytes)  # (d,) int8 sketch
-        if self.gamma is not None:
-            n += 4                           # fp32 gamma
-        return n
 
 
 # ------------------------------------------------------------ quantizer ----
