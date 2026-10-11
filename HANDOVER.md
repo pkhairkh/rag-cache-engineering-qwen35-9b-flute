@@ -652,3 +652,74 @@ ast / py_compile / git facts) and never imports; its CHECKS mirror the
 TASKS.md DoD 1:1. The only behavioral evidence in the whole of W20
 comes from the A10G box — the 237 suite, the capture, and the nine
 gate reports.
+
+---
+
+### W20.13 — the box-feedback stabilization (pull ≥ W20.13.5; NO rebuild needed)
+
+The A10G box's first full post-compile 237-suite run read **225
+passed / 35 failed / 3 skipped** (2026-10-12 handover). The 35
+decomposed into five classes; W20.13 fixes each at the ROOT, dev-box
+side, five commits — **all Python-side: kernel_tq.cu and the whole
+flute_extension tree are UNTOUCHED this wave, so the built extension
+stays valid — pull and re-run the suite, no rebuild**:
+
+1. **The pack domain** (the box's Category 1, 15 tests):
+   `pack_bits_t`/`unpack_bits_t` accept the integer domain 1..8 again
+   (the LEGACY domain; a shared `_check_pack_width` cop — the W20.4.4
+   OPEN ITEM, resolved by the box's evidence). The KERNEL pack stays
+   {3,4} (its own TORCH_CHECKs + the dispatcher's eligibility gate);
+   the 1/2-bit rows ride the torch twin exactly as the evals routing
+   note describes.
+2. **The rerank device contract** (Category 2, 9 tests): the box's
+   `Expected all tensors to be on the same device` at index.py's score
+   line — the live-model CUDA query vs the npz-edge CPU corpus (a
+   W20.4.3 regression invisible on a CUDA-less dev box). Fix:
+   `ChunkVectorLoader.device` + the ONE query hop (`q.to(loader.device)`,
+   frame=None path) + the per-candidate no-op belt + the frame device
+   belt in `check_loader`. Numerics verbatim; the dots run where the
+   corpus lives.
+3. **The pre-W20 tests' mechanical torch idioms** (the rest of
+   Category 1 + Categories 3/5): the ledger's carried open item,
+   landed at gate time — `np.array_equal` → `torch.equal` + a `.cpu()`
+   belt (~50 sites), `np.all(bool-tensor)` → `.all()` (numpy's method
+   dispatch was calling `Tensor.all(axis=…, out=…)` — the box's
+   test_end_to_end_mini TypeError), `.copy()` → `.clone()`, the qjl
+   parity's tobytes/unique/dtype sites, the mmap-root `.numpy()` hop,
+   the W20.4.3 loader contract on the two test mocks. Evidence-driven,
+   not a blind regex: every REAL-numpy site (the codebooks dataclass,
+   the fixture builders, the faiss-side brute force) untouched.
+4. **The parity-threshold re-derivation** (Category 4, 3 kernel-suite
+   tests — arithmetic, NOT kernel defects; TASKS.md §4.1 is the
+   decision record): **norm 1 → 4 ulps** (two different reduction
+   trees; the box measured 2 ulps at M=120/192 — 4 = 2× the measured
+   max; run-to-run determinism stays `torch.equal` ABSOLUTE) and the
+   **round-trip leg TIE-AWARE** (one admitted tie flip smears
+   ±Δc·norm/√d over the WHOLE vector via the adjoint Hadamard — any
+   nonzero tie count breaks per-element allclose(1e-5) by arithmetic;
+   the envelope adds the flip-smear term and reduces EXACTLY to the
+   authored allclose at zero ties; the isolated-decode leg stays at
+   the authored 1e-5). The same envelope + budget land in
+   `scripts/gpu/w20_gates.py` (G20.P1/P3/G20.4) — THRESHOLDS and
+   TASKS.md §4 mirror 1:1, the re-derivation written down, nothing
+   masked.
+
+**The box's re-run sequence** (the extension already built — no
+rebuild):
+
+```
+cd /home/ubuntu/RAGGA
+git pull --ff-only origin main          # >= W20.13.5
+source /home/ubuntu/venv/bin/activate
+python3 -m pytest src/rag/tests -q      # expect the 35 resolved
+```
+
+Then the protocol sequence unchanged (`env/W20_GPU_PROTOCOL.md`):
+capture the fixtures (step 2 — still PENDING, the G20.P1 arm), then
+the gates as their waves prescribe. If any residue survives the
+re-run (the handover's category list carried ~6 unlabeled failures —
+the static analysis could only classify the labeled ones), file the
+tracebacks verbatim: the decomposition loop continues exactly as this
+one did. If a gate's norm report lands at 3–4 ulps (inside the new
+budget), that is the re-derived contract working as documented — the
+report's number is the evidence, not the prose.

@@ -802,6 +802,52 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.12.3 —"},
         {"kind": "git_tag", "target": "w20-complete"},
     ],
+    # W20.13 — the box-feedback stabilization wave (appended at W20.13.5)
+    "W20.13": [
+        # W20.13.1 — the pack domain restored (the legacy 1..8)
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "def _check_pack_width"},
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "integer width in 1..8"},
+        {"kind": "absent", "target": "src/rag/turboquant.py",
+         "pattern": r"bits not in \(3, 4\)"},
+        {"kind": "grep", "target": "src/rag/evals.py",
+         "pattern": r"RESOLVED \(W20.13.1\)"},
+        {"kind": "py_compile", "target": "src/rag/turboquant.py"},
+        # W20.13.2 — the rerank device contract
+        {"kind": "grep", "target": "src/rag/index.py",
+         "pattern": "def device"},
+        {"kind": "grep", "target": "src/rag/index.py",
+         "pattern": "W20.13.2"},
+        {"kind": "py_compile", "target": "src/rag/index.py"},
+        # W20.13.3 — the mechanical torch adaptation (six files)
+        {"kind": "py_compile", "target": "src/rag/tests/test_evals.py"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_ingest.py"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_query.py"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_index.py"},
+        {"kind": "py_compile",
+         "target": "src/rag/tests/test_turboquant_split.py"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_w16_retrieval.py"},
+        {"kind": "absent", "target": "src/rag/tests/test_ingest.py",
+         "pattern": r"assert np\.array_equal"},
+        {"kind": "absent", "target": "src/rag/tests/test_evals.py",
+         "pattern": r"assert np\.array_equal"},
+        # W20.13.4 — the parity re-derivation
+        {"kind": "grep", "target": "scripts/gpu/w20_gates.py",
+         "pattern": "norm_max_ulps.: 4"},
+        {"kind": "grep", "target": "src/rag/tests/w20/test_w20_tq_kernels.py",
+         "pattern": "NORM_MAX_ULPS = 4"},
+        {"kind": "grep", "target": "TASKS.md",
+         "pattern": "the W20.13.4 threshold re-derivation"},
+        {"kind": "ledger", "target": "W20.13"},
+        # W20.13.5 — the wave close
+        {"kind": "git_log", "target": "W20.13.1 —"},
+        {"kind": "git_log", "target": "W20.13.2 —"},
+        {"kind": "git_log", "target": "W20.13.3 —"},
+        {"kind": "git_log", "target": "W20.13.4 —"},
+        {"kind": "git_log", "target": "W20.13.5 —"},
+        {"kind": "git_tag", "target": "w20-wave-13"},
+    ],
 }
 
 

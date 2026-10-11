@@ -353,9 +353,10 @@ def _check_pack_width(bits, ctx: str) -> int:
     {3, 4} by its own TORCH_CHECKs, and the dispatcher's
     _kernel_geometry_eligible gates the kernel path to production
     geometry, so no non-production width can ever reach a kernel.
-    Accepts int-like values (int, np.integer, x.0 floats — the old
-    guard's float-equality semantics); rejects bools, non-integral
-    floats, and out-of-domain widths loudly."""
+    Accepts int-like values (built-in ints, host-integer types whose
+    int() round-trips, x.0 floats — the old guard's float-equality
+    semantics); rejects bools, non-integral floats, and out-of-domain
+    widths loudly."""
     if isinstance(bits, bool):
         raise ValueError(
             f"{ctx}: bits must be an integer width in 1..8, got {bits!r}")

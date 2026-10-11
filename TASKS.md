@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: COMPLETE — 13/13 waves closed (W20.0–W20.12); all Tier-D DoD green; all 9 gates AUTHORED (PENDING box reports by design).
+Status: COMPLETE — 13/13 waves closed (W20.0–W20.12); the post-close box-feedback wave W20.13 (5 tasks, 2026-10-12) closed on top; all Tier-D DoD green; all 9 gates AUTHORED (PENDING box reports by design; §4.1 records the W20.13.4 threshold re-derivation).
 
 ---
 
@@ -29,6 +29,7 @@ Status: COMPLETE — 13/13 waves closed (W20.0–W20.12); all Tier-D DoD green; 
 | W20.10 | K4 | serving-side batched passes | 4 | G20.5 | CLOSED |
 | W20.11 | K5 | trainer levers (refresh 8, loader pinning) | 3 | G20.2 full, G20.3 | CLOSED |
 | W20.12 | closure | handover + final all-DoD audit | 3 | — | CLOSED |
+| W20.13 | box-feedback | the post-compile stabilization: pack domain, rerank device, test adaptation, parity re-derivation | 5 | — | CLOSED |
 
 Status values: OPEN → CLOSED (wave DoD Tier-D green, pushed, tagged) →
 BLOCKED (§7.2 PROMPT.md; a disposition note is mandatory).
@@ -1485,6 +1486,136 @@ box"
 
 ---
 
+## WAVE W20.13 — the box-feedback stabilization (post kernel-compile)
+
+Goal: the A10G box's first full post-compile 237-suite run (225
+passed / 35 failed / 3 skipped — the 2026-10-12 handover) decomposed
+and fixed at the ROOT on the dev box, one commit per task: THE LOOP's
+feedback half. The box's five categories resolved: the pack domain
+(15 tests), the rerank device contract (9), the pre-W20 tests'
+mechanical torch idioms (the ledger's carried open item, landed at
+gate time), the parity-threshold re-derivation (3 kernel-suite
+tests — arithmetic, not defects; §4.1 is the record), and the wave
+close. The production semantics (m1m2.py, the trainer, the W17/W18
+parity contracts) are untouched.
+
+#### W20.13.1 — the pack domain restored (the legacy 1..8)
+- [x] done
+ROLE kernel-twin owner · READ `turboquant.py` (the W20.3.2 pack
+bodies), `evals.py` (the OPEN ITEM note), the box's Category-1
+evidence · WRITE `turboquant.py`, `evals.py`
+BRIEF: the W20.3.2 {3,4}-only guard broke the evals bits_list=(1,2,
+3,3.5,4) sweep and the uniform-bits tests [1,2] — the W20.4.4 open
+item, now resolved by the box's evidence. A shared
+_check_pack_width domain cop on pack_bits_t/unpack_bits_t (integer
+widths 1..8; int-like inputs incl. x.0 floats per the old guard's
+float-equality semantics; bools/non-integral/out-of-domain rejected
+loudly); the general shift/mask path already covers every width; the
+bits==4 nibble fast path unchanged. The KERNEL pack stays {3,4} by
+its own TORCH_CHECKs + the dispatcher's _kernel_geometry_eligible —
+non-production widths can never reach a kernel.
+INVARIANTS: zero behavioral change at {3,4}; the byte layout
+width-generic by construction (G20.P1's fixture pin owns it).
+DO-D: py_compile green; `rg "_check_pack_width" turboquant.py` hits
+twice; the old `bits not in (3, 4)` guards absent; evals' OPEN ITEM
+marked RESOLVED.
+COMMIT: "W20.13.1 — pack_bits_t/unpack_bits_t: the legacy 1..8
+domain restored"
+
+#### W20.13.2 — the rerank device contract (loader.device + the ONE query hop)
+- [x] done
+ROLE index owner · READ `index.py` (rerank, ChunkVectorLoader,
+RetrievalFrame), the box's Category-2 evidence (the live-model CUDA
+query vs the npz-edge CPU corpus — the W20.4.3 regression a CUDA-less
+dev box could never surface) · WRITE `index.py`
+BRIEF: ChunkVectorLoader.device (the reset point's own codes' device,
+metadata-only, mixed-device refuses loudly); rerank's frame=None path
+hops the ONE query to loader.device (the same hop center_query does
+for the frame path; device-less mock loaders keep q put and the
+per-candidate belt aligns — a no-op on the real path);
+RetrievalFrame.check_loader gains the device belt (named refusal,
+mock-safe via getattr). preselect's faiss-edge already crossed
+correctly — untouched.
+INVARIANTS: numerics unchanged (the fp64 divide, the score order, the
+tie discipline verbatim); the dots run where the corpus lives (the
+pre-W20 host-era placement).
+DO-D: py_compile green; `rg "def device" index.py` hits;
+`rg "W20.13.2" index.py` hits (the hop + the belt).
+COMMIT: "W20.13.2 — the rerank device contract: loader.device + the
+ONE query hop"
+
+#### W20.13.3 — the pre-W20 tests' mechanical torch adaptation
+- [x] done
+ROLE test-sweeper · READ the box's failure decomposition (beyond its
+Category-1 attribution: the np.array_equal/np.all/.copy()/dtype
+sites on torch tensors — the open item carried since W20.4) · WRITE
+`test_evals.py`, `test_ingest.py`, `test_query.py`, `test_index.py`,
+`test_turboquant_split.py`, `test_w16_retrieval.py`
+BRIEF: the house idiom (test_tq_cache/test_turboquant's precedent —
+torch.equal + a .cpu() belt, np.array_equal cannot cross the device
+boundary): ~50 sites swept — array_equal on codes/vectors,
+np.all(bool-tensor) (numpy's method dispatch calls Tensor.all(axis=,
+out=) — torch rejects: the box's test_end_to_end_mini signature),
+Tensor .copy() -> .clone(), the qjl parity's tobytes/np.unique/
+np.int8/np.float32 sites, the mmap-root walk's .numpy() hop
+(from_arrays KEEPS the memmap memory — the flag still cannot lie),
+dtype checks -> torch dtypes, the W20.4.3 loader contract on the
+test mocks (torch.as_tensor, zero-copy; the counting mock's call
+count untouched), test_query's layout test on device-resident
+streams.
+INVARIANTS: evidence-driven, not a blind regex — every site still
+comparing REAL numpy (the codebooks dataclass, the fixture builders,
+the faiss-side brute force, the dict .copy()s) untouched;
+comparisons/tolerances/gates verbatim.
+DO-D: py_compile green on all six files; the `assert np.array_equal`
+residue zero in the swept files.
+COMMIT: "W20.13.3 — the pre-W20 tests' mechanical torch adaptation
+(the ledger's open item, landed at gate time)"
+
+#### W20.13.4 — the parity contract re-derived (norm 4 ulps + the TIE-AWARE round-trip envelope)
+- [x] done
+ROLE gate-owner (the dev box IS the gate owner; §1.1: thresholds are
+re-derived by task+commit, never masked) · READ the box's Category-4
+measurements (d2p22 round-trip beyond 1e-5 with the tie fraction
+GREEN; M120/M192 norm 2 ulp > 1), the W20.7.1 design note ("NOT
+bit-identical to torch.norm by tree shape") · WRITE
+`test_w20_tq_kernels.py`, `scripts/gpu/w20_gates.py`, TASKS.md §4/§4.1
+BRIEF: §4.1 is the decision record. (1) norm 1 -> 4 ulps (G20.P1/
+P3/G20.4-level2): two different reduction trees, measured max 2 ulps
+over 120–192 rows; 4 = 2x the measured max; determinism stays
+torch.equal ABSOLUTE. (2) the round-trip recon leg TIE-AWARE: one
+admitted flip smears ±Δc·norm/√d over the WHOLE vector via the
+adjoint Hadamard — any nonzero tie count breaks per-element
+allclose BY ARITHMETIC; the envelope |a−b| ≤ atol + rtol·|b| +
+(mm_lo·gap_lo + mm_hi·gap_hi)·norm/√d reduces EXACTLY to the
+authored allclose at mm == 0. The isolated decode leg UNCHANGED at
+1e-5. G20.P1's envelope is partition-aware (the outlier sub-books
+through the codebooks registry; the sub-units' own √n and norms) and
+covers the QJL sign-flip source (2·QJL_C·γ/d).
+INVARIANTS: ties budget, determinism contracts, decode legs, timer
+gates — all UNCHANGED.
+DO-D: py_compile green; THRESHOLDS' three norm rows read 4; the test
+constant NORM_MAX_ULPS = 4; §4.1 present in TASKS.md.
+COMMIT: "W20.13.4 — the parity contract re-derived: norm 4 ulps + the
+TIE-AWARE round-trip envelope"
+
+#### W20.13.5 — the wave close (ledger + handover + audit + tag)
+- [x] done
+ROLE orchestrator · READ TASKS.md §0/§4/§5, the auditor output ·
+WRITE TASKS.md, HANDOVER.md, `scripts/w20_static_audit.py`,
+`/home/z/my-project/worklog.md`
+BRIEF: the §0/§5 rows; HANDOVER's W20.13 section (the box's re-run
+sequence — pull ≥ this commit, rebuild NOT needed for the python-side
+fixes, re-run the 237-suite, then the protocol's gate sequence);
+the auditor's W20.13 CHECKS (mirroring this DoD 1:1); the worklog
+entry; `--all` green (14/14); push + tag w20-wave-13.
+DO-D: auditor --wave W20.13 exit 0; --all exit 0; the tag pushed;
+§5's W20.13 line written.
+COMMIT: "W20.13.5 — wave W20.13 closed: the box-feedback fixes
+landed, the suite re-armed"
+
+---
+
 ## 4. The GPU-box gate registry (statuses: NOT-AUTHORED → AUTHORED → PENDING → GREEN/RED from box reports ONLY)
 
 Thresholds are the gate's source of truth (mirrored 1:1 into
@@ -1569,6 +1700,7 @@ truthful (PROMPT.md §1.4):
 | W20.10 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.10 exit 0 (17/17, re-verified post-tag); push w20-wave-10 |
 | W20.11 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.11 exit 0 (12/12, re-verified post-tag); push w20-wave-11 |
 | W20.12 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.12 exit 0 (8/8, re-verified post-tag) AND --all exit 0 (the full 13-wave re-check in one pass); push w20-wave-12 implicit in the w20-complete tag sequence |
+| W20.13 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (the g++/py_compile/static-audit vehicles only); auditor --wave W20.13 exit 0 (26/26, re-verified post-tag) AND --all exit 0 (the full 14-wave re-check in one pass); push w20-wave-13 |
 
 Line format: `CLOSED <date> — no test executed, no CPU test authored,
 no repo module imported on this box; auditor --wave W20.<n> exit 0;
