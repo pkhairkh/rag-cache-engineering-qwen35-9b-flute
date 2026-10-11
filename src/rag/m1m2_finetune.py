@@ -118,6 +118,24 @@ a layer subset (zeroed grads; the default weight_decay=0 keeps them
 bit-anchored) — the "isolate single layer" experiment without code
 changes on the box.
 
+W21 — THE CEILING, ANSWERED (the architecture, not the regime): the
+box's post-W20.15 run trained clean mechanics (sawtooth decomposed,
+coverage tallied, gates moved to k[-0.087..+1.122]) yet the spread
+still plateaued ~0.12-0.13 with cos_neg PARKED at ~+0.36 — random
+cross pairs at +0.36 cosine is a representation-ANISOTROPY pedestal
+(the keys' shared direction; Su et al. 2021's centering fix), and the
+residual signal is the position lock: the v1 write addressed slots by
+POSITION (slot = p mod mem_size), so the state cosine is a
+position-aligned key correlation — surface overlap, not content. The
+fix lives in m1m2.py W21 (content-addressed slots via simhash of the
+cENTERED key + per-(layer, head) write gates); THIS module's changes
+are the trainer-side consequences only: the W18 backward accumulates
+per-HEAD gate rows ((L, H) — one inner product per head), and the
+sim-matrix construction moved to ONE public site (pair_sim_matrix —
+the loss, the stats, the bucketing, and the driver's held-out ladder
+all read the same matrix; the W20.14 rule, now shared code). The
+loss/metric SEMANTICS are unchanged.
+
 W20.15 — THE REGIME (what the fixed metric revealed on the box's
 300-step re-run): a SAWTOOTH. The between-capture-block loss variance
 measured 7,595x the within-block variance (the block difficulty IS
@@ -193,6 +211,8 @@ __all__ = [
     "prefill_capture_calls", "replay_states", "infonce_pairs_loss",
     "cosine_spread", "epoch_batches", "lexical_overlap",
     "bucketed_spread", "train_gates",
+    "flat_unit", "pair_sim_matrix", "sim_matrix_stats",
+    "bucketed_spread_from_sim",
 ]
 
 
@@ -255,6 +275,19 @@ def load_gates(module, path: str) -> Dict[str, object]:
                 f"load_gates: {path} was trained at {k}="
                 f"{int(file_meta[k])}, this module has {k}={want[k]} — "
                 f"geometry drift; refusing a silent reshape")
+    # W21 — the addressing regime must match (validated BEFORE any
+    # parameter mutates): a content-trained artifact loaded into a
+    # positional module (or vice versa) would silently score the wrong
+    # kernel; the shapes alone cannot catch it. Pre-W21 artifacts carry
+    # no regime meta — the shape check above already refuses them.
+    if ("write_addr" in file_meta
+            and hasattr(module, "write_addr")
+            and str(file_meta["write_addr"]) != str(module.write_addr)):
+        raise ValueError(
+            f"load_gates: {path} was trained at write_addr="
+            f"{file_meta['write_addr']!r}, this module runs "
+            f"{module.write_addr!r} — the addressing regimes disagree; "
+            f"refusing a silent kernel mismatch")
     for k in _GATE_KEYS:
         param = getattr(module, k, None)
         if param is None or not torch.is_tensor(param):
@@ -265,7 +298,9 @@ def load_gates(module, path: str) -> Dict[str, object]:
         if arrays[k].shape != want_shape:
             raise ValueError(
                 f"load_gates: {k} shape {arrays[k].shape} != the module's "
-                f"{want_shape} — the gate-vector geometry disagrees")
+                f"{want_shape} — the gate-vector geometry disagrees "
+                f"(a pre-W21 (L,) artifact is meaningless under content "
+                f"addressing; retrain)")
         with torch.no_grad():
             param.copy_(torch.from_numpy(arrays[k]).to(
                 param.device, param.dtype))
@@ -442,10 +477,13 @@ class _GatedMemoryReplay(torch.autograd.Function):
                 d1, d2 = module.write_deltas(
                     k, v, layer_idx, positions=positions,
                     state=grad_m1)
+                # W21: the gates are per-(layer, head) — one inner
+                # product per head (sum over the slot/dim axes), the
+                # exact Jacobian row for the (L, H) gate vectors.
                 if gk is not None:
-                    gk[layer_idx] += (grad_m1 * d1).sum()
+                    gk[layer_idx] += (grad_m1 * d1).sum(dim=(1, 2))
                 if gv is not None:
-                    gv[layer_idx] += (grad_m2 * d2).sum()
+                    gv[layer_idx] += (grad_m2 * d2).sum(dim=(1, 2))
         # the chain is pure adds: the identity gradient for the inits
         grad_m1_init = grad_m1 if ctx.needs_input_grad[0] else None
         grad_m2_init = grad_m2 if ctx.needs_input_grad[1] else None
@@ -508,12 +546,34 @@ def replay_states(module, calls: Sequence, m1_init: torch.Tensor,
 
 
 # --------------------------------------------------------------- loss -----
-def _flat_unit(x: torch.Tensor) -> torch.Tensor:
-    """(B, ...) -> (B, dims) fp32, L2-normalized (the cosine operand)."""
+def flat_unit(x: torch.Tensor) -> torch.Tensor:
+    """(B, ...) -> (B, dims) fp32, L2-normalized (the cosine operand).
+
+    W21: public (was _flat_unit) — the driver's held-out ladder streams
+    per-side units through the same normalization the loss uses."""
     b = x.shape[0]
     v = x.reshape(b, -1).to(torch.float32)
     v = v / v.norm(dim=-1, keepdim=True).clamp_min(1e-12)
     return v
+
+
+# W20.14 kept a private alias so internal callers stay stable:
+_flat_unit = flat_unit
+
+
+def pair_sim_matrix(m1_a: torch.Tensor, m2_a: torch.Tensor,
+                    m1_b: torch.Tensor, m2_b: torch.Tensor
+                    ) -> torch.Tensor:
+    """sim(i, j) = 0.5 * (cos(m1_a[i], m1_b[j]) + cos(m2_a[i],
+    m2_b[j])) — the B x B matrix EVERY reader scores: the InfoNCE loss,
+    the history stats, the bucketing, and the driver's held-out ladder
+    (W21: ONE construction site, shared code — the W20.14 rule that
+    the metric and the loss see the same discrimination, now enforced
+    by construction rather than by convention). Operands may be any
+    (B, ...) tensors of equal B; grad flows as the callers need (the
+    loss trains through this; the stats read it under no_grad)."""
+    return 0.5 * (flat_unit(m1_a) @ flat_unit(m1_b).T
+                 + flat_unit(m2_a) @ flat_unit(m2_b).T)
 
 
 def infonce_pairs_loss(m1_a: torch.Tensor, m2_a: torch.Tensor,
@@ -533,19 +593,16 @@ def infonce_pairs_loss(m1_a: torch.Tensor, m2_a: torch.Tensor,
         raise ValueError(
             f"infonce_pairs_loss: batch of {b} pair has no in-batch "
             f"negatives — use B >= 2")
-    sim = 0.5 * (_flat_unit(m1_a) @ _flat_unit(m1_b).T
-                 + _flat_unit(m2_a) @ _flat_unit(m2_b).T)
+    sim = pair_sim_matrix(m1_a, m2_a, m1_b, m2_b)
     logits = sim / tau
     targets = torch.arange(b, device=logits.device)
     return torch.nn.functional.cross_entropy(logits, targets)
 
 
-def _pair_sim_stats(m1_a, m2_a, m1_b, m2_b) -> Dict[str, float]:
-    """W20.14 — the B x B pair-similarity stats the history and the
-    held-out report share (no grad). sim(i, j) = 0.5*(cos(m1_a[i],
-    m1_b[j]) + cos(m2_a[i], m2_b[j])) — EXACTLY the matrix
-    infonce_pairs_loss trains on, so the metric scores the same
-    discrimination the loss optimizes:
+def sim_matrix_stats(sim: torch.Tensor) -> Dict[str, float]:
+    """The B x B stats from a PRECOMPUTED pair_sim_matrix (W21: the
+    driver's ladder passes the streamed matrix; call under no_grad for
+    metric use):
 
       cos_pos   the DIAGONAL mean — the true pairs,
       cos_neg   the OFF-DIAGONAL mean — the in-batch negatives,
@@ -555,19 +612,26 @@ def _pair_sim_stats(m1_a, m2_a, m1_b, m2_b) -> Dict[str, float]:
 
     B < 2 (no in-batch negatives) returns NaN for the negative-side
     fields — the same loudness the loss itself has."""
+    diag = torch.diagonal(sim)
+    b = sim.shape[0]
+    if b < 2:
+        return {"cos_pos": float(diag.mean()), "cos_neg": float("nan"),
+                "spread": float("nan"), "off_max": float("nan"),
+                "diag_min": float(diag.min())}
+    off = sim[~torch.eye(b, dtype=torch.bool, device=sim.device)]
+    return {"cos_pos": float(diag.mean()), "cos_neg": float(off.mean()),
+            "spread": float(diag.mean() - off.mean()),
+            "off_max": float(off.max()), "diag_min": float(diag.min())}
+
+
+def _pair_sim_stats(m1_a, m2_a, m1_b, m2_b) -> Dict[str, float]:
+    """W20.14 — the B x B pair-similarity stats the history and the
+    held-out report share (no grad; sim_matrix_stats over the shared
+    pair_sim_matrix — EXACTLY the matrix infonce_pairs_loss trains
+    on, so the metric scores the same discrimination the loss
+    optimizes)."""
     with torch.no_grad():
-        sim = 0.5 * (_flat_unit(m1_a) @ _flat_unit(m1_b).T
-                     + _flat_unit(m2_a) @ _flat_unit(m2_b).T)
-        diag = torch.diagonal(sim)
-        b = sim.shape[0]
-        if b < 2:
-            return {"cos_pos": float(diag.mean()), "cos_neg": float("nan"),
-                    "spread": float("nan"), "off_max": float("nan"),
-                    "diag_min": float(diag.min())}
-        off = sim[~torch.eye(b, dtype=torch.bool, device=sim.device)]
-        return {"cos_pos": float(diag.mean()), "cos_neg": float(off.mean()),
-                "spread": float(diag.mean() - off.mean()),
-                "off_max": float(off.max()), "diag_min": float(diag.min())}
+        return sim_matrix_stats(pair_sim_matrix(m1_a, m2_a, m1_b, m2_b))
 
 
 def cosine_spread(m1_a, m2_a, m1_b, m2_b) -> Tuple[float, float]:
@@ -670,34 +734,33 @@ def lexical_overlap(text_a: str, text_b: str) -> float:
     return float(inter) / denom if denom else 0.0
 
 
-def bucketed_spread(m1_a, m2_a, m1_b, m2_b,
-                    buckets: Sequence[str]) -> Dict[str, dict]:
-    """W20.15 — the held-out stats BUCKETED per pair: `_pair_sim_stats`'s
-    overall row (the same B x B matrix the loss trains on) plus, per
-    bucket label, the members' mean TRUE-pair cosine (the diagonal)
-    and their gap against the OVERALL off-diagonal mean (the shared
-    in-batch-negative background).
-
-    buckets[i] labels pair i (len(buckets) == B required). The report
-    reads: bucket cos_pos - overall cos_neg. A high-overlap bucket at
-    gap ~ +0.3 with a low-overlap bucket at ~ 0.0 is the
-    position-locked-write signature (see lexical_overlap); a flat
-    profile is the negative result that redirects the investigation.
-    Labels are reported verbatim — the caller owns the bucketing
-    rule (the driver uses lexical overlap thirds)."""
-    b = int(m1_a.shape[0])
+def bucketed_spread_from_sim(sim: torch.Tensor,
+                             buckets: Sequence[str]) -> Dict[str, dict]:
+    """W21 — bucketed_spread over a PRECOMPUTED pair_sim_matrix (the
+    driver's ladder path): the overall row plus, per bucket label, the
+    members' mean TRUE-pair cosine (the diagonal) and their gap
+    against the OVERALL off-diagonal mean (the shared
+    in-batch-negative background). buckets[i] labels pair i
+    (len(buckets) == B required). The report reads: bucket cos_pos -
+    overall cos_neg. A high-overlap bucket at gap ~ +0.3 with a
+    low-overlap bucket at ~ 0.0 is the position-locked-write
+    signature (see lexical_overlap); a flat profile is the negative
+    result that redirects the investigation. Labels are reported
+    verbatim — the caller owns the bucketing rule."""
+    b = int(sim.shape[0])
     if len(buckets) != b:
         raise ValueError(
-            f"bucketed_spread: {len(buckets)} bucket labels for {b} "
-            f"pairs — one label per pair, aligned with the stacked "
-            f"sides")
-    with torch.no_grad():
-        sim = 0.5 * (_flat_unit(m1_a) @ _flat_unit(m1_b).T
-                     + _flat_unit(m2_a) @ _flat_unit(m2_b).T)
-        diag = torch.diagonal(sim)
+            f"bucketed_spread_from_sim: {len(buckets)} bucket labels "
+            f"for {b} pairs — one label per pair, aligned with the sim "
+            f"matrix")
+    diag = torch.diagonal(sim)
+    if b >= 2:
         off = sim[~torch.eye(b, dtype=torch.bool, device=sim.device)]
-        cos_neg = float(off.mean()) if b >= 2 else float("nan")
-        diag_list = [float(x) for x in diag]
+        cos_neg = float(off.mean())
+    else:
+        off = diag
+        cos_neg = float("nan")
+    diag_list = [float(x) for x in diag]
     out: Dict[str, Dict[str, float]] = {
         "overall": {
             "cos_pos": float(diag.mean()), "cos_neg": cos_neg,
@@ -718,10 +781,26 @@ def bucketed_spread(m1_a, m2_a, m1_b, m2_b,
     return out
 
 
+def bucketed_spread(m1_a, m2_a, m1_b, m2_b,
+                    buckets: Sequence[str]) -> Dict[str, dict]:
+    """W20.15 — the held-out stats BUCKETED per pair (tensor operands;
+    the ladder's from-sim twin is bucketed_spread_from_sim — the same
+    numbers over a shared pair_sim_matrix)."""
+    b = int(m1_a.shape[0])
+    if len(buckets) != b:
+        raise ValueError(
+            f"bucketed_spread: {len(buckets)} bucket labels for {b} "
+            f"pairs — one label per pair, aligned with the stacked "
+            f"sides")
+    with torch.no_grad():
+        return bucketed_spread_from_sim(
+            pair_sim_matrix(m1_a, m2_a, m1_b, m2_b), buckets)
+
+
 # ------------------------------------------------------------- the loop ---
 @dataclass
 class GatesTrainConfig:
-    lr: float = 1e-2                # gates are 3 x 24 scalars — a hot lr
+    lr: float = 1e-2                # gates are 3 small vectors — a hot lr
     weight_decay: float = 0.0
     max_steps: int = 300
     warmup_steps: int = 20
@@ -792,11 +871,13 @@ def _grad_absmax(param) -> float:
 
 def _gate_value_stats(module) -> Dict[str, float]:
     """W20.15 — WHERE THE GATES ARE (not just their gradients): min /
-    max / absmean of both write-gate vectors. The box's 300-step run
-    logged 300 |g| absmax values and ZERO parameter locations — the
-    gates could have gone anywhere (negative = subtractive writes are
-    legal and unbounded) and the history could not say where they
-    ended; these fields pin it per step, post-update."""
+    max / absmean of both write-gate vectors (W21: (L, H) per-head
+    rows — the stats flatten; per-head locations ride the npz). The
+    box's 300-step run logged 300 |g| absmax values and ZERO parameter
+    locations — the gates could have gone anywhere (negative =
+    subtractive writes are legal and unbounded) and the history could
+    not say where they ended; these fields pin it per step,
+    post-update."""
     gk = module.write_gate_k.detach().float()
     gv = module.write_gate_v.detach().float()
     return {"gk_min": float(gk.min()), "gk_max": float(gk.max()),
