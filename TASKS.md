@@ -577,7 +577,14 @@ COMMIT: "W20.4.3 — the vector builds torch-native (faiss edge
 allowlisted)"
 
 #### W20.4.4 — evals.py + m1m2.py sweep (the ×5 + :345 sites)
-- [ ] done
+- [x] done
+bits_list disposition: FLAGGED, not constrained — no module constant
+documents the bits domain (bare default `(1,2,3,3.5,4)`); the W20.3.2
+conflict (pack_bits_t asserts bits∈{3,4}) is documented in
+measure_roundtrip's docstring; the A10G gate (G20.P1) decides the
+domain. Stat-definition notes: population variance (ddof=0), RAW 4th
+moment kurtosis, quantile(0.5)=np.median semantics (torch.median drops
+the upper middle on even counts — avoided).
 ROLE task-writer · READ `src/rag/evals.py:80-145` (the five numpy stat
 sites), `src/rag/m1m2.py:330-360` (:345) · WRITE the two files
 BRIEF: eval stats in torch (mean/var/kurtosis moments on device;

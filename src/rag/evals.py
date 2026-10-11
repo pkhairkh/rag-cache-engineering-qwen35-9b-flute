@@ -32,11 +32,19 @@ Real-data mode requires the GPU-box inputs (model artifacts, corpus,
 index) and refuses loudly when absent. Self-test mode exercises the exact
 measurement code paths on deterministic synthetic fixtures — that is what
 the CPU tests (tests/test_evals.py) run.
+
+W20.4.4: the P1/P4 stat blocks are torch-native on DEVICE — the
+host-array math is deleted from this module. The only host crossings
+are the REPORT-EDGE float extractions at the printed line / JSON
+artifact (AFTER the device math is done) and the recall stub's host
+CRC key (a hash edge whose torch-byte feed is bit-identical to the
+legacy host-array one).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -85,14 +93,26 @@ def measure_roundtrip(bits_list=(1, 2, 3, 3.5, 4), n_vectors: int = 16,
                       out_dir: str = _OUT_DIR) -> dict:
     """P1 items i–iv. On the GPU box this runs over REAL captured cache
     tensors (`--capture-dir`); the core is identical on synthetic unit
-    vectors (self-test)."""
-    import numpy as np
+    vectors (self-test).
+
+    W20.4.4: the stats are torch-native on DEVICE (host-array math
+    deleted); the only host crossings are the REPORT-EDGE floats below
+    — taken for the printed lines / the JSON artifact AFTER the device
+    math. The sweep structure (the bits_list loop, the per-vector round
+    trips) is unchanged. OPEN ITEM (W20.3.2, flagged NOT constrained):
+    pack_bits_t asserts bits in {3, 4} (the TQ index stream widths)
+    while this sweep's default bits_list = (1, 2, 3, 3.5, 4); nothing
+    in this file documents that domain (no module constant), so the
+    values are LEFT AS-IS — the 1/2-bit rows will raise at quant() and
+    the A10G gate owns the resolution."""
     import torch
     import turboquant as tq
 
     g = torch.Generator().manual_seed(seed)
     X = torch.randn(n_vectors, d, generator=g)
-    X = X / X.norm(dim=-1, keepdim=True)
+    # W18 discipline: generator-pinned creation on CPU, ONE move — the
+    # round trips and every stat below run on DEVICE.
+    X = (X / X.norm(dim=-1, keepdim=True)).to(DEVICE)
 
     lines, mse_table, passed = [], {}, True
     for bits in bits_list:
@@ -100,8 +120,14 @@ def measure_roundtrip(bits_list=(1, 2, 3, 3.5, 4), n_vectors: int = 16,
         mses = []
         for i in range(n_vectors):
             xr = q.roundtrip(X[i])
-            mses.append(((X[i] - xr) ** 2).sum().item())
-        mse = float(np.mean(mses))
+            mses.append(((X[i] - xr) ** 2).sum())   # 0-dim device tensor
+        # the legacy mean over the per-vector mse scalars — now ONE fp32
+        # device reduction over the same per-vector sums
+        mse_t = torch.stack(mses).mean()
+        # REPORT-EDGE: the single crossing per sweep row — mse feeds the
+        # table/gate line below (report data); the math never left the
+        # device.
+        mse = float(mse_t)
         mse_table[str(bits)] = mse
         if float(bits).is_integer():
             b = int(bits)
@@ -120,11 +146,19 @@ def measure_roundtrip(bits_list=(1, 2, 3, 3.5, 4), n_vectors: int = 16,
     import fht
     signs = fht.rotation_signs(d, 7)
     rot = torch.cat([fht.fht_apply(X[i:i + 1], signs) for i in range(n_vectors)])
-    coords = rot.reshape(-1).numpy() * np.sqrt(d)  # ~ N(0,1) if concentrated
-    var = float(np.var(coords))
-    kurt = float(np.mean(coords ** 4))
-    max_abs = float(np.max(np.abs(coords)))
-    frac_3s = float(np.mean(np.abs(coords) < 3.0))
+    # W20.4.4: the moment block runs on the DEVICE tensor, definitions
+    # preserved exactly — population variance (ddof=0, the legacy var),
+    # the RAW fourth moment (mean(coords**4), not the excess kurtosis),
+    # max|z|, and the within-3σ fraction.
+    coords = rot.reshape(-1) * math.sqrt(d)  # ~ N(0,1) if concentrated
+    var_t = coords.var(unbiased=False)
+    kurt_t = (coords ** 4).mean()
+    max_abs_t = coords.abs().max()
+    frac_3s_t = (coords.abs() < 3.0).to(torch.float32).mean()
+    # REPORT-EDGE: the concentration report values — the moments
+    # themselves never left the device.
+    var, kurt, max_abs, frac_3s = (float(var_t), float(kurt_t),
+                                   float(max_abs_t), float(frac_3s_t))
     conc_ok = abs(var - 1.0) < 0.05 and 2.5 < kurt < 3.6 and max_abs < 6.0 \
         and frac_3s > 0.995
     lines.append(f"concentration: var={var:.4f} (exp 1.0) kurtosis={kurt:.2f} "
@@ -135,17 +169,26 @@ def measure_roundtrip(bits_list=(1, 2, 3, 3.5, 4), n_vectors: int = 16,
     # (iii) per-head norm spread (D2 decision input; threshold: > 10x flags
     # the per-head-norm fallback, PROPOSAL D2)
     g2 = torch.Generator().manual_seed(seed + 1)
-    S = torch.randn(1, 32, 128, 128, generator=g2).half()
-    norms = S.float().norm(dim=-1).reshape(-1).numpy()  # per (head, 128-row)
-    spread = float(norms.max() / np.median(norms))
+    S = torch.randn(1, 32, 128, 128, generator=g2).half().to(DEVICE)
+    norms = S.float().norm(dim=-1).reshape(-1)  # per (head, 128-row)
+    # the legacy median (the average of the two middle values) == the
+    # q=0.5 quantile with linear interpolation — torch.median would DROP
+    # the upper middle element on even counts (4096 rows here), which is
+    # NOT the legacy definition
+    spread_t = norms.max() / torch.quantile(norms, 0.5)
+    # REPORT-EDGE: the spread report value.
+    spread = float(spread_t)
     lines.append(f"per-head norm spread max/median = {spread:.2f} "
                  f"(> 10.0 flags the D2 per-head fallback — informational)")
 
     # (iv) outlier mass: top-1% |coordinate| energy (the 3.5-bit split A/B
     # decision input — informational on synthetic; real tensors decide)
-    a = np.abs(coords)
-    thresh = np.quantile(a, 0.99)
-    mass = float((a[a >= thresh] ** 2).sum() / (a ** 2).sum())
+    a = coords.abs()
+    thresh = torch.quantile(a, 0.99)  # the legacy quantile convention:
+    # linear interpolation, the >=-threshold tie rule kept
+    mass_t = (a[a >= thresh] ** 2).sum() / (a ** 2).sum()
+    # REPORT-EDGE: the outlier-mass report value.
+    mass = float(mass_t)
     lines.append(f"outlier mass (top-1% coords, rotated) = {mass:.4f} "
                  f"(decision input for the split A/B — informational)")
 
@@ -250,8 +293,12 @@ def measure_margin(corpus_dir=None, out_dir: str = _OUT_DIR,
                    per_topic: int = 8, seed: int = 11) -> dict:
     """The cache-signal check: mean cos(query, same-topic chunks) vs
     cos(query, different-topic chunks); the margin ratio must be >= 3x
-    (proposal P4 gate — 'S is discriminative / M1/M2 carry info')."""
-    import numpy as np
+    (proposal P4 gate — 'S is discriminative / M1/M2 carry info').
+
+    W20.4.4: the cosine/mean math is torch-native on DEVICE (host-array
+    math deleted); the single host crossing is the REPORT-EDGE pair
+    below. The ratio's eps guards (max(1e-9, ·), the 0.05 branch) are
+    the legacy ones, verbatim."""
     import torch
 
     if self_test or corpus_dir is None:
@@ -262,16 +309,24 @@ def measure_margin(corpus_dir=None, out_dir: str = _OUT_DIR,
         for t in range(n_topics):
             for i in range(per_topic):
                 v = 0.15 * torch.randn(128, generator=g) + 4.0 * topic_dirs[t]
-                vecs[(t, i)] = (v / v.norm()).numpy().astype(np.float32)
+                # fixture prep is generator-pinned CPU (legacy-identical
+                # values); the vectors MOVE to DEVICE here — every dot
+                # product and mean below runs there.
+                vecs[(t, i)] = (v / v.norm()).to(DEVICE)
         margins = []
         for t in range(n_topics):
             q = vecs[(t, 0)]
-            same = [float(q @ vecs[(t, i)]) for i in range(1, per_topic)]
-            diff = [float(q @ vecs[(u, i)]) for u in range(n_topics)
-                    if u != t for i in range(per_topic)]
-            margins.append((float(np.mean(same)), float(np.mean(diff))))
-        same_m = float(np.mean([m for m, _ in margins]))
-        diff_m = float(np.mean([d for _, d in margins]))
+            same = torch.stack([q @ vecs[(t, i)]
+                                for i in range(1, per_topic)])
+            diff = torch.stack([q @ vecs[(u, i)]
+                                for u in range(n_topics)
+                                if u != t for i in range(per_topic)])
+            margins.append((same.mean(), diff.mean()))
+        same_m_t = torch.stack([m for m, _ in margins]).mean()
+        diff_m_t = torch.stack([d for _, d in margins]).mean()
+        # REPORT-EDGE: the margin report values — the cosine/mean math
+        # above stayed on the device tensors.
+        same_m, diff_m = float(same_m_t), float(diff_m_t)
         ratio = abs(same_m - diff_m) / max(1e-9, abs(diff_m)) \
             if abs(diff_m) > 0.05 else (same_m / max(1e-9, diff_m))
         ok = ratio >= 3.0
@@ -315,7 +370,14 @@ def measure_recall(disk_dir=None, out_dir: str = _OUT_DIR,
 
                 def __call__(self, input_ids, past_key_values, use_cache=True):
                     import zlib
-                    key = zlib.crc32(input_ids.numpy().tobytes())
+                    # W20.4.4: array-free hash feed — .view(torch.uint8)
+                    # reinterprets the tensor's own bytes, bit-identical
+                    # to the legacy host-array-era tobytes() feed (the
+                    # stub's key is unchanged); the crossing is the host
+                    # CRC edge itself (a hash key, not math).
+                    key = zlib.crc32(bytes(input_ids.flatten()
+                                           .contiguous()
+                                           .view(torch.uint8).tolist()))
                     t = key % 5
                     for L in (0, 2):
                         cur = past_key_values.layers[L].recurrent_states[0]

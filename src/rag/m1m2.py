@@ -321,7 +321,10 @@ class M1M2(nn.Module):
     def _resolve_positions(self, positions, T: int,
                            device: torch.device) -> torch.Tensor:
         """The write-positions contract (shared by write/write_deltas):
-        default arange(T); loud validation otherwise."""
+        default arange(T); loud validation otherwise. W20.4.4: the
+        min-position guard is the tensor-space (positions >= 0).all()
+        check — gather-free, no host-scalar read; the one host value on
+        the failure path is the raise's own message edge."""
         if positions is None:
             return torch.arange(T, device=device)
         if not isinstance(positions, torch.Tensor):
@@ -338,11 +341,16 @@ class M1M2(nn.Module):
             raise TypeError(
                 f"M1M2.write: positions must be an integer tensor, "
                 f"got dtype {positions.dtype}")
-        if positions.numel() > 0 and bool((positions < 0).any()):
+        if positions.numel() > 0 and not (positions >= 0).all():
+            # W20.4.4: tensor-space guard (the legacy any() bool plus the
+            # min host-scalar read are gone) — on integer dtypes
+            # "not all >= 0" is exactly "any < 0", the legacy semantic;
+            # the message edge below is the only host read, and only on
+            # the failure path.
             raise ValueError(
                 f"M1M2.write: positions must be non-negative (token "
                 f"positions), got min "
-                f"{int(positions.min().item())}")
+                f"{int(positions.min())}")
         return positions.to(device=device, dtype=torch.long)
 
     def _scatter_delta(self, x: torch.Tensor, slots: torch.Tensor, B: int,
