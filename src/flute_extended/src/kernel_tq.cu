@@ -938,3 +938,361 @@ torch::Tensor fht_backward_large(torch::Tensor g, torch::Tensor signs) {
     });
     return gx;
 }
+
+// ===========================================================================
+// W20.6.1 -- the tq_debug scalar twins: tq_debug_fht_large_forward /
+// tq_debug_fht_large_backward.
+//
+// test-only scalar twins of fht_forward_large / fht_backward_large --
+// the differential reference G20.P2 compares the real kernels against
+// (never on the production path: fht.py routes only to the real pair;
+// the W20.6.3 test file and the G20.P2 gate function are the only
+// callers). Host-side plain C++/ATen assembly of the SAME math,
+// fragment-wise (tile by tile, stage by stage, pair by pair), IN THE
+// SAME ORDER the kernels above execute -- the twin is meaningless
+// otherwise:
+//
+//   FORWARD (twins fht_large_run + fht_large_local_kernel +
+//   fht_large_cross_kernel, kernel_tq.cu:420-485 / 207-264 / 310-376):
+//     * pass 1, per (row, tile), row-major: the converting stage load
+//       (kernel_tq.cu:222-240 -- the fp32 path's cp.async raw copies
+//       move the same bits, so the one converting loop twins both
+//       paths), unsigned and unscaled; then the 14 tile-local stage
+//       visits of fht_block<1024>(smem, 16384) (kernel_tq.cu:252):
+//       sh = 0..13 -- the 13 local stages (len_ = 1..4096) PLUS the
+//       lowered len_ = 8192 boundary stage (the header's Boundary
+//       note, fht_large.cuh:53-62).
+//     * pass 2, one loop per cross stage, the launcher's exact
+//       ascending sequence (kernel_tq.cu:472-484): sh = 14..log2(K)-1,
+//       len_ = 16384..K/2. The forward epilogue rides the FINAL stage
+//       only (len_ = K/2): the left-associated multiply chain
+//       (t * signs[j]) * rsqrtf(K) at the store, ONE dtype cast
+//       (kernel_tq.cu:361-370).
+//   BACKWARD (twins fht_backward_large_run +
+//   fht_large_local_backward_kernel + fht_large_cross_backward_kernel,
+//   kernel_tq.cu:823-887 / 708-749 / 774-814): the signs at FIRST LOAD
+//   (the prologue's cast-then-multiply, kernel_tq.cu:729-732, signs
+//   indexed by COLUMN), the SAME 14-stage tile butterfly and the SAME
+//   ascending cross stages (transit stages unsigned and unscaled --
+//   the forward's cross kernel, kernel_tq.cu:876-883), and the adjoint
+//   epilogue at the final store: (u+w / u-w) * rsqrtf(K), NO sign.
+//
+// THE PAIRING-ORDER GUARANTEE (the twin's reason to exist): stages run
+// in the kernels' fixed ascending order (len_ = 1, 2, ..., K/2); every
+// stage visits pairs by the kernels' pair identity p (row-major over
+// the (M, K/2) space for the cross stages, fht_large_cross_kernel:
+// 334-339; flat over the tile's 8192 pairs for the local stages,
+// fht.cuh:90-95) with the kernels' shift/mask index i = ((p >> sh) <<
+// (sh+1)) + (p & (len_-1)) and the kernels' arithmetic: u at the LOWER
+// index, one fp32 add and one fp32 subtract, u on the left, low =
+// u + w at i, high = u - w at i + len_ (fht_large.cuh:128-145). The
+// kernels' grid-stride thread interleave and fht_block's register-
+// local early stages (fht.cuh:141-170 -- the same pair set, since
+// 2*len divides the 16-element run, with the same per-pair arithmetic)
+// reorder only WHICH thread owns WHICH pair: pairs at one stage are
+// disjoint, so the visit order cannot change a value
+// (fht_large.cuh:141-145). The flat p loop IS the kernels'
+// enumeration; fp32 add/sub/mul are IEEE round-to-nearest on host and
+// device alike, so the butterfly bits agree with the kernels' exactly.
+//
+// THE PLACEMENT (documented choice): the twin computes on the HOST, in
+// CPU-side clones -- the flat pair loop is the simplest formulation
+// that preserves the order, and the differential comparison stays
+// device-side (inputs CUDA, like the real pair; the twin migrates
+// internally and returns on x's device). The ONE constant the host
+// cannot reproduce faithfully, rsqrtf(K) (a device function the
+// kernels fold in-kernel, kernel_tq.cu:324-327 / 783-787), is computed
+// ON x's DEVICE through torch's CUDA rsqrt -- the same CUDA math
+// library ::rsqrt the kernels' rsqrtf compiles to -- and read back
+// (tq_debug_inv_sqrt_b below), so the epilogue constant matches
+// bit-for-bit; any residual ulp divergence is one scalar's tail,
+// absorbed by G20.P2's allclose (1e-5). fp16/bf16 I/O: the state stays
+// fp32 end-to-end, the dtype cast happens ONCE at the final store (the
+// c10 round-to-nearest-even conversions -- the same rounding as the
+// kernels' __float2half_rn / __float2bfloat16 store casts).
+//
+// THE LAW (PROMPT.md §1): authored STATICALLY on the CPU dev box -- no
+// test run, no test authored, no repo module imported; nvcc is ABSENT
+// here, so compilation and the differential suite defer to the A10G
+// box (recorded, legal). No reduction or synchronization primitives
+// anywhere in the twin (host code: one thread, unique writers by
+// construction). Verified by re-read + rg on this box.
+// ===========================================================================
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// The twin's tile-local butterfly: the 14 stage visits of
+// fht_block<1024>(smem, FHT_LARGE_TILE) (the call at kernel_tq.cu:252 /
+// 740), FLAT over the tile's 8192 pairs per stage -- fht_stage_sh's
+// enumeration and pairing, verbatim arithmetic (fht.cuh:90-95: pair p
+// -> i = ((p >> sh) << (sh+1)) + (p & lmask); s[i] = a + bv;
+// s[i + len] = a - bv). Covers the register-local early stages
+// (fht.cuh:141-170: sh = 0..3 inside each thread's 16-element run --
+// the same pair set, since 2*len divides 16, with the same per-pair
+// arithmetic) and the shared-memory stages (sh = 4..13) alike; the
+// lowered len_ = 8192 boundary stage is the sh = 13 visit. Disjoint
+// pairs per stage -> the flat visit order is value-identical to every
+// thread decomposition of the same stage (fht_large.cuh:141-145).
+// ---------------------------------------------------------------------------
+void tq_debug_tile_butterfly(float* v) {  // one 16384-fp32 tile, host memory
+    static_assert(
+        flute::FHT_LARGE_TILE == (1 << (flute::FHT_LARGE_LOCAL_STAGES + 1)),
+        "sh = 0..LOCAL_STAGES is len_ = 1..8192: the full tile butterfly");
+    constexpr int kStageMax = flute::FHT_LARGE_LOCAL_STAGES;  // 13
+    constexpr int kPairs = flute::FHT_LARGE_TILE >> 1;        // 8192
+    for (int sh = 0; sh <= kStageMax; ++sh) {
+        const int len = 1 << sh;
+        const int lmask = len - 1;
+        for (int p = 0; p < kPairs; ++p) {
+            // fht.cuh:91's pair index, verbatim.
+            const int i = ((p >> sh) << (sh + 1)) + (p & lmask);
+            const float u = v[i];        // the LOWER index's value
+            const float w = v[i + len];  // the HIGHER index's value
+            v[i] = u + w;                // low  = u + w  (fht.cuh:94)
+            v[i + len] = u - w;          // high = u - w  (fht.cuh:95)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The twin's cross stages: the launcher's ascending stage loop
+// (kernel_tq.cu:472-484 -- the backward's identical loop, 869-884), one
+// flat pass per stage over the whole (M, K/2) pair space in the
+// kernels' row-major p order (p = row * (K/2) + q), the same
+// shift/mask pair index (fht_large_cross_kernel:334-339 and the
+// backward's 794-799), the same one-add-one-subtract pairing, u at the
+// LOWER index. kBackward selects the epilogue exactly as the two final
+// kernels differ:
+//   forward  final store: (t * signs[j]) * inv_sqrt_b  (lines 361-370)
+//   backward final store: t * inv_sqrt_b, NO sign      (lines 807-812)
+// Transit stages carry neither sign nor scale (fht_large.cuh:87-96);
+// the final stage's store is the transform's ONE dtype cast.
+// ---------------------------------------------------------------------------
+template <typename scalar_t, bool kBackward>
+void tq_debug_cross_stages(float* ws, const float* signs, scalar_t* out,
+                           int M, int K, float inv_sqrt_b) {
+    if constexpr (kBackward) {
+        (void)signs;  // the adjoint's signs rode the load (the (void)
+                      // idiom of kernel_tq.cu:317)
+    }
+    const int row_shift = flute::fht_large_log2_floor(K) - 1;  // log2(K/2)
+    const int row_mask = (1 << row_shift) - 1;                 // K/2 - 1
+    const int64_t total_pairs = static_cast<int64_t>(M) << row_shift;
+
+    for (int sh = kFirstCrossSh; (1 << sh) < K; ++sh) {  // the launcher's loop
+        const bool is_final = ((1 << sh) << 1) == K;      // len_ == K/2
+        const int len = 1 << sh;
+        const int lmask = len - 1;
+        for (int64_t p = 0; p < total_pairs; ++p) {
+            // the kernel's pair decomposition, verbatim (lines 335-339):
+            // row-major (M, K/2) flattening, shift/mask index, no division.
+            const int row = static_cast<int>(p >> row_shift);
+            const int q = static_cast<int>(p) & row_mask;
+            const int i = ((q >> sh) << (sh + 1)) + (q & lmask);
+            const int64_t rbase = static_cast<int64_t>(row) * K;
+
+            const float u = ws[rbase + i];        // the LOWER index's value
+            const float w = ws[rbase + i + len];  // the HIGHER index's value
+            const float lo = u + w;  // low  = u + w  (the pairing contract)
+            const float hi = u - w;  // high = u - w
+
+            if (is_final) {
+                if constexpr (kBackward) {
+                    // the adjoint epilogue (kernel_tq.cu:811-812): the
+                    // scale, NO sign -- it rode the load.
+                    out[rbase + i] =
+                        static_cast<scalar_t>(lo * inv_sqrt_b);
+                    out[rbase + i + len] =
+                        static_cast<scalar_t>(hi * inv_sqrt_b);
+                } else {
+                    // the forward epilogue (kernel_tq.cu:367-370): the
+                    // sign, then the scale -- the kernels'
+                    // left-associated multiply chain, ONE dtype cast at
+                    // the final store.
+                    out[rbase + i] = static_cast<scalar_t>(
+                        (lo * signs[i]) * inv_sqrt_b);
+                    out[rbase + i + len] = static_cast<scalar_t>(
+                        (hi * signs[i + len]) * inv_sqrt_b);
+                }
+            } else {
+                ws[rbase + i] = lo;        // the in-place transit
+                ws[rbase + i + len] = hi;  // round-trip: unsigned, unscaled
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The epilogue constant: rsqrtf((float)K), computed the way the kernels
+// compute it -- ON THE DEVICE (rsqrtf is a device-only function; the
+// kernels fold it in-kernel, kernel_tq.cu:324-327 / 783-787). The twin
+// routes a one-element fp32 CUDA tensor through torch's CUDA rsqrt --
+// the same CUDA math library ::rsqrt(float) the kernels' rsqrtf
+// compiles to -- and reads the value back, so the epilogue constant
+// matches the kernels' bit-for-bit (and even on a box where torch's
+// rsqrt disagreed, the divergence is ~1 ulp of ONE scalar, absorbed by
+// G20.P2's allclose 1e-5 -- a box-side discovery, loudly noted).
+// ---------------------------------------------------------------------------
+float tq_debug_inv_sqrt_b(int K, const torch::Tensor& like) {
+    torch::Tensor kdev = torch::full(
+        {1}, static_cast<double>(static_cast<float>(K)),
+        like.options().dtype(at::kFloat));
+    return torch::rsqrt(kdev).item<float>();
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// tq_debug_fht_large_forward -- test-only scalar twin of
+// fht_forward_large: the differential reference for G20.P2 (never on
+// the production path). Same argument surface and same gate
+// (fht_large_check_args), same stage sequence and pairing order as the
+// real kernel (the W20.6.1 banner above), host-side flat-loop assembly
+// in fp32, the single dtype cast at the final store. Returns a fresh
+// tensor on x's device; x is never written.
+// ---------------------------------------------------------------------------
+torch::Tensor tq_debug_fht_large_forward(torch::Tensor x, torch::Tensor signs) {
+    fht_large_check_args(x, signs);  // the same surface as the real pair
+    const int M = static_cast<int>(x.size(0));
+    const int K = static_cast<int>(x.size(1));
+
+    if (M == 0) {
+        return torch::empty_like(x);  // nothing to transform (the real
+                                      // pair's M == 0 guard)
+    }
+
+    // the epilogue constant, device-computed (the helper's banner)
+    const float inv_sqrt_b = tq_debug_inv_sqrt_b(K, x);
+
+    // host-side staging: exact device->host byte copies (the casts sit
+    // where the kernels put them -- at the loads and the final store),
+    // a fresh host fp32 state, and a host output in the I/O dtype that
+    // IS the state for fp32 (the twin of fht_forward_large's ws/out
+    // aliasing, kernel_tq.cu:582-592 -- the final stage finishes in
+    // place).
+    torch::Tensor x_cpu = x.cpu();
+    torch::Tensor signs_cpu = signs.cpu();
+    torch::Tensor state =
+        torch::empty(x.sizes(), x_cpu.options().dtype(at::kFloat));
+    torch::Tensor out_cpu = (x.scalar_type() == at::kFloat)
+        ? state
+        : torch::empty(x.sizes(), x_cpu.options());
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf, at::kBFloat16, x.scalar_type(),
+        "tq_debug_fht_large_forward", [&] {
+            const scalar_t* xp = x_cpu.data_ptr<scalar_t>();
+            const float* sp = signs_cpu.data_ptr<float>();
+            float* wsp = state.data_ptr<float>();
+            scalar_t* op = out_cpu.data_ptr<scalar_t>();
+
+            // ---- pass 1: the tile-local butterflies (twins
+            // fht_large_run:456-461 + fht_large_local_kernel:222-260);
+            // (row, tile) row-major -- tiles are disjoint.
+            const int tiles = K / flute::FHT_LARGE_TILE;
+            for (int row = 0; row < M; ++row) {
+                for (int tile = 0; tile < tiles; ++tile) {
+                    const int64_t base = static_cast<int64_t>(row) * K
+                        + static_cast<int64_t>(tile) * flute::FHT_LARGE_TILE;
+                    // the converting stage load (kernel_tq.cu:236-239;
+                    // the fp32 cp.async path at 228-231 moves the same
+                    // bits): cast at the load, no sign, no scale.
+                    for (int j = 0; j < flute::FHT_LARGE_TILE; ++j) {
+                        wsp[base + j] = static_cast<float>(xp[base + j]);
+                    }
+                    // fht_block<1024>(smem, 16384) (kernel_tq.cu:252):
+                    // sh = 0..13 -- the 13 local stages plus the lowered
+                    // len_ = 8192 boundary stage.
+                    tq_debug_tile_butterfly(wsp + base);
+                    // write-back (kernel_tq.cu:257-260) is the identity
+                    // here: the twin's state IS the smem.
+                }
+            }
+
+            // ---- pass 2: the cross stages + the forward epilogue
+            // (twins fht_large_run:463-484 + fht_large_cross_kernel:
+            // 310-376); for fp32 I/O op == wsp (the real pair's
+            // in-place final stage).
+            tq_debug_cross_stages<scalar_t, false>(wsp, sp, op, M, K,
+                                                   inv_sqrt_b);
+        });
+
+    // the move home: a same-dtype device copy (no conversion rides it)
+    return out_cpu.to(x.device());
+}
+
+// ---------------------------------------------------------------------------
+// tq_debug_fht_large_backward -- test-only scalar twin of
+// fht_backward_large: the differential reference for G20.P2 (never on
+// the production path). The adjoint's orientation, twinned: signs at
+// FIRST LOAD (the prologue), the SAME butterfly, rsqrtf(K) at the
+// final store -- kernel_tq.cu:605-940's contract in flat-loop form,
+// with the same stage sequence and pairing-order guarantee as the
+// forward twin (the W20.6.1 banner above). Returns a fresh tensor on
+// g's device; g is never written.
+// ---------------------------------------------------------------------------
+torch::Tensor tq_debug_fht_large_backward(torch::Tensor g, torch::Tensor signs) {
+    fht_large_check_args(g, signs);  // the family checker (the real
+                                     // backward's reuse, kernel_tq.cu:912)
+    const int M = static_cast<int>(g.size(0));
+    const int K = static_cast<int>(g.size(1));
+
+    if (M == 0) {
+        return torch::empty_like(g);
+    }
+
+    // the epilogue constant, device-computed (the helper's banner)
+    const float inv_sqrt_b = tq_debug_inv_sqrt_b(K, g);
+
+    // host-side staging: the same buffers as the forward twin, with the
+    // gx/state aliasing for fp32 I/O (the twin of fht_backward_large's
+    // ws/gx aliasing, kernel_tq.cu:922-929).
+    torch::Tensor g_cpu = g.cpu();
+    torch::Tensor signs_cpu = signs.cpu();
+    torch::Tensor state =
+        torch::empty(g.sizes(), g_cpu.options().dtype(at::kFloat));
+    torch::Tensor gx_cpu = (g.scalar_type() == at::kFloat)
+        ? state
+        : torch::empty(g.sizes(), g_cpu.options());
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf, at::kBFloat16, g.scalar_type(),
+        "tq_debug_fht_large_backward", [&] {
+            const scalar_t* gp = g_cpu.data_ptr<scalar_t>();
+            const float* sp = signs_cpu.data_ptr<float>();
+            float* wsp = state.data_ptr<float>();
+            scalar_t* op = gx_cpu.data_ptr<scalar_t>();
+
+            // ---- pass 1: the tile-local butterflies WITH the sign
+            // prologue (twins fht_backward_large_run:850-855 +
+            // fht_large_local_backward_kernel:708-749): the signs at
+            // FIRST LOAD, indexed by COLUMN (col0 + j) -- cast, then
+            // the exact +-1 multiply (kernel_tq.cu:729-732's math).
+            const int tiles = K / flute::FHT_LARGE_TILE;
+            for (int row = 0; row < M; ++row) {
+                for (int tile = 0; tile < tiles; ++tile) {
+                    const int col0 = tile * flute::FHT_LARGE_TILE;
+                    const int64_t base =
+                        static_cast<int64_t>(row) * K + col0;
+                    for (int j = 0; j < flute::FHT_LARGE_TILE; ++j) {
+                        wsp[base + j] =
+                            static_cast<float>(gp[base + j]) * sp[col0 + j];
+                    }
+                    // the SAME tile butterfly (the same fht_block call,
+                    // kernel_tq.cu:740 -- H is self-adjoint)
+                    tq_debug_tile_butterfly(wsp + base);
+                }
+            }
+
+            // ---- pass 2: the transit stages (the forward's cross
+            // kernel, unsigned/unscaled -- kernel_tq.cu:876-883) and the
+            // adjoint's final epilogue (fht_large_cross_backward_kernel:
+            // 774-814: the scale, no sign); for fp32 I/O op == wsp.
+            tq_debug_cross_stages<scalar_t, true>(wsp, sp, op, M, K,
+                                                  inv_sqrt_b);
+        });
+
+    // the move home: a same-dtype device copy (no conversion rides it)
+    return gx_cpu.to(g.device());
+}

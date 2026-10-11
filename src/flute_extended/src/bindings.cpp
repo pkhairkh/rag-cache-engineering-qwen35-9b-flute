@@ -98,6 +98,17 @@ torch::Tensor fht_forward_awq(torch::Tensor x, torch::Tensor signs,
 torch::Tensor fht_forward_large(torch::Tensor x, torch::Tensor signs);
 torch::Tensor fht_backward_large(torch::Tensor g, torch::Tensor signs);
 
+// Test-only scalar debug twins of the large-K pair (also defined in
+// src/kernel_tq.cu -- W20.6.1): host-side plain-C++/ATen assembly of
+// the same math, the same stage sequence, the same pairing order --
+// the differential reference G20.P2 compares the real kernels against.
+// NEVER on the production dispatch path: fht.py routes only to
+// fht_forward_large / fht_backward_large (verified -- no fht.py
+// reference to the twins exists or is needed); the W20.6.3 test file
+// and the G20.P2 gate function are the only callers.
+torch::Tensor tq_debug_fht_large_forward(torch::Tensor x, torch::Tensor signs);
+torch::Tensor tq_debug_fht_large_backward(torch::Tensor g, torch::Tensor signs);
+
 // Unified dispatcher. Accepts either (indices, lut) for the quantized path
 // or (W_dense) for the dense CUTLASS baseline. Pass an empty Tensor for the
 // unused variants. q_layout selects the packed-indices layout:
@@ -318,5 +329,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Large-K FHT adjoint (K > 16384, power of two, % 32 == 0): "
           "gx = g @ T^T, out-of-place, signs before the butterfly "
           "(contract: include/flute/fht_large.cuh)",
+          py::arg("g"), py::arg("signs"));
+
+    // Test-only scalar twins of the large-K pair (src/kernel_tq.cu,
+    // W20.6.1) -- the differential reference for G20.P2. Never on the
+    // production path: fht.py never routes here (verified); the
+    // W20.6.3 test file and the G20.P2 gate are the only callers.
+    m.def("tq_debug_fht_large_forward", &tq_debug_fht_large_forward,
+          "test-only scalar twin of fht_forward_large -- the "
+          "differential reference for G20.P2 (never on the production "
+          "path); same stage sequence and pairing order as the kernel "
+          "(low = u + w at the lower index, high = u - w, ascending len_)",
+          py::arg("x"), py::arg("signs"));
+    m.def("tq_debug_fht_large_backward", &tq_debug_fht_large_backward,
+          "test-only scalar twin of fht_backward_large -- the "
+          "differential reference for G20.P2 (never on the production "
+          "path); signs at the first load, the same butterfly, rsqrtf(K) "
+          "at the final store",
           py::arg("g"), py::arg("signs"));
 }

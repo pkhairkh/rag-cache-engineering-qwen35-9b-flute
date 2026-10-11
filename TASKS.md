@@ -873,7 +873,7 @@ twins, the canary/trap build variants, the CUDA-gated fht_large test
 file, and gates G20.P2 + G20.6 in the harness.
 
 #### W20.6.1 — the tq_debug_simple twins (scalar fragment assembly)
-- [ ] done
+- [x] done
 ROLE task-writer · READ `src/flute_extended/src/kernel_debug_simple.cu:1-80`
 (the existing scalar-twin pattern), `kernel_tq.cu` (5.2/5.3) · WRITE
 `kernel_tq.cu` (append)
