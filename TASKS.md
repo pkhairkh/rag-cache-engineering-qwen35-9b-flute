@@ -415,7 +415,14 @@ DO-D: ast_def both; `rg "np\.packbits|np\.unpackbits" src/rag/turboquant.py` == 
 COMMIT: "W20.3.2 — torch bit pack/unpack (byte layout fixture-pinned)"
 
 #### W20.3.3 — dequant torch-native (syndromes: numpy gather, from_numpy adjoint, `.to(device)` return)
-- [ ] done
+- [x] done
+Notes: the DO-D `from_numpy == 0` is scoped to the decode region for
+this task (module-wide zero is 3.4's audit line — the 3 residual hits
+are `_qjl_compensation_term` (:847/:850, 3.4's) + the dead `_pad_to`
+(:966, deleted at 3.4/3.5). The degenerate zero-norm decodes via the
+0-dim multiply (value-exact zero, no host-sync branch). `_qjl_term_`
+bridged` (:798) is the sanctioned pre-3.4 bridge — 3.4 collapses it to
+the direct call.
 ROLE task-writer · READ `src/rag/turboquant.py:640-780` (dequant,
 _dequant_mse, _dequant_split_mse, the :770-776 gather+adjoint) · WRITE
 `src/rag/turboquant.py`
