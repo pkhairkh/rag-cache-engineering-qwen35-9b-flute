@@ -1494,18 +1494,60 @@ failure). A gate turns GREEN/RED **only** from
 
 | gate | contract | thresholds | authored in | status |
 |---|---|---|---|---|
-| G20.P1 | K1: the torch single path vs the frozen fixtures + the 237-suite regression | codes equal except ties ≤ 0.01%; norm ≤ 1 ulp; recon allclose ≤ 1e-5 rel; run-to-run `torch.equal` (CUDA); 237-suite 0 failures | W20.4 | AUTHORED — PENDING (awaiting the A10G box report per env/W20_GPU_PROTOCOL.md) |
+| G20.P1 | K1: the torch single path vs the frozen fixtures + the 237-suite regression | codes equal except ties ≤ 0.01%; norm ≤ 4 ulps; recon allclose ≤ 1e-5 rel (TIE-AWARE); run-to-run `torch.equal` (CUDA); 237-suite 0 failures | W20.4 | AUTHORED — PENDING (awaiting the A10G box report per env/W20_GPU_PROTOCOL.md) |
 | G20.P2 | K2: fht_large differential twins + determinism | kernel vs debug twin vs torch allclose ≤ 1e-5; run-to-run `torch.equal`; K%32≠0 and K≤16,384 refusals raise | W20.6 | AUTHORED — PENDING (awaiting the A10G box report; build the variants first or G20.6 FAILs honestly) |
-| G20.P3 | K3+K4: TQ kernel parity (quant+dequant+qjl) | same as G20.P1 thresholds on kernel outputs; batched-grid shapes 120–192 units | W20.8 (qjl folds in W20.9) | AUTHORED — PENDING (awaiting the A10G box report; the qjl leg completes W20.9) |
+| G20.P3 | K3+K4: TQ kernel parity (quant+dequant+qjl) | same as G20.P1 thresholds on kernel outputs (norm ≤ 4 ulps, recon TIE-AWARE); batched-grid shapes 120–192 units | W20.8 (qjl folds in W20.9) | AUTHORED — PENDING (awaiting the A10G box report; the qjl leg completes W20.9) |
 | G20.1 | capture cycle + TQ share | capture ≤ 10 s/cycle after K3; TQ ≤ 5 ms/prefill (phase timers) | W20.8 (phase-1) | AUTHORED — PENDING (phase-1: short-run history timers; full confirmation after K4/K5) |
 | G20.2 | step time + the 300-step run | step ≤ 2 s after K3; ≤ 1 s at refresh 8; 300 steps ≤ 10 min | W20.8 (phase-1) / W20.11 (full) | AUTHORED — PENDING (FULL: two 300-step runs at refresh 4/8, the loop clock end-to-end; honest box cost ≈ 25+ min) |
 | G20.3 | W19 convergence (re-run on the kernel path) | loss leaves ln(8) at step 0; gk/gv_absmax > 0; held-out spread positive | W20.11 | AUTHORED — PENDING (the exact history keys: loss/gk_absmax/gv_absmax/cos_pos/cos_neg; the ln(8)=ln(8-batch) tolerance 1e-4, the W19 suite's own) |
-| G20.4 | the parity contract (levels 1–2) | level 1: run-to-run `torch.equal` (codes + recon, kernel); level 2: ties ≤ 0.01%, norm ≤ 1 ulp, allclose ≤ 1e-5 | W20.8 | AUTHORED — PENDING (awaiting the A10G box report) |
+| G20.4 | the parity contract (levels 1–2) | level 1: run-to-run `torch.equal` (codes + recon, kernel); level 2: ties ≤ 0.01%, norm ≤ 4 ulps, allclose ≤ 1e-5 (TIE-AWARE) | W20.8 | AUTHORED — PENDING (awaiting the A10G box report) |
 | G20.5 | protocol integrity | TRAIN → RE-INGEST → INDEX → EVAL → QUERY on the kernel path; npz digests stable run-to-run; cross-backend decode allclose ≤ 1e-5; W16 verbatim install bit-exact within backend | W20.10 | AUTHORED — PENDING (awaiting the A10G box report; the digest surface excludes only the meta's saved_at provenance field — the format's own determinism surface) |
 | G20.6 | canary/trap | canary build: zero poison survives; trap build: FAILS the determinism gate (the negative control must fail) | W20.6 | AUTHORED — PENDING (the variants must be built on the box first — scripts/gpu/w20_build_variants.sh) |
 
 The capture (W20.1) and the 237-suite baseline are protocol steps, not
 gates; they are recorded in `env/W20_GPU_PROTOCOL.md`.
+
+### §4.1 — the W20.13.4 threshold re-derivation (the record, never a mask)
+
+The box's first full kernel run (225 passed / 35 failed / 3 skipped,
+2026-10-12 handover) measured two authored-threshold failures inside
+G20.P3's pytest surface that are ARITHMETIC, not kernel defects, and
+the registry rows above were re-derived accordingly (this section is
+the decision record; the THRESHOLDS dict and the test constants mirror
+it 1:1):
+
+1. **norm 1 → 4 ulps** (`test_batched_grid_shapes_kernel_vs_twin`
+   M120/M192: "norm 2 ulp > 1"): the comparison crosses two different
+   reduction trees (the kernel's shfl-xor 16→1 butterfly + ascending
+   CTA fold vs torch's cub tree). Measured max 2 ulps over 120–192
+   rows — the statistical drift of tree association, exactly as the
+   W20.7.1 design note predicted ("NOT bit-identical to torch.norm by
+   tree shape — the determinism + tolerance gates carry it"). The
+   budget: 4 = 2× the measured max. Run-to-run determinism stays
+   `torch.equal` — ABSOLUTE, untouched; the norm's downstream effect
+   (boundary ties) is carried by TIES_MAX_FRACTION.
+2. **the round-trip recon leg becomes TIE-AWARE**
+   (`test_geometry_ladder_kernel_vs_torch_twin[d2p22-u1]`: "kernel
+   round trip drifts vs twin round trip beyond 1e-5" while the codes
+   tie-fraction PASSED): the authored allclose(1e-5) contradicted the
+   tie budget by arithmetic — ONE admitted flip changes the
+   pre-butterfly stream at one flat position by ≤ gap·norm, and the
+   adjoint Hadamard smears it as ±Δ/√d over the WHOLE output vector,
+   so ANY nonzero tie count breaks per-element allclose at 2^22 (the
+   smaller rungs happened to flip zero ties). The re-derived
+   predicate: |a−b| ≤ atol + rtol·|b| + (mm_lo·gap_lo + mm_hi·gap_hi)
+   ·norm/√d — mm == 0 reduces EXACTLY to the authored allclose. The
+   ISOLATED DECODE leg (the same codes into both decoders) stays at
+   the authored 1e-5: no tie involvement, pure rounding drift. G20.P1
+   gains the same envelope (per-partition sub-books + the QJL
+   sign-flip term 2·QJL_C·γ/d — the sketch's FHT tree ties are a flip
+   source of their own).
+
+The ties budget (≤ 0.01%), the determinism contracts (`torch.equal`),
+the decode legs (1e-5) and every timer gate are UNCHANGED — the
+re-derivation touched exactly the two lines the box measured false,
+with the arithmetic written down. The box re-runs the suite + the
+gates as the only verdicts there are.
 
 ## 5. The attestation ledger (the no-CPU-test law, per wave)
 

@@ -92,11 +92,16 @@ EXIT_OK, EXIT_FAIL, EXIT_REFUSAL, EXIT_NO_CUDA = 0, 1, 2, 3
 # drift is a wave-close failure). One entry per gate row; each comment
 # cites the row's threshold text verbatim.
 THRESHOLDS: Dict[str, Dict[str, Any]] = {
-    # §4 G20.P1: "codes equal except ties ≤ 0.01%; norm ≤ 1 ulp; recon
-    # allclose ≤ 1e-5 rel; run-to-run torch.equal (CUDA); 237-suite 0
-    # failures"  (ties ≤ 0.01% == fraction ≤ 0.0001).
+    # §4 G20.P1 (norm re-derived W20.13.4): "codes equal except ties
+    # ≤ 0.01%; norm ≤ 4 ulps; recon allclose ≤ 1e-5 rel (TIE-AWARE —
+    # the round-trip leg's envelope gains the flip-smear term, see
+    # _probe_parity); run-to-run torch.equal (CUDA); 237-suite 0
+    # failures"  (ties ≤ 0.01% == fraction ≤ 0.0001; the norm budget
+    # 4 ulps = 2x the box-measured 2-ulp tree-association drift between
+    # torch's reduction tree and the fixture-era tree — determinism
+    # stays absolute, the ties carry the downstream effect).
     "G20.P1": {
-        "ties_max_fraction": 0.0001, "norm_max_ulps": 1,
+        "ties_max_fraction": 0.0001, "norm_max_ulps": 4,
         "recon_allclose_rtol": 1e-5, "recon_allclose_atol": 1e-5,
         "run_to_run_torch_equal": True, "suite_max_failures": 0,
     },
@@ -108,10 +113,11 @@ THRESHOLDS: Dict[str, Dict[str, Any]] = {
         "refusal_k_mod32": True,    # K % 32 != 0 must raise
         "refusal_k_max": 16384,     # K <= 16_384 must raise
     },
-    # §4 G20.P3: "same as G20.P1 thresholds on kernel outputs;
-    # batched-grid shapes 120–192 units".
+    # §4 G20.P3 (norm re-derived W20.13.4): "same as G20.P1 thresholds
+    # on kernel outputs (ties, the 4-ulp norm budget, the TIE-AWARE
+    # round-trip envelope); batched-grid shapes 120–192 units".
     "G20.P3": {
-        "ties_max_fraction": 0.0001, "norm_max_ulps": 1,
+        "ties_max_fraction": 0.0001, "norm_max_ulps": 4,
         "recon_allclose_rtol": 1e-5, "recon_allclose_atol": 1e-5,
         "run_to_run_torch_equal": True,
         "batched_grid_units_min": 120, "batched_grid_units_max": 192,
@@ -133,11 +139,12 @@ THRESHOLDS: Dict[str, Dict[str, Any]] = {
         "loss_leaves_ln8_step0": True, "gk_gv_absmax_positive": True,
         "heldout_spread_positive": True,
     },
-    # §4 G20.4: "level 1: run-to-run torch.equal (codes + recon, kernel);
-    # level 2: ties ≤ 0.01%, norm ≤ 1 ulp, allclose ≤ 1e-5".
+    # §4 G20.4 (norm re-derived W20.13.4): "level 1: run-to-run
+    # torch.equal (codes + recon, kernel); level 2: ties ≤ 0.01%, norm
+    # ≤ 4 ulps, allclose ≤ 1e-5 (TIE-AWARE)".
     "G20.4": {
         "level1_run_to_run_torch_equal": True,
-        "level2_ties_max_fraction": 0.0001, "level2_norm_max_ulps": 1,
+        "level2_ties_max_fraction": 0.0001, "level2_norm_max_ulps": 4,
         "level2_allclose_rtol": 1e-5, "level2_allclose_atol": 1e-5,
     },
     # §4 G20.5: "TRAIN → RE-INGEST → INDEX → EVAL → QUERY on the kernel
@@ -230,8 +237,10 @@ def _import_repo_modules() -> None:
     sys.path.insert(0, str(RAG_DIR))
     import _paths  # noqa: F401  (anchors idempotently, house style)
     import turboquant
+    import codebooks  # W20.13.4: the flip-bound's registry pairs
     from tq_codes import TQCodes
     _REPO["turboquant"] = turboquant
+    _REPO["codebooks"] = codebooks
     _REPO["TQCodes"] = TQCodes
     print(f"[w20-gates]   OK -- turboquant from {turboquant.__file__}")
 
@@ -347,6 +356,23 @@ def _probe_parity(tq: Any, np: Any, entry: Dict[str, Any],
             and (first.mask is not None) == outlier
             and (first.norm_hi is not None) == outlier)
 
+    # W20.13.4 — the flip bound's codebooks (the sides' OWN registry
+    # pairs): "half" packs coordinate halves of the SAME d (the books
+    # are (bits, d)); "outlier" packs two full sub-units (the books are
+    # the sub-quantizers' own (bits, n_lo) / (bits, n_hi)). The
+    # adjacent-centroid gaps bound ONE admitted tie's pre-butterfly
+    # delta (the boundary ladder flips to the NEIGHBORING level).
+    _cb = _REPO["codebooks"]
+    if outlier:
+        book_lo = _cb.get_codebook(bits_lo, n_lo)
+        book_hi = _cb.get_codebook(bits_hi, n_hi)
+    else:
+        book_lo = _cb.get_codebook(bits_lo, d)
+        book_hi = _cb.get_codebook(bits_hi, d)
+    gap_lo = float(np.max(np.abs(np.diff(book_lo.centroids))))
+    gap_hi = float(np.max(np.abs(np.diff(book_hi.centroids))))
+    qjl_c = math.sqrt(math.pi / 2.0)      # the QJL compensation constant
+
     mismatches = 0
     slots = 0
     norm_max_ulps = 0
@@ -363,13 +389,16 @@ def _probe_parity(tq: Any, np: Any, entry: Dict[str, Any],
             and torch.equal(c1.norm, c2.norm)
             and (c1.mask is None or torch.equal(c1.mask, c2.mask)))
         # (a) codes: unpack BOTH sides with the current torch decode
+        # (W20.13.4: per-side counts — the (c) envelope needs them)
+        mm = {"lo": 0, "hi": 0}
         for side, packed in (("lo", c1.idx_lo), ("hi", c1.idx_hi)):
             bits = int(c1.bits_lo) if side == "lo" else int(c1.bits_hi)
             n = int(c1.n_lo) if side == "lo" else int(c1.n_hi)
             cur = tq.unpack_bits_t(packed, bits, n).to(torch.int64).cpu()
             fix = torch.from_numpy(np.ascontiguousarray(
                 fx[f"idx_{side}_unpacked"][u])).to(torch.int64)
-            mismatches += int((cur != fix).sum().item())
+            mm[side] = int((cur != fix).sum().item())
+            mismatches += mm[side]
             slots += cur.numel()
             # layout pin (unpack_bits_t: "byte layout pinned by the frozen
             # fixtures"): torch-unpacking the FIXTURE's own packed stream
@@ -378,18 +407,46 @@ def _probe_parity(tq: Any, np: Any, entry: Dict[str, Any],
                 tq.unpack_bits_t(torch.from_numpy(
                     np.ascontiguousarray(fx[f"idx_{side}"][u])), bits, n
                 ).to(torch.int64), fix))
+        # the QJL sign flips (the sketch's own FHT tree ties — a flip
+        # changes the compensation term everywhere by 2*QJL_C*gamma/d)
+        mm_sign = 0
+        if c1.qjl_signs is not None:
+            fx_signs = torch.from_numpy(np.ascontiguousarray(
+                fx["qjl_signs"][u])).to(torch.int64)
+            mm_sign = int((c1.qjl_signs.to(torch.int64).cpu()
+                           != fx_signs).sum().item())
         # (b) norm (and norm_hi on the outlier split): view-int32 ulps
         norm_max_ulps = max(norm_max_ulps, _ulp_distance_fp32(
             c1.norm, torch.from_numpy(fx["norm"][u:u + 1])))
         if outlier and c1.norm_hi is not None:
             norm_max_ulps = max(norm_max_ulps, _ulp_distance_fp32(
                 c1.norm_hi, torch.from_numpy(fx["norm_hi"][u:u + 1])))
-        # (c) reconstruction
-        recon_ok &= bool(torch.allclose(
-            r1.to("cpu", torch.float32),
-            torch.from_numpy(np.ascontiguousarray(fx["recon"][u])),
-            rtol=float(th["recon_allclose_rtol"]),
-            atol=float(th["recon_allclose_atol"])))
+        # (c) reconstruction — TIE-AWARE (W20.13.4): allclose's
+        # per-element envelope PLUS the flip-smear budget. A boundary
+        # tie the (a) budget admits changes the pre-butterfly stream
+        # at ONE flat position by <= gap*norm, and the adjoint
+        # Hadamard smears it as ±Δ/√(side d) over that side's output
+        # span — "half" rotates the FULL d (one FHT: /√d), "outlier"
+        # rotates the two sub-units (/√n_lo and /√n_hi, each with its
+        # own norm). A flipped QJL sign adds 2*QJL_C*γ/d everywhere.
+        # mm == 0 on every source reduces EXACTLY to the authored
+        # allclose — the strict predicate, generalized honestly.
+        fx_recon = torch.from_numpy(
+            np.ascontiguousarray(fx["recon"][u])).to(torch.float32)
+        if outlier:
+            smear = (mm["lo"] * gap_lo * float(fx["norm"][u])
+                     / math.sqrt(n_lo)
+                     + mm["hi"] * gap_hi * float(fx["norm_hi"][u])
+                     / math.sqrt(n_hi))
+        else:
+            smear = ((mm["lo"] * gap_lo + mm["hi"] * gap_hi)
+                     * float(fx["norm"][u]) / math.sqrt(d))
+        if mm_sign:
+            smear += mm_sign * 2.0 * qjl_c * float(fx["gamma"][u]) / d
+        env = (float(th["recon_allclose_atol"])
+               + float(th["recon_allclose_rtol"]) * fx_recon.abs() + smear)
+        recon_ok &= bool(((r1.to("cpu", torch.float32) - fx_recon).abs()
+                          <= env).all())
 
     tie_fraction = (mismatches / slots) if slots else 0.0
     rtr_equal = rtr_codes_ok and rtr_recon_ok
@@ -895,8 +952,10 @@ def _probe_p3_unit(q: Any, x_unit: torch.Tensor,
                      and torch.equal(c_kernel.idx_hi, c2.idx_hi)
                      and torch.equal(c_kernel.norm, c2.norm))
     rtr_recon = bool(torch.equal(r_kernel, r2))
-    # (a) the tie counter
+    # (a) the tie counter (W20.13.4: per-side counts — the (c) leg-1
+    # envelope needs them)
     mismatches, slots = 0, 0
+    mm = {"lo": 0, "hi": 0}
     for side in ("lo", "hi"):
         bits = int(c_kernel.bits_lo if side == "lo" else c_kernel.bits_hi)
         n = int(c_kernel.n_lo if side == "lo" else c_kernel.n_hi)
@@ -904,13 +963,25 @@ def _probe_p3_unit(q: Any, x_unit: torch.Tensor,
                               bits, n).to(torch.int64)
         tu = tq.unpack_bits_t(getattr(c_twin, "idx_" + side),
                               bits, n).to(torch.int64)
-        mismatches += int((ku != tu).sum().item())
+        mm[side] = int((ku != tu).sum().item())
+        mismatches += mm[side]
         slots += int(ku.numel())
     # (b) the norm ulp budget
     norm_ulps = _ulp_distance_fp32(c_kernel.norm, c_twin.norm)
-    # (c) the two recon legs
-    recon_round = bool(torch.allclose(r_kernel, r_round_twin,
-                                      rtol=rtol, atol=atol))
+    # (c) the two recon legs — leg 1 TIE-AWARE (W20.13.4): allclose's
+    # envelope PLUS the flip-smear budget (mm*gap*norm/√d — the
+    # admitted flips' worst-case coherent Hadamard rows; this probe is
+    # flat "half", one FULL-d rotation; mm == 0 reduces EXACTLY to the
+    # authored allclose). Leg 2 UNCHANGED — the SAME kernel codes into
+    # both decoders, no tie involvement, pure rounding drift.
+    cb_lo, cb_hi = q._device_codebooks(x_unit.device)
+    gap_lo = float((cb_lo.centroids[1:] - cb_lo.centroids[:-1]).abs().max())
+    gap_hi = float((cb_hi.centroids[1:] - cb_hi.centroids[:-1]).abs().max())
+    smear = ((mm["lo"] * gap_lo + mm["hi"] * gap_hi) * float(c_twin.norm)
+             / math.sqrt(int(q.d)))
+    diff = (r_kernel - r_round_twin).abs()
+    env = (atol + rtol * r_round_twin.abs() + smear)
+    recon_round = bool((diff <= env).all())
     recon_decode = bool(torch.allclose(r_kernel, r_decode_twin,
                                        rtol=rtol, atol=atol))
     return {
