@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 import numpy as np
 import torch
@@ -26,6 +27,43 @@ from ingest import (check_m1m2_geometry, load_system_state,  # noqa: E402
                     m1m2_mem_size_from_system, reseed_cache)
 from query import answer_query, query_cache_vector  # noqa: E402
 from tq_cache import TQCache  # noqa: E402
+
+
+def _context_token_ids(corpus_path: str, chunk_ids, tokenizer, dev):
+    """W23: the retrieved chunks' TEXT as 2-D (1, T) token tensors,
+    ascending chunk id — the ingest stream order, the state distribution
+    the delta rule saw when the codes were captured. Chunk i = line i of
+    documents.jsonl (the ingest convention, field 'text' or 'content').
+    A missing corpus file or missing lines fail LOUDLY (a wrong-corpus
+    file is a caller error, never a silently empty context)."""
+    want = sorted({int(c) for c in chunk_ids})
+    if not want:
+        return []
+    if not os.path.exists(corpus_path):
+        raise SystemExit(
+            f"run_query: --answer-mode prefill needs the corpus file "
+            f"{corpus_path!r} (--corpus) — the SAME documents.jsonl the "
+            f"corpus was ingested from (chunk i = line i)")
+    want_set = set(want)
+    texts = {}
+    with open(corpus_path) as f:
+        for i, line in enumerate(f):
+            if i > want[-1]:
+                break
+            if i in want_set:
+                doc = json.loads(line)
+                texts[i] = doc.get("text", doc.get("content", ""))
+    missing = [i for i in want if i not in texts]
+    if missing:
+        raise SystemExit(
+            f"run_query: corpus {corpus_path!r} has no line(s) {missing} "
+            f"for chunk id(s) {missing} — chunk i = line i (the ingest "
+            f"order); pass the SAME file the corpus was ingested from")
+    # add_special_tokens=False: the chunks' ingest encoding regime (the
+    # context must live in the same token regime as the ingestion)
+    return [torch.tensor(
+        [tokenizer.encode(texts[i], add_special_tokens=False)],
+        dtype=torch.long, device=dev) for i in want]
 
 
 def main() -> int:
@@ -64,6 +102,27 @@ def main() -> int:
                          "softmax). Retrieval-quality knob, A/B it with "
                          "eval_retrieval.py; pass the SAME k to ingest "
                          "and query for read consistency")
+    ap.add_argument("--answer-mode", choices=("prefill", "install"),
+                    default="prefill",
+                    help="W23: how the answer context is built. 'prefill' "
+                         "(default) re-runs the retrieved chunks' TEXT "
+                         "through a fresh reseeded cache — the proven "
+                         "context build (the W14/W15 true-doc control, "
+                         "conf 0.895; a delta-rule state is NON-ADDITIVE, "
+                         "so the codes-sum superposes chunks instead of "
+                         "composing them). 'install' keeps the spec §6 "
+                         "codes-sum (the A/B)")
+    ap.add_argument("--corpus", default=DEFAULTS["corpus"],
+                    help="documents.jsonl for --answer-mode prefill (the "
+                         "ingest source; chunk i = line i; field 'text' "
+                         "or 'content')")
+    ap.add_argument("--no-answer-m1m2", action="store_true",
+                    help="W23: skip the M1/M2 read/write block during the "
+                         "ANSWER phase only (the true-doc control's "
+                         "regime; the retrieval-side query prefill keeps "
+                         "it ON, so the query vector is unaffected) — "
+                         "the memory's generation effect becomes a "
+                         "measured A/B, not an assumption")
     ap.add_argument("--no-m1m2", action="store_true",
                     help="W17: load without the wiring (only valid for a "
                          "corpus ingested --no-m1m2)")
@@ -146,8 +205,12 @@ def main() -> int:
         print(f"\n    Query {i + 1}: {question[:80]}...")
         # add_special_tokens=False: matches the ingestion's chunk and
         # system encoding (the query must live in the same token regime)
+        # W23: 2-D (1, T) + dtype long + device — the model's forward
+        # expects batched ids (a 1-D tensor crashes the reshape; the
+        # box-side sed hack around this is now the repo's proper fix)
         query_ids = torch.tensor(
-            tokenizer.encode(question, add_special_tokens=False)).to(dev)
+            [tokenizer.encode(question, add_special_tokens=False)],
+            dtype=torch.long, device=dev)
 
         cache = cache_factory()
         reseed_cache(cache, system)
@@ -160,16 +223,52 @@ def main() -> int:
         print(f"    Top {args.top_k}: {[int(x) for x in ids]} "
               f"scores {[f'{s:.4f}' for s in scores]}")
 
-        result = answer_query(
-            model=model,
-            query_token_ids=query_ids,
-            system=system,
-            loader=loader,
-            cache_factory=cache_factory,
-            retrieved_ids=[int(x) for x in ids],
-            max_new_tokens=args.max_new_tokens)
-        answer = tokenizer.decode(result.new_token_ids, skip_special_tokens=True)
+        # W23: the answer context build. 'prefill' (default): the
+        # retrieved chunks' TEXT through a fresh reseeded cache (the
+        # proven path). 'install': the spec §6 codes-sum (the A/B).
+        ctx_ids = None
+        if args.answer_mode == "prefill":
+            ctx_ids = _context_token_ids(args.corpus,
+                                         [int(x) for x in ids],
+                                         tokenizer, dev)
+            print(f"    [W23] answer mode prefill: {len(ctx_ids)} chunk "
+                  f"text(s), {sum(int(c.shape[-1]) for c in ctx_ids)} "
+                  f"context tokens")
+        else:
+            print("    [W23] answer mode install (the §6 codes-sum A/B)")
+
+        # W23: the answer-phase M1/M2 A/B — disabled AFTER the retrieval
+        # prefill above (the query vector keeps the M1/M2 codes),
+        # re-enabled right after the answer
+        m1m2_mod = getattr(inner, "m1m2", None)
+        if args.no_answer_m1m2 and m1m2_mod is not None:
+            m1m2_mod.enabled = False
+            print("    [W23] M1/M2 read/write OFF for the answer "
+                  "(the true-doc control's regime)")
+        try:
+            result = answer_query(
+                model=model,
+                query_token_ids=query_ids,
+                system=system,
+                loader=loader,
+                cache_factory=cache_factory,
+                retrieved_ids=[int(x) for x in ids],
+                max_new_tokens=args.max_new_tokens,
+                context_token_ids=ctx_ids)
+        finally:
+            if m1m2_mod is not None:
+                m1m2_mod.enabled = True
+        answer = tokenizer.decode(result.new_token_ids,
+                                  skip_special_tokens=True)
+        toks = result.new_token_ids
+        conf = (sum(result.token_confs) / len(result.token_confs)
+                if result.token_confs else 0.0)
+        rep = (sum(1 for a, b in zip(toks, toks[1:]) if a == b)
+               / max(1, len(toks) - 1))
         print(f"    Answer: {answer[:300]}")
+        print(f"    [gen gate] mean conf {conf:.3f} | repetition {rep:.2f} "
+              f"(bisect_install's bar: conf >= 0.20, rep <= 0.6; the "
+              f"true-doc control measured 0.895)")
 
     print("\n" + "=" * 60)
     print("QUERY COMPLETE")
