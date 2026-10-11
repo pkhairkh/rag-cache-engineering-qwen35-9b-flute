@@ -60,8 +60,8 @@ from turboquant import (
     TQCodes,
     TurboQuant,
     get_quantizer,
-    pack_bits,
-    unpack_bits,
+    pack_bits_t,
+    unpack_bits_t,
 )
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -161,31 +161,31 @@ def test_pack_bits_roundtrip_lossless(b):
         .astype(np.uint8)
     idx[0], idx[1] = 0, 2 ** b - 1                  # both edge values
 
-    packed = pack_bits(idx, b)
+    packed = pack_bits_t(idx, b)
     assert packed.dtype == np.uint8 and packed.ndim == 1
     assert packed.nbytes == (5000 * b + 7) // 8
-    back = unpack_bits(packed, b, 5000)
+    back = unpack_bits_t(packed, b, 5000)
     assert back.dtype == np.uint8
     assert np.array_equal(back, idx)
 
     # odd lengths: the 4-bit fast path pads to a whole nibble pair, the
     # generic path leaves a partial trailing byte — both must trim to n
     idx_odd = idx[:101].copy()
-    p_odd = pack_bits(idx_odd, b)
+    p_odd = pack_bits_t(idx_odd, b)
     assert p_odd.nbytes == (101 * b + 7) // 8
-    assert np.array_equal(unpack_bits(p_odd, b, 101), idx_odd)
+    assert np.array_equal(unpack_bits_t(p_odd, b, 101), idx_odd)
 
 
 def test_pack_bits_rejects_out_of_range():
     for b in (1, 2, 3, 4):
         with pytest.raises(ValueError):
-            pack_bits(np.array([0, 2 ** b], dtype=np.uint8), b)
+            pack_bits_t(np.array([0, 2 ** b], dtype=np.uint8), b)
     # the bits domain itself is validated loudly too
     for bad in (0, 9):
         with pytest.raises(ValueError):
-            pack_bits(np.zeros(4, np.uint8), bad)
+            pack_bits_t(np.zeros(4, np.uint8), bad)
         with pytest.raises(ValueError):
-            unpack_bits(np.zeros(1, np.uint8), bad, 4)
+            unpack_bits_t(np.zeros(1, np.uint8), bad, 4)
 
 
 # --- gate 5: code serialization round-trip ----------------------------------- #

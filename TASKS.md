@@ -389,7 +389,15 @@ COMMIT: "W20.3.1 — quant encode torch-native (norm tensor, searchsorted
 parity, boundary-scaling identity)"
 
 #### W20.3.2 — pack/unpack in torch (syndrome: numpy packbits)
-- [ ] done
+- [x] done
+Notes: the numpy pair is DELETED (module + __all__); the mask reader
+in `_split_channels` (:632) got a mechanical MSB-first torch expansion
+(big-endian fixture — deliberately NOT the little-endian _t stream);
+the pack domain is asserted to bits∈{3,4} per this brief — W20.4 must
+reconcile the blast radius (pre-W20 uniform-bits tests at b∈{1,2};
+evals.py bits_list). test_turboquant.py: mechanical rename only
+(imports + call sites; the numpy-constructor/dtype adaptation is
+W20.4's sweep).
 ROLE task-writer · READ `src/rag/turboquant.py:159-203` (pack_bits/
 unpack_bits — the byte layout to reproduce), `:800-833` (_packed_len) ·
 WRITE `src/rag/turboquant.py`

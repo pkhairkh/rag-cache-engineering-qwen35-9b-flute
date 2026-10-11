@@ -119,7 +119,7 @@ from tq_codes import TQCodes  # W20.2.1 — the torch-native codes container (re
 
 __all__ = [
     "KINDS", "SEEDS", "TQCodes", "TurboQuant", "get_quantizer",
-    "pack_bits", "unpack_bits",
+    "pack_bits_t", "unpack_bits_t",
 ]
 
 # ---------------------------------------------------------------- kinds ----
@@ -157,69 +157,43 @@ QJL_C = math.sqrt(math.pi / 2.0)
 
 
 # ------------------------------------------------------------- bit packs ---
-def pack_bits(idx: np.ndarray, bits: int) -> np.ndarray:
-    """Pack unsigned indices (each < 2**bits, bits in {1..8}) into a uint8
-    bit-stream (little-endian bit order). Lossless; length =
-    ceil(n * bits / 8) bytes."""
-    if bits not in range(1, 9):
-        raise ValueError(f"pack_bits: bits must be 1..8, got {bits}")
-    idx = np.asarray(idx)
-    if idx.size and idx.dtype != np.uint8:
-        # range-check BEFORE any dtype cast (wide dtypes would wrap mod 256)
-        if int(idx.max()) >= (1 << bits) or int(idx.min()) < 0:
-            raise ValueError(
-                f"pack_bits: index out of {bits}-bit range "
-                f"[{int(idx.min())}, {int(idx.max())}]")
-    idx = np.ascontiguousarray(idx, dtype=np.uint8)
-    if idx.size == 0:
-        return np.zeros(0, dtype=np.uint8)
-    if int(idx.max(initial=0)) >= (1 << bits):
+def pack_bits_t(idx: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack uint8 quantization indices into the packed uint8 bit-stream
+    (the canonical W20.3.2 encode side — the promoted W20.3.1 stand-in
+    `_pack_bits_t`). uint8 in -> uint8 out, same device, no host hop,
+    no numpy anywhere in the body.
+
+    Byte layout — bit-precise (the EXACT numpy pack_bits layout):
+    * bit order: LITTLE-ENDIAN — bit k of index i sits at flat stream
+      position i*bits + k (each index's LSB first);
+    * byte assembly: byte m holds flat bits 8m..8m+7 with flat bit 8m
+      in the LSB (bytes LSB-first); length = ceil(n*bits/8) =
+      _packed_len(n, bits) bytes;
+    * tail padding: the final partial byte's unused high flat bits
+      are zero;
+    * bits == 4 fast path: two nibbles per byte — byte j = idx[2j] |
+      (idx[2j+1] << 4), the EARLIER index in the LOW nibble; an odd
+      tail pads with one zero nibble (the last byte's high nibble 0);
+    * bits == 3: the general shift/mask path.
+    Supported widths: bits in {3, 4} — the TQ index streams (the lo/hi
+    split packs its halves separately, the callers already do); other
+    widths raise a clear ValueError.
+    Indices stay uint8 at the boundary; the general path widens to
+    int64 internally for the shift/mask arithmetic (device-resident,
+    documented widening — the output folds back to uint8).
+
+    Checks are metadata-only (the host-side bits domain): NO device
+    value probe — the numpy original's range check cost a host sync,
+    the exact syndrome this rewrite removes; searchsorted bucketize
+    indices are < 2**bits by construction, so the legacy range error
+    is unreachable from the encode path.
+
+    byte layout pinned by the frozen fixtures — G20.P1 is the pinning
+    gate (numpy pack_bits/unpack_bits parity)."""
+    if bits not in (3, 4):
         raise ValueError(
-            f"pack_bits: index {int(idx.max())} exceeds {bits}-bit range")
-    if bits == 4:  # fast path: two nibbles per byte
-        if idx.size % 2:
-            idx = np.concatenate([idx, np.zeros(1, np.uint8)])
-        return (idx[0::2] | (idx[1::2] << 4)).astype(np.uint8)
-    bits_mat = ((idx[:, None] >> np.arange(bits, dtype=np.uint8)) & 1)
-    return np.packbits(bits_mat.reshape(-1), bitorder="little")
-
-
-def unpack_bits(packed: np.ndarray, bits: int, n: int) -> np.ndarray:
-    """Inverse of pack_bits: returns exactly n indices."""
-    if bits not in range(1, 9):
-        raise ValueError(f"unpack_bits: bits must be 1..8, got {bits}")
-    if bits == 4:
-        p = np.ascontiguousarray(packed, dtype=np.uint8)
-        out = np.empty(p.size * 2, dtype=np.uint8)
-        out[0::2] = p & 0xF
-        out[1::2] = p >> 4
-        return out[:n]
-    raw = np.unpackbits(np.ascontiguousarray(packed, dtype=np.uint8),
-                        bitorder="little")[: n * bits].reshape(n, bits)
-    weights = (1 << np.arange(bits, dtype=np.uint8))
-    return (raw * weights).sum(axis=-1, dtype=np.uint8)
-
-
-def _pack_bits_t(idx: torch.Tensor, bits: int) -> torch.Tensor:
-    """Torch twin of pack_bits — the W20.3.1 encode-side stand-in: uint8
-    indices in -> packed uint8 bit-stream out, same device, no host hop.
-
-    Layout pinned by G20.P1 fixtures; canonical pair lands in W20.3.2.
-    This stand-in reproduces the numpy pack_bits byte layout EXACTLY:
-    little-endian bit order (bit k of index i, LSB first, at flat
-    position i*bits + k; byte m = flat bits 8m..8m+7 with flat bit 8m in
-    the LSB), zero-padded tail; length = ceil(n*bits/8) bytes. bits==4
-    takes the two-nibbles-per-byte fast path: byte j = idx[2j] |
-    (idx[2j+1] << 4) — the earlier index in the LOW nibble, one zero
-    nibble pads an odd tail.
-
-    Checks are metadata-only (bits in 1..8; the input is flattened and
-    cast to uint8): a VALUE range probe would be a device sync — the
-    exact syndrome this rewrite exists to remove. Indices off the
-    searchsorted bucketize are < 2**bits by construction, so the legacy
-    range error is unreachable from the encode path."""
-    if bits not in range(1, 9):
-        raise ValueError(f"_pack_bits_t: bits must be 1..8, got {bits}")
+            f"pack_bits_t: bits must be 3 or 4 (the TQ index stream "
+            f"widths), got {bits}")
     idx = idx.reshape(-1)
     n = idx.numel()
     if n == 0:
@@ -227,8 +201,8 @@ def _pack_bits_t(idx: torch.Tensor, bits: int) -> torch.Tensor:
     if idx.dtype != torch.uint8:
         idx = idx.to(torch.uint8)
     if bits == 4:
-        # fast path (pack_bits 1:1): two nibbles per byte, the EARLIER
-        # index in the low nibble; an odd tail pads with one zero nibble
+        # fast path: two nibbles per byte, the EARLIER index in the
+        # low nibble; an odd tail pads with one zero nibble
         if n % 2:
             idx = torch.cat(
                 [idx, torch.zeros(1, dtype=torch.uint8, device=idx.device)])
@@ -244,6 +218,60 @@ def _pack_bits_t(idx: torch.Tensor, bits: int) -> torch.Tensor:
             [flat, torch.zeros(tail, dtype=flat.dtype, device=idx.device)])
     weights = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=idx.device)
     return (flat.reshape(-1, 8) * weights).sum(dim=-1).to(torch.uint8)
+
+
+def unpack_bits_t(packed: torch.Tensor, bits: int, n: int) -> torch.Tensor:
+    """Unpack exactly `n` uint8 indices from the packed uint8 bit-stream
+    (the canonical W20.3.2 decode side — the EXACT inverse of
+    pack_bits_t). uint8 in -> uint8 out, same device, no host hop, no
+    numpy anywhere in the body.
+
+    Byte layout — bit-precise (identical contract to pack_bits_t, the
+    frozen-fixture numpy layout):
+    * bit order: LITTLE-ENDIAN — flat stream position i*bits + k holds
+      bit k of output index i (each index's LSB first);
+    * byte disassembly: byte m contributes flat bits 8m..8m+7, flat
+      bit 8m read from the byte's LSB (bytes LSB-first);
+    * tail padding: the zero pad bits beyond n*bits are DROPPED —
+      exactly n indices come out;
+    * bits == 4 fast path: two nibbles per byte — idx[2j] = byte & 0xF
+      (the LOW nibble, the earlier index) and idx[2j+1] = byte >> 4
+      (the HIGH nibble); an odd tail's last byte carries the zero pad
+      in its high nibble (read, then trimmed by [:n]);
+    * bits == 3: the general shift/mask regroup with weights 2**k.
+    Supported widths: bits in {3, 4} — matching pack_bits_t (other
+    widths raise a clear ValueError).
+    Packed bytes in uint8, indices out uint8 (the general path widens
+    to int64 internally for the shift/mask arithmetic — documented
+    widening; the output folds back to uint8).
+
+    byte layout pinned by the frozen fixtures — G20.P1 is the pinning
+    gate (numpy pack_bits/unpack_bits parity)."""
+    if bits not in (3, 4):
+        raise ValueError(
+            f"unpack_bits_t: bits must be 3 or 4 (the TQ index stream "
+            f"widths), got {bits}")
+    p = packed.reshape(-1)
+    if p.dtype != torch.uint8:
+        p = p.to(torch.uint8)
+    if bits == 4:
+        # fast path, pack's exact inverse: byte j -> idx[2j] (low
+        # nibble) and idx[2j+1] (high nibble); an odd tail's zero pad
+        # sits in the last byte's high nibble (trimmed by [:n])
+        out = torch.empty(p.numel() * 2, dtype=torch.uint8,
+                          device=p.device)
+        out[0::2] = p & 0xF
+        out[1::2] = p >> 4
+        return out[:n]
+    # general path (bits == 3): expand each byte to its 8 flat bits
+    # LSB-first, keep the first n*bits, regroup into (n, bits) rows,
+    # fold with the powers-of-two weights
+    sh = torch.arange(8, device=p.device)
+    flat = ((p.to(torch.int64).reshape(-1, 1) >> sh) & 1).reshape(-1)
+    flat = flat[: n * bits]
+    weights = torch.tensor([1 << k for k in range(bits)],
+                           device=p.device)
+    return (flat.reshape(n, bits) * weights).sum(dim=-1).to(torch.uint8)
 
 
 # ------------------------------------------------------------ quantizer ----
@@ -464,8 +492,8 @@ class TurboQuant:
             codes = TQCodes(
                 self.kind, self.d, norm,
                 self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
-                _pack_bits_t(idx_lo.to(torch.uint8), self.bits_lo),
-                _pack_bits_t(idx_hi.to(torch.uint8), self.bits_hi),
+                pack_bits_t(idx_lo.to(torch.uint8), self.bits_lo),
+                pack_bits_t(idx_hi.to(torch.uint8), self.bits_hi),
                 self.seed)
         if self.qjl:
             self._attach_qjl(codes, x32)
@@ -572,7 +600,7 @@ class TurboQuant:
         # the packed per-channel mask, legacy layout EXACT: numpy
         # packbits' default bitorder='big' — channel 0 is the MSB of byte
         # 0, tail zero-padded to whole bytes (the dequant-side unpackbits
-        # reader is MSB-first). Deliberately NOT _pack_bits_t's
+        # reader is MSB-first). Deliberately NOT pack_bits_t's
         # little-endian index stream — a different fixture, a different
         # layout.
         mbits = mask_ch.to(torch.uint8)
@@ -601,7 +629,16 @@ class TurboQuant:
                 f"TurboQuant({self.kind}): outlier-partition codes without a "
                 f"mask/group — corrupted serialization?")
         n_ch = self.d // int(codes.group)
-        bits_ = np.unpackbits(np.ascontiguousarray(codes.mask, dtype=np.uint8))
+        # W20.3.3 owns the full rewrite — mechanical swap of the numpy
+        # unpackbits reader (MSB-first, bitorder='big' — the mask
+        # fixture layout, NOT pack_bits_t's little-endian index
+        # stream): torch shift/mask expansion into the byte-identical
+        # 0/1 uint8 bit vector, then numpy for the legacy readers below
+        # (codes.mask is a torch uint8 tensor per TQCodes rev-1).
+        m_t = codes.mask.to(torch.uint8).reshape(-1)
+        bits_ = ((m_t.reshape(-1, 1)
+                  >> torch.arange(7, -1, -1, device=m_t.device)) & 1) \
+            .reshape(-1).to(torch.uint8).cpu().numpy()
         if bits_.shape[0] < n_ch:
             raise ValueError(
                 f"TurboQuant({self.kind}): mask covers {bits_.shape[0]} "
@@ -785,8 +822,10 @@ class TurboQuant:
         q = self._route_for(codes)
         if q is not self:
             return q._dequant_mse(codes, dtype)
-        idx_lo = unpack_bits(codes.idx_lo, codes.bits_lo, codes.n_lo)
-        idx_hi = unpack_bits(codes.idx_hi, codes.bits_hi, codes.n_hi)
+        # W20.3.3 owns the full rewrite
+        idx_lo = unpack_bits_t(codes.idx_lo, codes.bits_lo, codes.n_lo)
+        # W20.3.3 owns the full rewrite
+        idx_hi = unpack_bits_t(codes.idx_hi, codes.bits_hi, codes.n_hi)
         y = np.empty(self.d, dtype=np.float32)
         y[: codes.n_lo] = self._cb_lo.centroids[idx_lo]
         y[codes.n_lo:] = self._cb_hi.centroids[idx_hi]
