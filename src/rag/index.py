@@ -477,6 +477,36 @@ class ChunkVectorLoader:
         """The §4 retrieval-vector length (sum of S + M1 + M2 unit dims)."""
         return self._dims
 
+    @property
+    def device(self) -> torch.device:
+        """W20.13.2: the loader's working device — the CORPUS side's
+        answer to "which device do we score on". The codes' device (the
+        reset point's own units, probed cheaply — metadata only, no
+        dequant, no sync): the npz disk edge (from_arrays) is CPU today,
+        so this is CPU for every on-disk corpus, and a future
+        CUDA-resident loader reports CUDA. vector()/delta_vector()
+        reconstruct on the same device (the docstrings' "on the codes'
+        device"), so rerank's query hop targets THIS device — the ONE
+        small operand moves, never the candidate stream. A
+        mixed-device reset point (never producible by from_arrays)
+        refuses loudly: never a silent cross-device fallback."""
+        devs = {c.device for c in self.system.s_codes.values()}
+        for c in (self.system.m1_codes, self.system.m2_codes):
+            if c is not None:
+                devs.add(c.device)
+        if not devs:
+            raise RuntimeError(
+                "ChunkVectorLoader.device: the reset point carries no "
+                "codes — a corrupt system_state.npz (the ingest driver "
+                "always writes S layers)")
+        if len(devs) > 1:
+            raise RuntimeError(
+                f"ChunkVectorLoader.device: the reset point's units sit "
+                f"on mixed devices {sorted(str(d) for d in devs)} — "
+                f"refusing to pick one silently (TQCodes.to(device) is "
+                f"the caller's move)")
+        return devs.pop()
+
     def chunk_ids(self) -> List[int]:
         """All ingested chunk ids, ascending (the iter_vectors order)."""
         return sorted(self._chunks)
@@ -825,7 +855,12 @@ class RetrievalFrame:
     def check_loader(self, loader: "ChunkVectorLoader") -> None:
         """Loud frame-vs-corpus guards: dims and the reset-point reference
         (a re-ingestion with a different system prompt must invalidate the
-        frame, not silently mis-center every query)."""
+        frame, not silently mis-center every query). W20.13.2 adds the
+        device belt: the frame's vectors and the loader's codes must be
+        co-resident — rerank centers the query on the FRAME's device and
+        scores the LOADER's candidates, so a frame/corpus device split
+        would otherwise fail at the first dot with an anonymous
+        cross-device error instead of this named one."""
         if int(self.dims) != int(loader.dims):
             raise ValueError(
                 f"RetrievalFrame: dims {self.dims} != the corpus's "
@@ -837,6 +872,16 @@ class RetrievalFrame:
                 f"corpus's {ref!r} — the reset point changed after the "
                 f"frame was built; re-run run_index.py (the centering is "
                 f"meaningless against a foreign zero point)")
+        loader_dev = getattr(loader, "device", None)
+        if loader_dev is not None and self.sys_vector.device != loader_dev:
+            raise ValueError(
+                f"RetrievalFrame: the frame's vectors sit on "
+                f"{self.sys_vector.device} but the corpus's codes sit on "
+                f"{loader_dev} — a frame/corpus device split; rebuild "
+                f"the frame on the corpus's device "
+                f"(build_retrieval_frame does this by construction; a "
+                f"loaded frame may need its vectors moved with the "
+                f"TQCodes.to(device) discipline)")
 
 
 def build_retrieval_frame(loader: "ChunkVectorLoader",
@@ -1322,6 +1367,20 @@ def rerank(loader, query_vector, candidate_ids,
     if frame is not None:
         frame.check_loader(loader)
         q = frame.center_query(q)
+    else:
+        # W20.13.2 — the ONE query hop: the candidates define the
+        # working device (the loader's own .device — metadata only,
+        # no dequant), and the query is the single small operand, so
+        # IT hops there once instead of every torch.dot raising
+        # cross-device (the box's live-model CUDA query against the
+        # npz-edge CPU corpus — the W20.4.3 regression a CUDA-less
+        # dev box could never surface). A loader without .device
+        # (the tests' torch-typed mock loaders) keeps q where it is —
+        # the per-candidate belt below aligns the OTHER side there
+        # (test-scale cost; the real path's belt is a no-op).
+        target = getattr(loader, "device", None)
+        if target is not None and q.device != target:
+            q = q.to(target)
     qn = torch.linalg.vector_norm(q)
     if qn == 0.0 and frame is not None:
         raise ValueError(
@@ -1371,6 +1430,13 @@ def rerank(loader, query_vector, candidate_ids,
                 f"the query's ({q.shape[0]},) — frame drift between the "
                 f"loader and the query")
         v = v.to(torch.float32)
+        # W20.13.2 belt: the candidate lands on q's device — a NO-OP
+        # on the real path (the query hop / the frame belt already
+        # aligned them; torch.Tensor.to returns self when device AND
+        # dtype already match); the device-less mock loaders align
+        # here, one small test-scale tensor at a time.
+        if v.device != q.device:
+            v = v.to(q.device, torch.float32)
         vn = torch.linalg.vector_norm(v)
         if not torch.isfinite(vn):
             raise ValueError(
