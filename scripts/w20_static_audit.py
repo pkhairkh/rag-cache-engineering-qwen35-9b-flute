@@ -586,7 +586,51 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.5.6 —"},
         {"kind": "git_tag", "target": "w20-wave-5"},
     ],
-    # W20.6 … W20.12 — appended by each wave's close-out task.
+    # W20.6 — debug twins + canary/trap builds (appended at W20.6.4)
+    "W20.6": [
+        # W20.6.1 — the scalar debug twins
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "tq_debug_fht_large_forward"},
+        {"kind": "grep", "target": "src/flute_extended/src/bindings.cpp",
+         "pattern": "tq_debug"},
+        # W20.6.2 — canary/trap variants
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "FLUTE_TQ_CANARY"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "FLUTE_TQ_TRAP"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "#ifdef"},
+        {"kind": "exists", "target": "scripts/gpu/w20_build_variants.sh",
+         "executable": True},
+        # W20.6.3 — the CUDA-gated fht_large suite
+        {"kind": "exists", "target":
+         "src/rag/tests/w20/test_w20_fht_large.py"},
+        {"kind": "grep", "target":
+         "src/rag/tests/w20/test_w20_fht_large.py",
+         "pattern": "def test_"},
+        {"kind": "grep", "target":
+         "src/rag/tests/w20/test_w20_fht_large.py",
+         "pattern": "_gpu_guard"},
+        {"kind": "grep", "target":
+         "src/rag/tests/w20/test_w20_fht_large.py",
+         "pattern": "allow_module_level"},
+        {"kind": "py_compile", "target":
+         "src/rag/tests/w20/test_w20_fht_large.py"},
+        # W20.6.4 — the harness gates G20.P2 + G20.6
+        {"kind": "grep", "target": "scripts/gpu/w20_gates.py",
+         "pattern": "gate_g20_p2|gate_g20_6"},
+        {"kind": "grep", "target": "scripts/gpu/w20_gates.py",
+         "pattern": "NOT-AUTHORED-YET"},
+        {"kind": "py_compile", "target": "scripts/gpu/w20_gates.py"},
+        # W20.6.6 — wave close: ledger + git facts
+        {"kind": "ledger", "target": "W20.6"},
+        {"kind": "git_log", "target": "W20.6.1 —"},
+        {"kind": "git_log", "target": "W20.6.2 —"},
+        {"kind": "git_log", "target": "W20.6.3 —"},
+        {"kind": "git_log", "target": "W20.6.4 —"},
+        {"kind": "git_tag", "target": "w20-wave-6"},
+    ],
+    # W20.7 … W20.12 — appended by each wave's close-out task.
 }
 
 

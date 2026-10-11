@@ -349,3 +349,28 @@ FLUTE_CUDA_ARCHES=86, then G20.P2 (W20.6) is the differential
 authority. Tier-G: G20.P2's twins land in W20.6 (this wave closed on
 Tier-D only — noted in the ledger). Attestation truthful. Next:
 W20.6 — the debug twins + canary/trap builds + the K2 gates.
+
+## W20.6 — K2 COMPLETE: the twins, the negative controls, the gates (CLOSED 2026-10-11)
+
+The differential surfaces: the scalar debug twins
+(tq_debug_fht_large_forward/backward — flat pair loops in the kernels'
+exact enumeration order, the G20.P2 references); the canary/trap
+build variants (the backward's coverage armed — the 5.3 ledger note
+closed; `scripts/gpu/w20_build_variants.sh`: env-macro variant builds
+with .so artifacts set aside and production restored bit-exact from
+backup); the CUDA-gated suite (test_w20_fht_large.py: 5 tests —
+ladder parity vs twin+reference, run-to-run determinism, the
+refusals, canary zero-poison + trap-must-fail via fresh-subprocess
+variant probes).
+
+G20.P2 + G20.6 are AUTHORED — PENDING: the harness's gate_g20_p2
+(per-rung twin+reference parity + per-rung run-to-run determinism +
+the refusals) and gate_g20_6 (canary zero-poison; trap must fail;
+absent variants = honest FAIL with the build pointer — a gate is
+never skippable). **The box runs G20.P2 + G20.6 after building the
+variants** (`bash scripts/gpu/w20_build_variants.sh canary` then
+`trap`, then `--gates G20.P2,G20.6`).
+
+Wave DoD: Tier-D 20/20 post-tag; attestation truthful. K2 is
+complete. Next: W20.7 — tq_quant_batched (K3, THE wave: the fused
+encode kernel).
