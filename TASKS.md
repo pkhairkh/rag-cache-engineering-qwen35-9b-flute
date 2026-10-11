@@ -824,7 +824,17 @@ DO-D: `rg "fht_forward_large|fht_backward_large" bindings.cpp` hit;
 COMMIT: "W20.5.4 — bindings + build registration for kernel_tq.cu"
 
 #### W20.5.5 — fht.py wrapper + the eligibility table extension
-- [ ] done
+- [x] done
+Three bands landed: K≤16,384 single-block VERBATIM (segments serve the
+24,576 conv window — untouched, verified); 16,384<K≤2^22 pow2 →
+fht_large when the built extension exposes the names (lazy
+_large_kernel_available, the _awq convention; explicit kernel+old
+build → the loud refusal, "rebuild to gain them"); everything else →
+auto reference / explicit loud refusal. NOTE: the pre-W20 file
+silently fell back for kernel+ineligible K (its comment claimed
+validation); the refusal makes that literal truth — no in-repo
+consumer passes backend="kernel" (verified). fht.py +94/0 purely
+additive; kernel_fht.cu empty-diff verified (the auditor's git fact).
 ROLE task-writer · READ `fht.py:314-430` (kernel_available, the
 dispatch + _kernel_eligible :355, fht_apply :434), `:561-640`
 (fht_adjoint) · WRITE `src/flute_extended/fht.py`

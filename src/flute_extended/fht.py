@@ -335,6 +335,32 @@ def _resolve_backend(backend: FhtBackend, x: torch.Tensor) -> str:
                 "(not built, or the input is not on CUDA). Rebuild with "
                 "`cd flute_extended && python setup.py build_ext --inplace`, "
                 "or use backend='auto'/'reference'. Never a silent fallback.")
+        # W20.5.5: the explicit kernel backend is also K-validated HERE -
+        # this branch is reachable only when the caller asked for
+        # "kernel" (auto never enters it), which makes the "kernel mode
+        # is validated above" note in _raw_kernel_apply literal truth.
+        # Ineligible K (the eligibility table: _kernel_eligible /
+        # _kernel_eligible_large) refuses loudly instead of the old
+        # silent reference fallback; the message names the large-kernel
+        # availability state.
+        K = int(x.shape[-1])
+        if not _kernel_eligible(K) and not (_kernel_eligible_large(K)
+                                            and _large_kernel_available()):
+            large_state = ("present" if _large_kernel_available()
+                           else "NOT present (an older extension - "
+                                "rebuild to gain them)")
+            raise RuntimeError(
+                f"fht(backend='kernel'): K={K} is outside the CUDA "
+                "kernels' eligibility table. The single-block kernel "
+                "serves 32 <= K <= 65504 with K % 32 == 0 and every "
+                "descending segment <= 16384 (the conv window 24576 = "
+                "16384 + 8192 qualifies); the large kernel serves "
+                "power-of-two K in [32768, 4194304] (2^15..2^22). The "
+                "large-kernel bindings fht_forward_large / "
+                f"fht_backward_large are {large_state}. Rebuild with "
+                "`cd flute_extended && python setup.py build_ext "
+                "--inplace`, or use backend='auto'/'reference'. Never "
+                "a silent fallback.")
         return "kernel"
     # auto: use kernel for CUDA tensors
     if x.is_cuda and _load_kernel() is not None:
@@ -364,6 +390,60 @@ def _kernel_eligible(K: int) -> bool:
     return all(b <= _MAX_KERNEL_SEGMENT for _, b in segments(K))
 
 
+# ---------------------------------------------------------------------------
+# THE ELIGIBILITY TABLE (W20.5.5) - three K bands, one routing decision
+# ---------------------------------------------------------------------------
+# Band 1 - K <= 16,384: the EXISTING single-block kernel, VERBATIM (the
+#   dispatch lines in _raw_kernel_apply untouched; the auditor diffs
+#   kernel_fht.cu to prove the kernel side byte-identical). This band
+#   includes the segmented conv window: K = 24,576 (the "2 x 12,288"
+#   conv fold) decomposes to 16,384 + 8,192 - every segment fits one
+#   64 KiB tile, so segments(K) drives the existing kernel's
+#   per-segment loop exactly as before. UNTOUCHED.
+# Band 2 - K > 16,384 and a power of two in [2^15, 2^22] (K % 32 == 0
+#   by construction): the large pair C.fht_forward_large /
+#   C.fht_backward_large - 13 tile-local stages (2*len_ <= 8,192) plus
+#   the cross-tile global passes, per the contract in
+#   include/flute/fht_large.cuh (kernels: src/kernel_tq.cu; bindings:
+#   src/bindings.cpp) - WHEN the built extension exposes the two names.
+#   An older (pre-W20.5) build lacks them: auto mode keeps the torch
+#   reference; the explicit backend="kernel" request is refused loudly
+#   in _resolve_backend, the message naming the large-kernel
+#   availability state.
+# Band 3 - everything else (non-pow2 past the tile, K % 32 != 0, K
+#   beyond 2^22): no CUDA kernel path. Auto: the torch reference (the
+#   fallback _raw_kernel_apply has always had). Explicit
+#   backend="kernel": the loud refusal.
+# NOTE: the _MAX_KERNEL_SEGMENT paragraph above predates W20.5.5 - of
+# the "larger FIRST segments" it sends to the reference, the
+# power-of-two 2^15..2^22 subset now routes to Band 2 when built.
+_LARGE_K_MIN = 1 << 15   # 32768: the first single-segment K past the 16384-fp32 tile
+_LARGE_K_MAX = 1 << 22   # 4194304: the contract's top target shape
+
+
+def _kernel_eligible_large(K: int) -> bool:
+    """The fht_large dispatch contract: a single power-of-two segment in
+    [2^15, 2^22] - K > 16,384, K % 32 == 0 by construction (the contract
+    header include/flute/fht_large.cuh). Examples: 32,768; 524,288
+    (2^19); 4,194,304 (2^22) -> eligible. 24,576 -> NOT large (Band 1:
+    16,384 + 8,192 segments); 40,960 -> NOT large (non-pow2, Band 3).
+    Disjoint from _kernel_eligible by construction (2^15 >
+    _MAX_KERNEL_SEGMENT), so the two predicates never both fire."""
+    return _LARGE_K_MIN <= K <= _LARGE_K_MAX and (K & (K - 1)) == 0
+
+
+def _large_kernel_available() -> bool:
+    """True when the built extension exports the W20.5 large-K pair
+    fht_forward_large / fht_backward_large. An older extension lacks
+    the names: the large band stays on the torch reference in auto mode
+    - a performance fallback, never a correctness one (the loud refusal
+    on the explicit kernel backend is _resolve_backend's job; the
+    _awq_kernel_available convention, applied to the large pair)."""
+    C = _load_kernel()
+    return C is not None and hasattr(C, "fht_forward_large") \
+        and hasattr(C, "fht_backward_large")
+
+
 def _raw_kernel_apply(x2d: torch.Tensor, signs: torch.Tensor,
                       transpose: bool) -> torch.Tensor:
     """2-D contiguous dispatch to the extension (forward or adjoint)."""
@@ -371,6 +451,20 @@ def _raw_kernel_apply(x2d: torch.Tensor, signs: torch.Tensor,
     assert C is not None
     K = int(x2d.shape[1])
     if not _kernel_eligible(K):
+        # Band 2 (W20.5.5): a power-of-two K past one shared-memory tile
+        # routes to the fht_large pair when the built extension exposes
+        # the bindings (13 tile-local stages + cross-tile passes - the
+        # include/flute/fht_large.cuh contract). An older build lacks
+        # the names and falls through to the reference below (auto mode
+        # only - the explicit backend="kernel" case was already refused
+        # in _resolve_backend, which K-validates before dispatch).
+        if _kernel_eligible_large(K) and _large_kernel_available():
+            signs_f = signs if (signs.is_cuda and signs.dtype == torch.float32
+                                and signs.is_contiguous()) else \
+                signs.detach().to(x2d.device, torch.float32).contiguous()
+            if transpose:
+                return C.fht_backward_large(x2d, signs_f)
+            return C.fht_forward_large(x2d, signs_f)
         # the kernel's segment table + thread geometry + shared-memory tile
         # contract; fall to the reference rather than refusing (auto mode
         # only reaches here for K the kernel cannot tile; "kernel" mode is
