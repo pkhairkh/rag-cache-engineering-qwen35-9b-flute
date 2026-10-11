@@ -48,6 +48,15 @@ reused verbatim on the GPU box.
 
 Cache layout: <this dir>/codebooks/cb_b{bits}_d{d}.npz with keys
 bits, d, centroids, boundaries, mse_per_variance.
+
+OFFLINE-NUMPY-ISLAND
+--------------------
+The Lloyd-Max solve + quadrature is offline authoring: solved once per
+(b, d) in numpy and cached to disk (npz), per PROPOSAL.md rev 2 — it is
+NEVER runtime math. Runtime consumers receive torch tensors, not numpy
+tables: `Codebook.device_tensors` / `get_codebook(bits, d, device=...)` ->
+`DeviceCodebook`. The module-level torch import exists solely for that
+mirror; no solve-path function references it.
 """
 from __future__ import annotations
 
@@ -56,9 +65,12 @@ import os
 from dataclasses import dataclass
 
 import numpy as np
+import torch  # runtime device mirror only — never referenced by the solve path
 
 __all__ = [
     "Codebook",
+    "CodebookTensors",
+    "DeviceCodebook",
     "solve_codebook",
     "get_codebook",
     "load_codebook",
@@ -231,6 +243,20 @@ class Codebook:
         """uint8 cell indices -> centroid values (float32)."""
         return self.centroids[np.asarray(idx)]
 
+    def device_tensors(
+        self, device: str | torch.device = "cpu"
+    ) -> CodebookTensors:
+        """(boundaries, centroids) as float32 torch tensors on `device`.
+
+        The runtime half of the OFFLINE-NUMPY-ISLAND boundary: the tables
+        were solved offline in numpy; this mirrors them to torch and caches
+        the pair in the module-level `_DEVICE_TENSOR_CACHE` registry (key
+        design documented there), so repeated calls for the same codebook
+        and device are a free cache hit. The numpy fields above are left
+        untouched — the solve path never sees torch.
+        """
+        return _device_tensors(self, device)
+
 
 def solve_codebook(bits: int, d: int, iters: int = 500, tol: float = 1e-12) -> Codebook:
     """Solve the Lloyd-Max quantizer of the sphere-coordinate density.
@@ -336,13 +362,33 @@ def solve_codebook(bits: int, d: int, iters: int = 500, tol: float = 1e-12) -> C
     )
 
 
-def get_codebook(bits: int, d: int, cache_dir: str | None = None) -> Codebook:
+def get_codebook(
+    bits: int,
+    d: int,
+    cache_dir: str | None = None,
+    device: str | torch.device | None = None,
+) -> Codebook | DeviceCodebook:
     """Return the (bits, d) codebook, solving and caching it if needed.
 
     `cache_dir` defaults to `<this module's dir>/codebooks` (the committed
     artifact directory). Cache files are cb_b{bits}_d{d}.npz with keys
     bits, d, centroids, boundaries, mse_per_variance. Deterministic: a cache
     hit returns exactly what solve_codebook would produce.
+
+    `device` (W20.2.2; appended AFTER `cache_dir` so every existing call —
+    positional (bits, d) or keyword cache_dir=... — behaves exactly as
+    before):
+
+      * None (default): the legacy behavior — returns the numpy Codebook
+        unchanged (offline-island tables; np.searchsorted, digests,
+        snapshot).
+      * "cpu" / "cuda" / a torch.device: returns a DeviceCodebook — the
+        thin runtime mirror whose `.boundaries` / `.centroids` are float32
+        torch tensors on that device (built once from the solved numpy
+        tables, registry-cached in _DEVICE_TENSOR_CACHE) with the scalar
+        metadata (bits, d, mse_per_variance) forwarded. This is the surface
+        the W20.3 turboquant rewrite consumes; runtime math never re-enters
+        the numpy island.
     """
     bits, d = _validate_bits_d(bits, d)
     cdir = str(CACHE_DIR if cache_dir is None else os.fspath(cache_dir))
@@ -354,7 +400,7 @@ def get_codebook(bits: int, d: int, cache_dir: str | None = None) -> Codebook:
                 f"cache file {path} holds (bits={cb.bits}, d={cb.d}) but "
                 f"(bits={bits}, d={d}) was requested"
             )
-        return cb
+        return _with_device(cb, device)
     cb = solve_codebook(bits, d)
     os.makedirs(cdir, exist_ok=True)
     np.savez(
@@ -365,7 +411,7 @@ def get_codebook(bits: int, d: int, cache_dir: str | None = None) -> Codebook:
         boundaries=cb.boundaries,
         mse_per_variance=np.float64(cb.mse_per_variance),
     )
-    return cb
+    return _with_device(cb, device)
 
 
 def load_codebook(path: str) -> Codebook:
@@ -409,3 +455,165 @@ def load_codebook(path: str) -> Codebook:
     return Codebook(
         bits=bits, d=d, centroids=centroids, boundaries=boundaries, mse_per_variance=mse
     )
+
+
+# --------------------------------------------------------------------------- #
+# Runtime device mirror — the torch side of the OFFLINE-NUMPY-ISLAND boundary
+# --------------------------------------------------------------------------- #
+# Everything above this banner (solve, quadrature, npz cache IO) is the
+# documented numpy island: offline authoring, executed once per (b, d),
+# cached to disk — per PROPOSAL.md rev 2 it is never runtime math. Everything
+# below is the W20.2.2 runtime mirror: device consumers receive float32 torch
+# tensors built from the solved tables.
+
+
+@dataclass(frozen=True)
+class CodebookTensors:
+    """A Codebook's tables mirrored to torch: float32, device-resident.
+
+    Attributes:
+        boundaries: shape (2**bits - 1,), ascending Voronoi edges — ready
+            for torch.searchsorted (the encode side).
+        centroids:  shape (2**bits,), ascending, symmetric +/- — ready for
+            LUT gather, centroids[idx] (the decode side).
+
+    Immutable by convention: the numpy source tables are frozen-dataclass
+    fields produced by a deterministic solve, and the CPU mirror shares
+    their memory (torch.as_tensor zero-copy) — neither side is ever written.
+    """
+
+    boundaries: torch.Tensor
+    centroids: torch.Tensor
+
+    @property
+    def device(self) -> torch.device:
+        """The device both mirrored tables live on."""
+        return self.boundaries.device
+
+
+# Module-level registry of mirrored tensor pairs (W20.2.2). Key:
+#     (bits, d, str(torch.device(device)), id(boundaries_array))
+# — the id() of the underlying numpy boundaries table is part of the key so
+# a re-solved / re-loaded codebook (fresh numpy tables) can never be served
+# a stale tensor pair, while re-mirroring the same Codebook on the same
+# device is a free cache hit. Entries are tiny (<= 31 float32 values), and a
+# new array identity supersedes (drops) older entries with the same (bits,
+# d, device) — repeated get_codebook(..., device=...) calls each produce
+# fresh numpy tables (every disk load allocates anew), so without this the
+# registry would grow per call. Thread-safety is not required (plain dict).
+_DEVICE_TENSOR_CACHE: dict[tuple, CodebookTensors] = {}
+
+
+def _device_tensors(
+    cb: Codebook, device: str | torch.device | None = "cpu"
+) -> CodebookTensors:
+    """Build (or fetch from the registry) cb's torch mirror for `device`.
+
+    torch.as_tensor(np.ascontiguousarray(...), dtype=float32, device=...)
+    shares memory with the numpy table on CPU (zero copy) and copies when
+    the target device differs — both fine for these immutable tables.
+    """
+    dev = torch.device("cpu") if device is None else torch.device(device)
+    key = (cb.bits, cb.d, str(dev), id(cb.boundaries))
+    hit = _DEVICE_TENSOR_CACHE.get(key)
+    if hit is not None:
+        return hit
+    tensors = CodebookTensors(
+        boundaries=torch.as_tensor(
+            np.ascontiguousarray(cb.boundaries), dtype=torch.float32, device=dev
+        ),
+        centroids=torch.as_tensor(
+            np.ascontiguousarray(cb.centroids), dtype=torch.float32, device=dev
+        ),
+    )
+    stale = [k for k in _DEVICE_TENSOR_CACHE if k[:3] == key[:3] and k[3] != key[3]]
+    for k in stale:
+        del _DEVICE_TENSOR_CACHE[k]  # latest array identity wins
+    _DEVICE_TENSOR_CACHE[key] = tensors
+    return tensors
+
+
+class DeviceCodebook:
+    """THE runtime codebook surface for device consumers (W20.3+).
+
+    A thin immutable view over one solved numpy Codebook mirrored to a torch
+    device: `get_codebook(bits, d, device=...)` returns THIS object; the
+    legacy `get_codebook(bits, d)` (device=None default) keeps returning the
+    numpy Codebook, exactly as before.
+
+    Surface (what the W20.3 turboquant rewrite consumes):
+        boundaries        float32 torch tensor, (2**bits - 1,) — searchsorted
+        centroids         float32 torch tensor, (2**bits,)     — LUT gather
+        bits, d           scalar metadata (ints)
+        mse_per_variance  scalar metadata (float)
+        tensors           the cached CodebookTensors pair
+        device            the torch.device both tables live on
+        numpy_codebook    the offline-island original (digest/snapshot edge)
+
+    encode/decode are deliberately NOT mirrored here: their torch-native
+    implementation (searchsorted tie parity, the boundary-scaling identity)
+    belongs to the W20.3 rewrite of turboquant.py, which consumes this view.
+    """
+
+    __slots__ = ("_numpy", "_tensors")
+
+    def __init__(self, cb: Codebook, tensors: CodebookTensors) -> None:
+        self._numpy = cb
+        self._tensors = tensors
+
+    @classmethod
+    def from_codebook(
+        cls, cb: Codebook, device: str | torch.device | None = "cpu"
+    ) -> DeviceCodebook:
+        """Mirror `cb` to `device` (registry-cached) and wrap the result."""
+        return cls(cb, cb.device_tensors(device))
+
+    # -- scalar metadata, forwarded from the solved Codebook ---------------- #
+    @property
+    def bits(self) -> int:
+        return self._numpy.bits
+
+    @property
+    def d(self) -> int:
+        return self._numpy.d
+
+    @property
+    def mse_per_variance(self) -> float:
+        return self._numpy.mse_per_variance
+
+    # -- the mirrored tables: torch, device-resident ------------------------ #
+    @property
+    def boundaries(self) -> torch.Tensor:
+        return self._tensors.boundaries
+
+    @property
+    def centroids(self) -> torch.Tensor:
+        return self._tensors.centroids
+
+    @property
+    def tensors(self) -> CodebookTensors:
+        return self._tensors
+
+    @property
+    def device(self) -> torch.device:
+        return self._tensors.device
+
+    @property
+    def numpy_codebook(self) -> Codebook:
+        return self._numpy
+
+    def __repr__(self) -> str:
+        return (
+            f"DeviceCodebook(bits={self._numpy.bits}, d={self._numpy.d},"
+            f" device={self._tensors.device})"
+        )
+
+
+def _with_device(
+    cb: Codebook, device: str | torch.device | None
+) -> Codebook | DeviceCodebook:
+    """get_codebook's device router: device=None -> the legacy numpy
+    Codebook, unchanged; anything else -> the DeviceCodebook mirror."""
+    if device is None:
+        return cb
+    return DeviceCodebook.from_codebook(cb, device)

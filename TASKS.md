@@ -309,7 +309,13 @@ COMMIT: "W20.2.1 — TQCodes torch-native (device tensors; numpy only at
 the npz edge)"
 
 #### W20.2.2 — codebooks mirrored to device tensors
-- [ ] done
+- [x] done
+Mirror surface landed (W20.3 consumes): `DeviceCodebook` view class —
+`get_codebook(bits, d, cache_dir=None, device=None)`; device=None →
+legacy numpy Codebook byte-identical; device set → `.boundaries`/
+`.centroids` float32 torch tensors + `.numpy_codebook` (the island
+original). `device` is keyword-appended AFTER cache_dir (positional-3rd
+callers unaffected; W20.3 passes device= by keyword).
 ROLE task-writer · READ `src/rag/codebooks.py:1-260` (the Codebook
 class :200, the offline solve, the disk cache) · WRITE
 `src/rag/codebooks.py`
