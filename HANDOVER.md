@@ -583,3 +583,107 @@ addressing):**
 
 File the [6] ladder + the [3.5] data lines verbatim; the next wave
 starts from those rows.
+
+## W21.6 — the box-run repair: what the 17 failures + the [2] crash were (2026-10-12)
+
+**Your pasted run, decomposed.** The suite read 17 failed / 258 passed /
+3 skipped / 1 error, and the finetune died at `[2] prefill_system` with
+`NotImplementedError: Cannot copy out of meta tensor; no data!` — before
+a single training step. Three distinct mechanics bugs, **none of them
+the content-addressing kernel** (w21a/b/c/e/f — order invariance, the
+kernel contrast, the pedestal removal, per-head gates, the decode
+freeze — all PASSED on your box; the architecture is behaving exactly
+as designed):
+
+1. **P0 — the meta mix (the crash, 5 test failures + 1 error + the
+   finetune [2] abort).** `from_pretrained(low_cpu_mem_usage)` builds
+   the model inside accelerate's meta-device context. The M1/M2 gates
+   are real parameters, so the checkpoint loader's missing-key re-init
+   materializes them — but the W21 sign-mixing master is a PLAIN
+   attribute (deliberately never a buffer, so it stays out of
+   state_dict), and a plain attribute is invisible to that re-init: it
+   stayed a meta tensor with no data, and the first content write
+   crashed trying to copy out of it. **Fix:** `_get_mix` now detects a
+   meta-born master and rebuilds it from the Sylvester recursion — a
+   pure function of the geometry, bit-identical to what a normally
+   constructed module holds. The state_dict contract (exactly the 3
+   gates) is untouched.
+
+2. **P1 — CUDA scatter nondeterminism (9 test failures, including the
+   ones whose tensors "looked equal" in the pytest diff).** The content
+   scatter used `torch.index_add`, which accumulates through atomic
+   adds on CUDA — the accumulation ORDER is run-to-run nondeterministic
+   as soon as ≥3 rows collide on one slot, and the content mode's
+   κ-block collisions are ~8-deep at the test geometry (mem 8, κ=4).
+   Consequences you saw: `write != write_deltas` (bit-exactness
+   contracts w18f_1/w21g), three replays of the same calls producing
+   different states (w19f_5b), memopt-vs-plain forward/grad mismatches
+   (w18f_2/3/5), two fresh modules disagreeing (w21h), the quant-store
+   composability breaking (d6), and `w17f_2`'s replay-vs-cache rel-MSE
+   blowing out to 0.4630 vs the 0.12 budget — 1-ulp pre-quant
+   differences flipping 3.5-bit quantization buckets. (The v1
+   positional path never hit this: at T ≤ 2·mem its slots hold ≤2
+   tokens, and two-term fp addition commutes.) **Fix:** the content
+   scatter is now a fixed-order segment sum — stable-sort the flat
+   (head·mem + slot) indices, form each slot's token sum by an fp32
+   prefix scan differenced at the segment boundaries, and write the
+   per-slot rows with `index_copy` into distinct rows. No atomics
+   anywhere on the value path: write == write_deltas bit-exact,
+   replays bit-identical, the W18 exact-gradient replay contract
+   restored. The mathematical values are the same per-slot sums with
+   fp re-association (verified standalone: ≤1e-5 relative at the
+   production geometry — far inside the 3.5-bit quant noise the cache
+   round-trip already carries).
+
+3. **P2 — authored-test defects (4 more failures).** (a)
+   `epoch_batches` was a bare generator, so its loud refusals never
+   fired at call time — the raise was deferred to the first `next()`
+   (test_w20_15b "DID NOT RAISE"); it is now a plain function that
+   validates eagerly. (b) `float(gk[0].abs())`-style idioms crash on
+   the new (L, H) gate rows (w18f_3's assert message, w19f_3, w19f_8) —
+   the row magnitude is `.abs().max()`. (c) test_w21d's key
+   construction crashed (`.view(1, H, 1, D)` demands 64 elements from
+   a 16-element key) — the key now broadcasts through `(1, 1, 1, D)`,
+   and its "independent keys" bound was a coin flip (0.23 expected vs
+   the 0.25 bound at the any-of-κ statistic) — widened to 0.35 with
+   the derivation in the docstring.
+
+**The box sequence (unchanged commands — no rebuild, the wave touches
+no CUDA):**
+
+```
+cd /home/ubuntu/RAGGA
+git pull --ff-only origin main          # >= W21.6
+source /home/ubuntu/venv/bin/activate
+python3 -m pytest src/rag/tests -q      # expect the suite back to green
+                                         # (260 + the W21 gates; w17f_2's
+                                         # rel-MSE should return to its
+                                         # round-trip level, well under
+                                         # the 0.12 budget)
+
+# then THE W21 RUN — verbatim the same command as before:
+python3 scripts/gpu/finetune_m1m2.py \
+    --pairs-file data/pairs.jsonl \
+    --gates-out m1m2_gates_trained.npz \
+    --m1m2-mem-size 1024 \
+    --max-steps 300 \
+    --refresh-every 4 \
+    --gate-init 0.1
+```
+
+**What to expect now that the run can actually start:** the training
+mechanics are unchanged from W21's design — the run should complete
+300 steps, the [6] ladder should print its addressing rows (the
+positional v1 row ≈ your old numbers; the content rows' cos(neg)
+collapsing toward ~0 = the pedestal gone; the low-overlap bucket gaps
+going positive = the position lock measured), and the gates artifact +
+history save BEFORE the reports (the OOM can no longer eat them). If
+any single test still fails, file its name + the assertion text
+verbatim — one pinned failure is one fix, not a redesign.
+
+The architectural verdict stands as W21 delivered it: the substantial
+issue was the position-addressed write + the anisotropy pedestal,
+mitigated entirely inside the gates + the global caches (content
+simhash slots, centering, per-(layer, head) gates — Product-Key Memory
+/ Memorizing Transformers lineage; Charikar simhash; Su et al.
+centering), with the v1 regime one flag away for the A/B.

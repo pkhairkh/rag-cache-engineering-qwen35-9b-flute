@@ -122,16 +122,22 @@ state); `push_to_cache` quantize-on-writes through
 — the state the NEXT forward must see (the codes are the persisted
 truth; the cache never holds fp16).
 
-Determinism contract (W21): the slot is a pure function of the input
-k bits — center (fp32) -> fixed Sylvester Hadamard mixing (fp32) ->
-sign bits -> integer slot. The capture/replay pair recomputes it from
-the SAME captured k (bit-identical inputs, same device, same shapes)
-so the W18 exact-gradient replay stays exact: write_deltas reproduces
-the forward's scatter bit-for-bit (shared code). The mixing matrix is
+Determinism contract (W21, hardened W21.6): the slot is a pure
+function of the input k bits — center (fp32) -> fixed Sylvester
+Hadamard mixing (fp32) -> sign bits -> integer slot — and the SCATTER
+is a pure function of the (slots, values) bits: a stable-sort segment
+sum (fixed accumulation order, no atomics on the value path), so
+write_deltas reproduces the forward's delta bit-for-bit and repeated
+replays of the same calls are bit-identical, on any device (the W21.0
+box run measured index_add's atomic-order nondeterminism flipping
+3.5b quant buckets — see _scatter_delta_content). The mixing matrix is
 built from the Sylvester recursion (±1 entries, exact in any dtype) —
 NOT a seeded RNG — so every box derives the same matrix; it is a plain
 attribute, never a registered buffer (it must not enter state_dict or
-the gates artifact; geometry pins it).
+the gates artifact; geometry pins it). Under from_pretrained's meta
+device context the master is born meta (a plain attribute is invisible
+to the missing-key re-init); _get_mix rebuilds it from the recursion —
+bit-identical by construction (W21.6).
 
 Numerics: the softmax read path runs in fp32 (scores scaled by 1/√D
 over the mem dim, per the read contract); the write's centering and
@@ -149,7 +155,8 @@ modes — chunk deltas sum losslessly at install exactly as before.
 Within one call, the v1 positional mode is BIT-exact under regrouping
 (per-slot sums formed before the single gated add); the content mode
 re-groups tokens by content hash instead of position — the same
-per-slot-sum property holds (index_add over the call's tokens), and
+per-slot-sum property holds (a fixed-order segment sum over the call's
+tokens, W21.6), and
 the per-call centering means merging two CALLS into one longer call
 changes each call's own center (call-granular, documented — install
 sums CALL deltas, never merged calls).
@@ -354,11 +361,30 @@ class M1M2(nn.Module):
 
     def _get_mix(self, device) -> torch.Tensor:
         """The (head_dim, next_pow2(head_dim)) sign-mixing on `device`
-        (cached per device; the CPU master is the pinned ±1 truth)."""
+        (cached per device; the CPU master is the pinned ±1 truth).
+
+        W21.6 — THE META SELF-HEAL: `from_pretrained(low_cpu_mem_usage)`
+        constructs the whole model inside accelerate's meta-device
+        context, and the Sylvester master — a PLAIN attribute built from
+        torch.ones/torch.cat in __init__ — comes out as a META tensor
+        with no data (the gates get materialized by the missing-key
+        re-init; a plain attribute is invisible to that path — the
+        W21 box run crashed exactly here, at the first write, in the
+        loader tests AND the finetune driver's [2] prefill_system).
+        The master is a pure function of the geometry (the Sylvester
+        recursion — no RNG), so rebuilding it is bit-identical to what
+        a normally-constructed module holds; the self-heal keeps the
+        state_dict contract (still never a buffer) and the ingest-box/
+        query-box determinism story intact."""
         key = str(device)
         cached = self._mix_dev.get(key)
         if cached is None:
-            cached = self._mix_full.to(device)
+            mix = self._mix_full
+            if mix is None or mix.device.type == "meta":
+                mix = _sylvester_hadamard(
+                    _next_pow2(self.head_dim))[:self.head_dim, :].contiguous()
+                self._mix_full = mix
+            cached = mix.to(device)
             self._mix_dev[key] = cached
         return cached
 
@@ -657,11 +683,38 @@ class M1M2(nn.Module):
     def _scatter_delta_content(self, xc: torch.Tensor, slots: torch.Tensor,
                                state: torch.Tensor) -> torch.Tensor:
         """delta (H, mem, D) in promote(xc, state) — the W21 CONTENT
-        scatter: per (head, block) index_add into the (H·mem, D) flat
-        layout (head_offset + slot), the per-slot token sums formed by
-        index_add exactly as in the positional path. Bit-identical
-        between write and write_deltas (shared code — the W18
-        exactness contract)."""
+        scatter, DETERMINISTIC (W21.6): every (token, block) write is
+        flattened to its (head·mem + slot) index, STABLE-sorted, and
+        each slot's token sum is formed by a fixed-order fp32 prefix
+        scan differenced at the segment boundaries (index_copy into
+        the zeros — one row per distinct slot). Bit-identical between
+        write and write_deltas and across repeated invocations on any
+        device (shared code — the W18 exactness contract).
+
+        WHY NOT index_add (the box's W21 run): torch.index_add on CUDA
+        accumulates through atomics, whose ORDER is run-to-run
+        nondeterministic whenever >= 3 rows collide on one index. The
+        positional v1 path never hits that at T <= 2·mem (<= 2
+        colliders per slot — fp add commutes, bit-stable), but the
+        content mode's kappa-block collisions are unboundedly deep
+        (the box: write != write_deltas, 3 replays of the same calls
+        != themselves, and 1-ulp pre-quant differences flipping 3.5b
+        quant buckets until rel-MSE 0.46 against the 0.12 budget).
+        The per-slot-sum property (spec §2.2 "summing is lossless"
+        within a call) is unchanged — the segment sums are the same
+        mathematical values with fp re-association (documented; the
+        positional path keeps its bit-exact index_add v1 reference).
+
+        Determinism inventory: argsort(stable) orders equal keys by
+        position (documented guarantee); index_select/gather are
+        trivially order-fixed; torch.cumsum is a fixed scan tree for
+        a given shape (not in torch's CUDA nondeterministic set);
+        int64 boundary arithmetic is exact; index_copy targets
+        DISTINCT rows (no atomics anywhere on the value path). The
+        fp32 scan keeps ~4 significant digits above the per-slot sums
+        at every production geometry (kappa·B·H·T <= ~2^18 O(1) rows
+        -> |prefix| <= ~10^3), far inside the 3.5-bit quant noise the
+        cache round-trip already carries."""
         B, H, T, D = xc.shape
         blocks = slots.shape[-1]
         dtype = torch.promote_types(xc.dtype, state.dtype)
@@ -669,11 +722,32 @@ class M1M2(nn.Module):
         head_off = (torch.arange(H, device=xc.device,
                                  dtype=slots.dtype)
                     * self.mem_size).view(1, H, 1)
+        # (blocks · B·H·T,) in (j, n) order — row j·N + n pairs with
+        # src row n (src.repeat tiles exactly that layout)
+        flat_idx = torch.cat([(slots[..., j] + head_off).reshape(-1)
+                              for j in range(blocks)]) \
+            if blocks else torch.zeros(0, dtype=slots.dtype,
+                                       device=xc.device)
+        if flat_idx.numel() == 0:
+            return torch.zeros(H, self.mem_size, D, dtype=dtype,
+                               device=xc.device)
+        src_rep = src.repeat(blocks, 1)
+        # fixed accumulation order: stable sort by slot, then a
+        # prefix-scan segment sum (bit-stable across invocations)
+        order = torch.argsort(flat_idx, stable=True)
+        sidx = flat_idx.index_select(0, order)
+        ssrc = src_rep.index_select(0, order)
+        csum = torch.cumsum(ssrc.to(torch.float32), dim=0)
+        csum0 = torch.cat([torch.zeros(1, D, dtype=csum.dtype,
+                                       device=csum.device), csum], dim=0)
+        uniq, counts = torch.unique_consecutive(sidx, return_counts=True)
+        ends = torch.cumsum(counts, 0)                # exact int64 scan
+        starts = ends - counts
+        seg = csum0.index_select(0, ends) \
+            - csum0.index_select(0, starts)
         delta = torch.zeros(H * self.mem_size, D, dtype=dtype,
                             device=xc.device)
-        for j in range(blocks):
-            idx = (slots[..., j] + head_off).reshape(-1)   # (B·H·T,)
-            delta = torch.index_add(delta, 0, idx, src)
+        delta = torch.index_copy(delta, 0, uniq, seg.to(dtype))
         return delta.view(H, self.mem_size, D)
 
     def _gated_scatter_content(self, xc: torch.Tensor, state: torch.Tensor,

@@ -1023,6 +1023,51 @@ CHECKS = {
         {"kind": "git_log", "target": "W21.5 —"},
         {"kind": "git_tag", "target": "w21-content-addr"},
     ],
+
+    # W21.6 — the box-run repair: the meta-mix self-heal + the
+    # deterministic content scatter (the kernel was right, the
+    # delivery was not)
+    "W21.6": [
+        # the meta self-heal (P0 — the loader/finetune crash)
+        {"kind": "grep", "target": "src/rag/m1m2.py",
+         "pattern": r"mix\.device\.type == \"meta\""},
+        {"kind": "grep", "target": "src/rag/m1m2.py",
+         "pattern": r"def _get_mix"},
+        {"kind": "grep", "target": "src/rag/m1m2.py",
+         "pattern": "META SELF-HEAL"},
+        # the deterministic content scatter (P1 — the index_add atomics)
+        {"kind": "grep", "target": "src/rag/m1m2.py",
+         "pattern": r"torch\.argsort\(flat_idx, stable=True\)"},
+        {"kind": "grep", "target": "src/rag/m1m2.py",
+         "pattern": r"torch\.unique_consecutive\(sidx, return_counts=True\)"},
+        {"kind": "grep", "target": "src/rag/m1m2.py",
+         "pattern": r"torch\.index_copy\(delta, 0, uniq, seg\.to\(dtype\)\)"},
+        {"kind": "grep", "target": "src/rag/m1m2.py",
+         "pattern": "DETERMINISTIC"},
+        {"kind": "py_compile", "target": "src/rag/m1m2.py"},
+        # the eager epoch_batches refusal (P2a — the deferred raise)
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"def _epoch_batches_gen"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"return _epoch_batches_gen\(items, batch, seed\)"},
+        {"kind": "py_compile", "target": "src/rag/m1m2_finetune.py"},
+        # the (L, H) row-magnitude idioms + the w21d broadcast fix (P2b/c)
+        {"kind": "grep", "target": "src/rag/tests/test_w19_finetune.py",
+         "pattern": r"float\(gk\[0\]\.abs\(\)\.max\(\)\)"},
+        {"kind": "grep", "target": "src/rag/tests/test_w18_finetune.py",
+         "pattern": r"\.abs\(\)\.max\(\)\)\}"},
+        {"kind": "grep", "target": "src/rag/tests/test_w21_content_addr.py",
+         "pattern": r"\.view\(1, 1, 1, D\)\.expand\(1, H, 1, D\)"},
+        {"kind": "grep", "target": "src/rag/tests/test_w21_content_addr.py",
+         "pattern": r"hits_ind <= trials \* 0\.35"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_w21_content_addr.py"},
+        # the spec amendment + the wave close
+        {"kind": "grep", "target": "SPECIFICATION.md",
+         "pattern": r"\*\*N7\.3 \(W21\.6\)\.\*\*"},
+        {"kind": "ledger", "target": "W21.6"},
+        {"kind": "git_log", "target": "W21.6 —"},
+        {"kind": "git_tag", "target": "w21-box-repair"},
+    ],
 }
 
 

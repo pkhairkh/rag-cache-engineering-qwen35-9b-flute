@@ -143,7 +143,7 @@ def test_w18f_3_memopt_gradients_exact(model):
     gk_plain, gv_plain, n_plain = _run_path(False)
     gk_opt, gv_opt, n_opt = _run_path(True)
     assert torch.equal(gk_plain, gk_opt), \
-        f"gate_k grads differ: max {float((gk_plain - gk_opt).abs())}"
+        f"gate_k grads differ: max {float((gk_plain - gk_opt).abs().max())}"
     assert torch.equal(gv_plain, gv_opt)
     assert n_plain == n_opt == 2  # ONLY the two write-gate vectors
 

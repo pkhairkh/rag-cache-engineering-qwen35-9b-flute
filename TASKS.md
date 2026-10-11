@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: COMPLETE — 13/13 waves closed (W20.0–W20.12); the post-close box-feedback waves W20.13 (5 tasks) and W20.14 (5 tasks, 2026-10-12) closed on top, the post-finetune-regime wave W20.15 (5 tasks, 2026-10-12) on top of those, and the content-addressing wave W21 (5 tasks, 2026-10-12 — the position-lock + anisotropy-pedestal mitigation, gates + global caches only) on top; all Tier-D DoD green; gates AUTHORED (PENDING box reports by design; §4.1 records the W20.13.4 threshold re-derivation).
+Status: COMPLETE — 13/13 waves closed (W20.0–W20.12); the post-close box-feedback waves W20.13 (5 tasks) and W20.14 (5 tasks, 2026-10-12) closed on top, the post-finetune-regime wave W20.15 (5 tasks, 2026-10-12) on top of those, the content-addressing wave W21 (5 tasks, 2026-10-12 — the position-lock + anisotropy-pedestal mitigation, gates + global caches only) on top, and the box-run repair W21.6 (2026-10-12 — the meta-mix self-heal + the deterministic content scatter; the kernel was right, the delivery was not) on top; all Tier-D DoD green; gates AUTHORED (PENDING box reports by design; §4.1 records the W20.13.4 threshold re-derivation).
 
 ---
 
@@ -2037,6 +2037,65 @@ deferred); if the ladder shows the content rows separating but the
 training spread still flat, the next lever is the LOSS temperature or
 the hard-negative mining, not the architecture.
 
+## WAVE W21.6 — the box-run repair (the W21 delivery was broken, not the
+kernel)
+
+- [x] done
+ROLE orchestrator · CONTEXT the box's first W21 run (the pasted
+HANDOVER): 17 failed / 258 passed / 3 skipped / 1 error AND the
+finetune driver CRASHES at [2] prefill_system — while the W21 kernel
+gates themselves PASSED (w21a/b/c/e/f: order invariance, the kernel
+contrast, the pedestal, per-head gates, decode freeze). Three
+mechanics bugs, none of them the architecture:
+  * P0 — `_get_mix` meta crash: `from_pretrained(low_cpu_mem_usage)`
+    constructs the model inside accelerate's meta-device context; the
+    gates get materialized by the missing-key re-init, the Sylvester
+    master — a PLAIN attribute — stays meta with no data. Fix:
+    `_get_mix` rebuilds it from the recursion (a pure function of the
+    geometry — bit-identical; state_dict still exactly the 3 gates).
+    Restores: the 5 loader-test failures + the error + THE FINETUNE
+    CRASH.
+  * P1 — `torch.index_add` on CUDA accumulates through atomics:
+    run-to-run nondeterministic at >= 3 colliders per index; the
+    content mode's kappa-block collisions are 8-deep at the test
+    geometry. Fix: `_scatter_delta_content` is now a stable-sort
+    segment sum (argsort(stable) -> index_select -> fp32 cumsum ->
+    unique_consecutive boundaries -> index_copy on distinct rows; no
+    atomics on the value path). Restores: write == write_deltas
+    bit-exact (w18f_1, w21g), 3 replays bit-identical (w19f_5b),
+    memopt forward/grad parity (w18f_2/3), the cross-module slots
+    (w21h), the quant-store composability (d6), and w17f_2's
+    replay-vs-cache rel-MSE (the box measured 0.4630 — nondeterminism
+    amplified by 3.5b quant bucket flips against the 0.12 budget).
+    Standalone numpy verification (dev box, no repo imports):
+    scripts/w21_6_segment_check.py — the segment sums equal the
+    reference scatter within fp re-association (f64 ~1e-13; fp32
+    <= 1e-5 at the production geometry — far inside the 3.5-bit
+    quant noise), bit-stable across invocations, the (j, n) flat
+    layout == src.repeat, empty guard, blocks=1 == ordered
+    accumulation.
+  * P2 — test-side + library-side defects the W21.4 authoring pass
+    missed: (a) `epoch_batches` was a bare generator — the refusal
+    body never ran at call time (test_w20_15b DID NOT RAISE); now a
+    plain function that validates eagerly and hands back the engine
+    (iteration unchanged). (b) `float(gk[0].abs())`-style idioms on
+    the new (L, H) gate rows raise ValueError (w18f_3's f-string,
+    w19f_3, w19f_8) — now `.abs().max()` (the row magnitude). (c)
+    w21d's `.view(1, H, 1, D)` on a (D,) key crashes (16 elements into
+    64 slots) — the key broadcasts via (1, 1, 1, D); the independent
+    bound was also a coin flip at the any-of-kappa statistic (0.23
+    expected vs the 0.25 bound) — now 0.35 with the derivation.
+WRITE `src/rag/m1m2.py` (the two fixes + the docstring contracts),
+`src/rag/m1m2_finetune.py` (epoch_batches eager), the three test
+files, `SPECIFICATION.md` (N7.3), this section + the §5 row, the
+auditor's W21.6 block, `HANDOVER.md` (the W21.6 box section).
+DO-D: py_compile all five touched files exit 0; `python3
+scripts/w20_static_audit.py --wave W21.6` exit 0 AND `--all` exit 0;
+the W21 pins held (every W21.1-W21.5 pattern still matches).
+COMMIT: "W21.6 — the box-run repair: the meta mix self-heal + the
+deterministic content scatter (stable-sort segment sum); the kernel
+was right, the delivery was not"
+
 ## 5. The attestation ledger (the no-CPU-test law, per wave)
 
 One line per wave close, written by the orchestrator, only when
@@ -2061,6 +2120,7 @@ truthful (PROMPT.md §1.4):
 | W20.14 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile/static-audit vehicles + a pure-stdlib jsonl read of the training DATA, no repo code); auditor --wave W20.14 exit 0 (22/22, re-verified post-tag) AND --all exit 0 (the full 15-wave re-check in one pass); push w20-wave-14 |
 | W20.15 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile/static-audit vehicles + a pure-stdlib json/history read of the box-run artifacts, no repo code); auditor --wave W20.15 exit 0 (re-verified post-tag) AND --all exit 0 (the full 16-wave re-check in one pass); push w20-wave-15 |
 | W21 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile/static-audit vehicles only; the uploaded HANDOVER.md training log read as data); auditor --wave W21 exit 0 (36/36, re-verified post-tag) AND --all exit 0 (the full 17-wave re-check in one pass — the W20.15 "curated negatives" vocabulary pin held after the driver rewrite); push w21-content-addr |
+| W21.6 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile + the static auditor only; the pure-numpy segment-sum verification in /home/z/my-project/scripts/w21_6_segment_check.py imports nothing from the repo); auditor --wave W21.6 exit 0 AND --all exit 0 (the W21 pins re-verified post-edit); push main (a62ffa8..W21.6) |
 
 Line format: `CLOSED <date> — no test executed, no CPU test authored,
 no repo module imported on this box; auditor --wave W20.<n> exit 0;

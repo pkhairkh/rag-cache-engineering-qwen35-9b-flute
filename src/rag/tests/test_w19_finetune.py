@@ -281,7 +281,9 @@ def test_w19f_3_the_loop_descends_the_objective():
         f"vs ln(4)={math.log(4):.4f})"
     assert losses[-1] < losses[0] - 0.3
     gk = module.write_gate_k.detach()
-    assert float(gk[0].abs()) > float(gk[1].abs()), \
+    # W21: the gates are (L, H) — the row's magnitude is its absmax
+    # (the per-head row, one number per layer for this contrast)
+    assert float(gk[0].abs().max()) > float(gk[1].abs().max()), \
         "the pair signal (layer 0) must out-weight the common layer"
 
 
@@ -510,7 +512,7 @@ def test_w19f_8_history_carries_the_w2014_fields():
     after = module.write_gate_k.detach()
     assert torch.equal(after[1:], before[1:]), \
         "masked layers must not move (zero grad + weight_decay 0)"
-    assert float((after[0] - before[0]).abs()) > 1e-6, \
+    assert float((after[0] - before[0]).abs().max()) > 1e-6, \
         "the unmasked layer must keep learning"
 
     # an out-of-range subset is a loud refusal, never a silent clamp

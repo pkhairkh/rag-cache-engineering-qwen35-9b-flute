@@ -678,6 +678,15 @@ def epoch_batches(pairs: Sequence, batch: int, seed: int = 1234):
     of the same epoch (harmless: a batch's negatives are its other
     members, which remain distinct pairs). n <= batch yields the
     whole shuffled set as ONE batch (nothing to wrap).
+
+    W21.6 — the refusals are EAGER: this is a plain function that
+    validates (batch, the pair count) and hands back the generator,
+    so `epoch_batches(pairs, 1)` raises AT THE CALL — the W21.0 box
+    run caught the v1 shape, a bare `yield` function, deferring the
+    body (and the raise) to the first `next()`, which made the
+    refusal unobservable at the call site (test_w20_15b: DID NOT
+    RAISE). Iteration behavior is unchanged for every well-formed
+    caller (the driver, the tests, the trainer).
     """
     if isinstance(batch, bool) or not isinstance(batch, int) or batch < 2:
         raise ValueError(
@@ -689,6 +698,12 @@ def epoch_batches(pairs: Sequence, batch: int, seed: int = 1234):
         raise ValueError(
             f"epoch_batches: {n} pair cannot form a batch — the "
             f"InfoNCE needs >= 2 (in-batch negatives)")
+    return _epoch_batches_gen(items, batch, seed)
+
+
+def _epoch_batches_gen(items: list, batch: int, seed: int):
+    """epoch_batches' engine (validated inputs; the forever loop)."""
+    n = len(items)
     epoch = 0
     while True:
         order = list(range(n))

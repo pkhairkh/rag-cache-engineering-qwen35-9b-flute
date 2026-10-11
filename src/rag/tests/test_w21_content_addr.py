@@ -185,7 +185,13 @@ def test_w21d_simhash_collision_monotone():
     """Keys at cos ~0.95 share >= 1 block slot far more often than
     independent keys (the collision monotonicity the kernel rides;
     direct _content_slots probe at mem 256: P_share(same) ~0.9 vs
-    ~0.06 for independent)."""
+    ~0.06 per block for independent). W21.6: the keys broadcast across
+    heads (a (D,) key views to (1, 1, 1, D) — the original .view(1, H,
+    1, D) crashed: 64 elements requested from 16) and the independent
+    bound is the ANY-of-kappa statistic: 1 - (1 - 2^-b)^kappa =
+    1 - (1 - 1/16)^4 ~= 0.23 expected hits (the docstring's ~0.06 is
+    the PER-BLOCK share) — the bound 0.35 sits ~3 sigma above the mean
+    at 60 trials (sigma ~= 3.3), a real ceiling, not a coin flip."""
     mod = M1M2(num_heads=H, head_dim=D, mem_size=MEM,
                num_linear_layers=NLAY).to(DEVICE)
     g = torch.Generator().manual_seed(18)
@@ -195,10 +201,10 @@ def test_w21d_simhash_collision_monotone():
         base = torch.randn(D, generator=g).to(DEVICE)
         noise = 0.05 * torch.randn(D, generator=g).to(DEVICE)
         other = torch.randn(D, generator=g).to(DEVICE)
-        ka = (base + noise).view(1, H, 1, D)
-        kb_sim = base.view(1, H, 1, D) + \
+        ka = (base + noise).view(1, 1, 1, D).expand(1, H, 1, D)
+        kb_sim = base.view(1, 1, 1, D) + \
             0.05 * torch.randn(1, H, 1, D, generator=g).to(DEVICE)
-        kb_ind = other.view(1, H, 1, D) + \
+        kb_ind = other.view(1, 1, 1, D) + \
             0.05 * torch.randn(1, H, 1, D, generator=g).to(DEVICE)
         with torch.no_grad():
             sa = mod._content_slots(ka)[0, 0, 0]    # (K,) per head 0
@@ -209,7 +215,9 @@ def test_w21d_simhash_collision_monotone():
         if bool((sa == sb_i).any()):
             hits_ind += 1
     assert hits_sim >= trials * 0.6       # similar keys collide (a lot)
-    assert hits_ind <= trials * 0.25      # independent keys rarely do
+    # independent keys rarely do (0.23 expected: 1 - (1 - 2^-4)^4;
+    # ~3 sigma headroom at 60 trials)
+    assert hits_ind <= trials * 0.35
 
 
 # ============================================= E. per-head gates ===========
