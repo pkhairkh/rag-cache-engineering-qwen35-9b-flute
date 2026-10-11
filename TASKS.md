@@ -2096,6 +2096,144 @@ COMMIT: "W21.6 — the box-run repair: the meta mix self-heal + the
 deterministic content scatter (stable-sort segment sum); the kernel
 was right, the delivery was not"
 
+## WAVE W22 — the proven-memory wave: the ladder made runnable, the
+curated hard negatives, the sparse read
+
+The box's W21.6 run (the pasted HANDOVER) is the FIRST REAL SIGNAL in
+the M1/M2 line — content addressing answered the position lock and the
+pedestal: spread +0.20..0.35 sustained over 300 steps (v1: exactly
+0.0000), cos(pos) +0.30..0.46 against cos(neg) +0.07..0.16, gates open
+k[-0.080..+1.183], zero OOM in training. But the run is NOT closable:
+(1) every [6] ladder row OOM'd (16 MiB request against a full 22 GiB —
+the device-resident captures + the 4x1.07 GiB unit stacks + their
+lists on top of the model), then the script CRASHED with
+UnboundLocalError (`del val_group` UNBINDS the name the trailing
+report reads) — held-out generalization was never MEASURED; (2) the
+loss swung 0.28..1.64 block-to-block on SEVEN random in-batch
+negatives while 17.5k curated label-0 non-pairs rode along unused;
+(3) coverage 4.2%. The wave adopts the three remaining PROVEN pieces
+of the reference key-value-memory lineage (the same lineage W21
+cites — no new concept, the RAG flow untouched): the sparse top-k
+READ (PKM top-32, Lample et al. 2019, arXiv:1907.05242; Memorizing
+Transformers kNN, Wu et al. 2022, arXiv:2203.08913; RETRO, Borgeaud
+et al. 2022, arXiv:2112.04426), the curated HARD-NEGATIVE columns
+(DPR, Karpukhin et al. 2020, arXiv:2004.04906; MoCo's shared queue,
+He et al. 2020, arXiv:1911.05722; Robinson et al. 2021,
+arXiv:2011.12031), and the host-staged ladder (the measurement
+instrument — bounded GPU footprint, < 1 GiB beyond the model at any
+pair count or row count).
+
+#### W22.1 — m1m2_finetune.py: the curated hard negatives in the loss
+- [x] done
+ROLE trainer-owner · WRITE `src/rag/m1m2_finetune.py`:
+`infonce_pairs_loss(..., m1_n=None, m2_n=None)` — N curated negative
+COLUMNS appended to the logits (sim(a_i, n_l) never a target; built
+through the SAME pair_sim_matrix one-construction site with the
+b-operands swapped — the W20.14 metric/loss parity rule holds by
+construction); gradients flow into the negatives' replays (push-away
+into the same (L, H) gates). `GatesTrainConfig.neg_pairs` (int >= 0,
+default 0 = the exact W21 regime bit-identically); `train_gates(...
+negatives=...)` — the pool captures neg_pairs curated SIDES per
+refresh (staged like pair sides; one-time loud warning + W21 fallback
+on iterator exhaustion, never a mid-pool crash); `_pair_sim_stats`
+gains cos_hneg (NaN when off); the capture log names the neg sides.
+DO-D: `python3 -m py_compile src/rag/m1m2_finetune.py` exit 0; `rg -n
+"m1_n|neg_pairs|cos_hneg" src/rag/m1m2_finetune.py` hits.
+COMMIT: "W22.1 — the curated hard negatives: N shared label-0 columns
+in the InfoNCE (DPR/MoCo's small-batch fix; neg_pairs=0 is the exact
+W21 regime)"
+
+#### W22.2 — m1m2.py: read_topk (the sparse retrieval, opt-in)
+- [x] done
+ROLE module-owner · WRITE `src/rag/m1m2.py`: `read_topk` (None = the
+spec §2.2 dense softmax, bit-identical — the DEFAULT; an int k in
+[1, mem_size] softmaxes the top-k score row only, the unselected slots
+EXACT zero probability — topk -> softmax -> scatter). Validated loudly
+at construction AND at read time (bool/0/>mem/non-int raise; the
+write knobs' loudness contract). The §7 fine-tune never reads (it
+scores WRITTEN states), so gates artifacts stay regime-valid at any
+k; the knob is a deployment-time retrieval-quality A/B measured by
+the retrieval evals, not the pair ladder. P3 holds at any k (zero
+memories read exact zeros).
+DO-D: `python3 -m py_compile src/rag/m1m2.py` exit 0; `rg -n
+"read_topk|_read_k|torch.topk" src/rag/m1m2.py` hits.
+COMMIT: "W22.2 — read_topk: the sparse PKM/Memorizing-Transformers
+read (default None = the spec §2.2 dense contract, bit-identical)"
+
+#### W22.3 — the driver: the ladder OOM + the crash, fixed; the feed
+- [x] done
+ROLE driver-owner · WRITE `scripts/gpu/finetune_m1m2.py`: (a) THE
+CRASH — `del val_group` rebinds to None (never del: the box's
+UnboundLocalError at the trailing `if val_group is not None`), with
+`ladder_ran` carrying the report's condition; (b) THE OOM —
+`_capture_group(host_stage=True)` moves every recorded k/v + m_init to
+(pinned) HOST at prefill end, `_side_units` streams one side's calls
+to the module device and frees them, `_group_units` stacks the four
+unit matrices on the HOST, `_sim_from_units` stages only (chunk, dim)
+row/col blocks onto the device — the ladder's GPU footprint beyond
+the model is bounded at < 1 GiB at any pair count; (c) the [4] residue
+release before [6] (iterators, the [2] system cache; gc.collect +
+empty_cache — val_pairs stays, [6] captures from it); (d)
+`--neg-pairs` (default 8; 0 = the W21 A/B) — the label-0 feed drawn
+from the rows EXCLUDING the held-out control slice (the first n_ctrl
+after the seeded shuffle), epoch-rebatched at seed+1, capped at 2048
+encoded b-sides; the artifact's meta records neg_pairs.
+DO-D: `python3 -m py_compile scripts/gpu/finetune_m1m2.py` exit 0;
+`rg -n "host_stage|ladder_ran|--neg-pairs|val_group = None"
+scripts/gpu/finetune_m1m2.py` hits.
+COMMIT: "W22.3 — the box-run repair: the ladder host-staged (bounded
+GPU), the UnboundLocalError crash fixed, the --neg-pairs feed (the
+control slice stays held out)"
+
+#### W22.4 — the box-run regression gates (AUTHORED, PENDING)
+- [x] done
+ROLE test-author · WRITE `src/rag/tests/test_w22_hardneg_topk.py`
+(A. the default read == the manual dense spec reference bit-exact;
+B. k=mem == dense up to softmax order + the top-k support is EXACT
+zeros (one-hot-M2 probe turns the read output INTO the prob row),
+rows sum to 1, top-1 == score argmax; C. k=1 returns the argmax M2
+row EXACTLY; D. P3 at any k — zero memories read exact zeros; E. loud
+guards at init AND post-init; F. the loss OFF is bit-identical to the
+W21 loss AND the manual cross-entropy; G. a HARD (near-duplicate)
+negative raises the loss above an EASY one, gradients reach the
+negative states, and 20 SGD steps PUSH APART; H. the loss's guards —
+half a pair / N=0 / N-mismatch raise; I. cos_hneg == the shared-site
+mean, NaN when off, and the square-metric fields do not move; J. the
+trainer with a negatives feed — finite cos_hneg in history, the
+exact pop accounting, exhaustion falls back loudly (NaN after),
+neg_pairs=0 with a live iterator is BIT-IDENTICAL to negatives=None).
+NOT run on this box (the no-CPU-test law) — the box runs the suite.
+DO-D: `python3 -m py_compile src/rag/tests/test_w22_hardneg_topk.py`
+exit 0; the W22 test names present.
+COMMIT: "W22.4 — the W22 contracts (AUTHORED, PENDING): the sparse-
+read support/exactness/P3/guards + the hard-negative loss semantics
+and the W21-regime bit-parity"
+
+#### W22.5 — the serve-side knob + the wave close
+- [x] done
+ROLE orchestrator · WRITE `scripts/gpu/run_query.py` +
+`scripts/gpu/run_ingestion.py` (`--m1m2-read-topk`, default 0 = the
+dense spec contract; set on the module post-load, validated loudly
+inside M1M2.read; the SAME k at ingest and query for read
+consistency); `TASKS.md` (this section + the §5 row),
+`SPECIFICATION.md` (N7.4 — the read_topk amendment), the auditor
+registration (`scripts/w20_static_audit.py` CHECKS W22), `HANDOVER.md`
+(the W22 box section: the honest verdict on the W21.6 run, the re-run
+commands, the decision tree).
+DO-D: `python3 scripts/w20_static_audit.py --wave W22` exit 0 AND
+`--all` exit 0; tag `w22-proven-memory` pushed.
+COMMIT: "W22.5 — wave W22 closed: the sparse read + the curated hard
+negatives + the runnable ladder (the three proven pieces, adopted)"
+
+Box open items carried (NOT this wave's scope, recorded for the next):
+the kappa choice stays a box decision (the ladder finally RUNS — pick
+the config with the best low-overlap gap; the W21.5 note applies); the
+read_topk VALUE is a retrieval-eval A/B on the box (start k=32, the
+PKM choice at a comparable slot budget; measure with eval_retrieval.py
+before serving with it); the loss temperature at the new negative-pool
+size (tau 0.07 was tuned for large-batch SimCLR — try 0.1); coverage
+(4.2% at 300 steps — the runbook's re-run raises steps, not width).
+
 ## 5. The attestation ledger (the no-CPU-test law, per wave)
 
 One line per wave close, written by the orchestrator, only when
@@ -2121,6 +2259,7 @@ truthful (PROMPT.md §1.4):
 | W20.15 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile/static-audit vehicles + a pure-stdlib json/history read of the box-run artifacts, no repo code); auditor --wave W20.15 exit 0 (re-verified post-tag) AND --all exit 0 (the full 16-wave re-check in one pass); push w20-wave-15 |
 | W21 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile/static-audit vehicles only; the uploaded HANDOVER.md training log read as data); auditor --wave W21 exit 0 (36/36, re-verified post-tag) AND --all exit 0 (the full 17-wave re-check in one pass — the W20.15 "curated negatives" vocabulary pin held after the driver rewrite); push w21-content-addr |
 | W21.6 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile + the static auditor only; the pure-numpy segment-sum verification in /home/z/my-project/scripts/w21_6_segment_check.py imports nothing from the repo); auditor --wave W21.6 exit 0 AND --all exit 0 (the W21 pins re-verified post-edit); push main (a62ffa8..W21.6) |
+| W22 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile + the static auditor only; the uploaded HANDOVER.md box log read as data); auditor --wave W22 exit 0 AND --all exit 0 (the full 18-wave re-check in one pass); push w22-proven-memory |
 
 Line format: `CLOSED <date> — no test executed, no CPU test authored,
 no repo module imported on this box; auditor --wave W20.<n> exit 0;

@@ -57,6 +57,13 @@ def main() -> int:
     ap.add_argument("--m1m2-gates", default=None,
                     help="W17: trained-gates .npz — the SAME artifact the "
                          "corpus was ingested with (geometry-validated)")
+    ap.add_argument("--m1m2-read-topk", type=int, default=0,
+                    help="W22: sparse memory retrieval — softmax over the "
+                         "TOP-k M1 slots only (the PKM/Memorizing-"
+                         "Transformers read; 0 = the spec §2.2 dense "
+                         "softmax). Retrieval-quality knob, A/B it with "
+                         "eval_retrieval.py; pass the SAME k to ingest "
+                         "and query for read consistency")
     ap.add_argument("--no-m1m2", action="store_true",
                     help="W17: load without the wiring (only valid for a "
                          "corpus ingested --no-m1m2)")
@@ -89,6 +96,13 @@ def main() -> int:
                           m1m2_mem_size=mem_size or 128,
                           m1m2_gates_path=args.m1m2_gates)
     check_m1m2_geometry(model, system, mem_size)
+    # W22 — the sparse read knob (validated loudly inside M1M2.read;
+    # 0 = the dense spec §2.2 contract, the default)
+    inner = getattr(model, "model", model)
+    if not args.no_m1m2 and args.m1m2_read_topk:
+        inner.m1m2.read_topk = args.m1m2_read_topk
+        print(f"    [W22] read_topk {args.m1m2_read_topk} — sparse memory "
+              f"retrieval (the dense softmax is the default A/B)")
     dev = next(model.parameters()).device  # W18: ids follow the model
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)

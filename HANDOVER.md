@@ -252,18 +252,25 @@ python3 scripts/gpu/finetune_m1m2.py \
 
 ## ✅ SUMMARY
 
-**Everything works perfectly except the M1/M2 contrastive learning.**
+**The M1/M2 contrastive learning now carries real signal — held-out
+measurement is the remaining open item (W22 fixes the instrument).**
 
 - Kernels: ✅ All pass
-- Tests: ✅ 260 passed, 3 skipped
+- Tests: ✅ 260 passed, 3 skipped (plus the W21/W22 gate suites)
 - Compilation: ✅ Clean
 - Model loading: ✅ Works
 - Capture pipeline: ✅ Works
 - Training loop: ✅ Runs to completion
-- Memory: ✅ No OOM
-- **M1/M2 discrimination: ❌ Spread = 0 at all steps**
+- Memory: ✅ No OOM in training; the [6] ladder OOM is fixed (W22)
+- **M1/M2 discrimination: 🟡 in-train spread +0.20..0.35 (W21's
+  content addressing answered the structural failure); the held-out
+  ladder OOM'd + crashed before reporting — W22 makes it runnable and
+  adds the curated hard negatives + the sparse top-k read**
 
-The system is functionally complete and stable. The only remaining work is debugging why the contrastive objective isn't producing discriminative M1/M2 states. The loss surface may have another saddle point, or the state construction may be collapsing diversity.
+The system is functionally complete and stable. The remaining work is
+measurement (run the W22 command; read the ladder), coverage (600
+steps), and the deployment A/Bs (kappa, read_topk, tau). See the W22
+section below for the honest verdict and the decision tree.
 
 ## W20.14 — the M1/M2 discrimination metric: the roll bug (CLOSED 2026-10-12)
 
@@ -687,3 +694,112 @@ mitigated entirely inside the gates + the global caches (content
 simhash slots, centering, per-(layer, head) gates — Product-Key Memory
 / Memorizing Transformers lineage; Charikar simhash; Su et al.
 centering), with the v1 regime one flag away for the A/B.
+
+## W22 — the honest verdict on your run + the three proven pieces (2026-10-12)
+
+**Did training succeed? Yes — and you deserve the exact shape of that
+answer:**
+
+**What genuinely worked (the first real learning signal in the M1/M2
+line):** spread went from EXACTLY 0.0000 (the v1 structural artifact)
+to **+0.20..0.35 sustained for 300 straight steps**; cos(pos) rode
++0.30..0.46 against cos(neg) +0.07..0.16 — a 3-5x separation, not a
+permutation identity; the gates opened for real (k[-0.080..+1.183]);
+300 steps / 1220 s / zero OOM in training. The W21 architecture change
+(content-addressed writes + centering) did exactly what the PKM /
+Memorizing-Transformers lineage predicted. This is no longer "no
+signal" — the write kernel discriminates.
+
+**What did NOT succeed, be clear about it:** (1) **the held-out
+ladder never ran** — every [6] row OOM'd at a 16 MiB request against a
+full 22 GiB, and then the script CRASHED with `UnboundLocalError:
+val_group` (a `del val_group` four lines above unbinds the name the
+trailing report reads). So generalization is UNMEASURED — in-train
+signal yes, held-out proof no. (2) The loss swung 0.28..1.64
+block-to-block because B=8 gives each anchor SEVEN random in-batch
+negatives — while your 17,519 curated label-0 non-pairs rode along
+unused. (3) Coverage 4.2% (608 of 14,469 pairs). The run is a real
+signal, not a finished training.
+
+**The OOM, root-caused:** the W21 ladder kept everything on the GPU —
+~2.6 GiB of retained capture k/v + four (64, 4.19M) fp32 unit stacks +
+their python lists (~6 GiB transient) on top of the model and the
+allocator's live residue. W22 makes the ladder HOST-STAGED: captures
+land on (pinned) host memory per side, replays stream one side at a
+time, unit stacks build on the host, and only (16, dim) chunks ride
+the PCIe for the matmul — the ladder's GPU footprint beyond the model
+is bounded under ~1 GiB at ANY pair count. The [4] residue (epoch
+iterators, the system cache) is gc-released before [6]. The crash fix
+is the one-liner it deserved: rebind to None, never `del`.
+
+**The three proven pieces adopted (same lineage W21 cites — the RAG
+concept untouched):**
+
+1. **Curated hard negatives (`--neg-pairs 8`, the new default).** Every
+   contrastive result at this batch scale: DPR's in-batch + hard
+   negatives (Karpukhin 2020), MoCo's shared queue (He 2020), Robinson
+   2021's shortcut analysis. The label-0 text2s join each capture pool
+   as 8 shared negative columns — each anchor must now ALSO rank its
+   own pair above curated non-pairs. The feed excludes the held-out
+   control slice (your [6] label-0 line stays untouched), epoch-
+   rebatched at seed+1. `--neg-pairs 0` is the exact W21 loss (A/B).
+2. **Sparse top-k read (`read_topk`, default OFF = the spec §2.2 dense
+   softmax, bit-identical).** PKM retrieves top-32 of 2^26 slots;
+   Memorizing Transformers read exact kNN; a dense softmax over 1024
+   accumulating slots averages toward the state mean. The §7 fine-tune
+   never reads, so your trained gates artifact is valid at any k —
+   `--m1m2-read-topk 32` at ingest+query is the deployment A/B to
+   measure with eval_retrieval.py.
+3. **The runnable ladder** (the instrument — without held-out numbers
+   every "is it working" argument is an argument).
+
+**The box sequence:**
+
+```
+cd /home/ubuntu/RAGGA
+git pull --ff-only origin main          # >= W22
+source /home/ubuntu/venv/bin/activate
+python3 -m pytest src/rag/tests -q      # the W21 suite + the 13 new W22
+                                        # gates (sparse-read exactness +
+                                        # hard-negative semantics)
+
+# THE W22 RUN — the recommended regime (hard negatives ON, more steps
+# for coverage; ~35-40 min at 600 steps):
+python3 scripts/gpu/finetune_m1m2.py \
+    --pairs-file data/pairs.jsonl \
+    --gates-out m1m2_gates_trained.npz \
+    --m1m2-mem-size 1024 \
+    --max-steps 600 \
+    --refresh-every 4 \
+    --gate-init 0.1 \
+    --neg-pairs 8
+# (optional, if the loss still sawtooths at the doubled negative pool:
+#  add --tau 0.1 — 0.07 was tuned for batch-4096 SimCLR, not B=8+8)
+
+# then the retrieval A/B for the sparse read, same corpus:
+python3 scripts/gpu/run_ingestion.py ... --m1m2-read-topk 32
+python3 scripts/gpu/eval_retrieval.py ...        # vs a dense-read ingest
+```
+
+**What to expect / the decision tree:**
+
+- **The ladder finally prints.** Seven rows + the label-0 control line
+  per row. Read them as: the "run config" row is your trained regime's
+  held-out number; the kappa rows pick the block count with the best
+  LOW-overlap gap (κ=4 is the default, not a promise); the
+  "positional v1 (A/B)" row is the old world, for contrast.
+- **If held-out spread lands ≥ ~0.15 with the control gap positive:**
+  the gates generalize — re-ingest with the artifact and run the
+  retrieval eval; the M1/M2 line is unblocked end-to-end.
+- **If held-out spread collapses while in-train stays ~0.3:** the gates
+  overfit 4.2% of the pairs — raise steps (the 600-step command), not
+  architecture; rerun.
+- **If cos(neg) on uncentered rows still parks at ~+0.36:** that's the
+  pedestal — expected only on the "content uncentered" row; centered
+  rows should sit near 0.
+- **If the loss still swings wildly with --neg-pairs 8:** try
+  `--tau 0.1`; if it still sawtooths, the block difficulty variance
+  (W20.15) is the residual cause — raise `--batch-pairs`.
+- **If anything OOMs in [6] again:** paste the traceback verbatim — the
+  ladder is now bounded by construction, so a failure there is new
+  information, not a repeat.

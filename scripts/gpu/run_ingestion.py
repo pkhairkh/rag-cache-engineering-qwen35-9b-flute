@@ -52,6 +52,14 @@ def main() -> int:
                          "artifact) — without it the gates stay at the "
                          "P3 zero init and the m1/m2 units are zero (the "
                          "retrieval signal appears only after training)")
+    ap.add_argument("--m1m2-read-topk", type=int, default=0,
+                    help="W22: sparse memory retrieval — softmax over the "
+                         "TOP-k M1 slots during the ingest prefills too "
+                         "(the PKM/Memorizing-Transformers read; 0 = the "
+                         "spec §2.2 dense softmax, the default). Pass the "
+                         "SAME k at query for read consistency (the read "
+                         "feeds the prefill hidden states that produce "
+                         "the written k/v)")
     ap.add_argument("--no-m1m2", action="store_true",
                     help="W17: load without the M1/M2 wiring (the "
                          "W16-exact A/B; snapshots carry no m1/m2 units)")
@@ -80,6 +88,12 @@ def main() -> int:
                           use_m1m2=not args.no_m1m2,
                           m1m2_mem_size=args.m1m2_mem_size,
                           m1m2_gates_path=args.m1m2_gates)
+    # W22 — the sparse read knob (validated loudly inside M1M2.read;
+    # 0 = the dense spec §2.2 contract, the default)
+    if not args.no_m1m2 and args.m1m2_read_topk:
+        getattr(model, "model", model).m1m2.read_topk = args.m1m2_read_topk
+        print(f"    [W22] read_topk {args.m1m2_read_topk} — sparse memory "
+              f"retrieval during ingest (pass the SAME k at query)")
 
     from transformers import AutoTokenizer
     print("[2] Loading tokenizer...")
