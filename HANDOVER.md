@@ -260,3 +260,35 @@ Wave DoD: Tier-D green (24/24, auditor --wave W20.2 exit 0 post-tag);
 Tier-G none (parity is W20.4's G20.P1); attestation truthful. Next:
 W20.3 — the turboquant.py torch rewrite (the core, the six CPU
 syndromes).
+
+## W20.3 — turboquant.py torch rewrite, the K1 core (CLOSED 2026-10-11)
+
+The six CPU syndromes are dead, one per task: the `.item()` norm sync
+(3.1 — norm is a 0-dim fp32 tensor end-to-end), the numpy searchsorted
+(3.1 — torch.searchsorted with the boundary-scaling identity: argmin
+|y/n − c| ≡ argmin |y − n·c|, the normalized vector never materialized;
+ties np-left ≡ torch right=False), numpy packbits (3.2 — pack_bits_t/
+unpack_bits_t, byte layout fixture-pinned), the numpy gather + the
+from_numpy adjoint butterfly (3.3 — torch LUT gather + fht_adjoint
+device-native; the degenerate zero-norm decodes via the 0-dim multiply),
+and the QJL chain (3.4 — torch.sign(FHT(r)) with the scale-invariance
+identity; the compensation device-native; the bridge collapsed).
+
+**THE AUDIT LINE**: `rg "np\.|numpy" src/rag/turboquant.py` == 0
+module-wide — numpy exists NOWHERE in the K1 core (the two sanctioned
+offline edges: TQCodes.to_arrays/from_arrays + the codebooks solve
+island). The `.item()`/`.cpu()`/`.numpy()`/from_numpy greps: 0.
+
+3.5 reconciled the module: the rev-2 runtime contract docstring (the
+single device-parametric path; the DIFFERENTIAL TWIN role — kernel-first
+dispatch foreshadowed for W20.8), all five construction sites verified
+torch-clean, the consumer surface intact (tq_cache/install/index/
+snapshot/evals keep their imports; the mechanical test sweep is W20.4's).
+
+Carried to W20.4 (open items, recorded in the TASKS ledger): the
+pre-W20 test files' dtype adaptations (pack tests + evals qjl host-
+dtype assertions); the pack domain bits∈{3,4} blast radius (uniform-
+bits tests at b∈{1,2}; evals bits_list); G20.P1 is the behavioral
+authority for all of it. Wave DoD: Tier-D 24/24 post-tag; Tier-G none
+(G20.P1 lands W20.4). Attestation truthful. Next: W20.4 — wiring +
+serving sweep + the K1 gates.

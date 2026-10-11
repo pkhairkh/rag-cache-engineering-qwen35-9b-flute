@@ -384,7 +384,54 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.2.3 —"},
         {"kind": "git_tag", "target": "w20-wave-2"},
     ],
-    # W20.3 … W20.12 — appended by each wave's close-out task.
+    # W20.3 — turboquant.py torch rewrite (appended at W20.3.6)
+    "W20.3": [
+        # W20.3.1 — quant encode torch-native
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "boundary-scaling"},
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "torch.searchsorted"},
+        # W20.3.2 — torch pack/unpack
+        {"kind": "py_compile", "target": "src/rag/turboquant.py"},
+        {"kind": "absent", "target": "src/rag/turboquant.py",
+         "pattern": r"np\.packbits|np\.unpackbits"},
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "def pack_bits_t"},
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "def unpack_bits_t"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_turboquant.py"},
+        {"kind": "grep", "target": "src/rag/tests/test_turboquant.py",
+         "pattern": "pack_bits_t"},
+        # W20.3.3 — dequant torch-native
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "fht_adjoint"},
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "def dequant"},
+        # W20.3.4 — qjl torch + THE module-wide numpy-zero audit line
+        {"kind": "absent", "target": "src/rag/turboquant.py",
+         "pattern": r"np\.|numpy"},
+        {"kind": "absent", "target": "src/rag/turboquant.py",
+         "pattern": r"\.item\(\)|\.cpu\(\)|\.numpy\(\)|from_numpy"},
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "scale invariance"},
+        # W20.3.5 — the module contract
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "differential twin"},
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "class TurboQuant"},
+        {"kind": "grep", "target": "src/rag/turboquant.py",
+         "pattern": "from tq_codes import TQCodes"},
+        # W20.3.6 — wave close: ledger + git facts
+        {"kind": "ledger", "target": "W20.3"},
+        {"kind": "git_log", "target": "W20.3.1 —"},
+        {"kind": "git_log", "target": "W20.3.2 —"},
+        {"kind": "git_log", "target": "W20.3.3 —"},
+        {"kind": "git_log", "target": "W20.3.4 —"},
+        {"kind": "git_log", "target": "W20.3.5 —"},
+        {"kind": "git_log", "target": "W20.3.6 —"},
+        {"kind": "git_tag", "target": "w20-wave-3"},
+    ],
+    # W20.4 … W20.12 — appended by each wave's close-out task.
 }
 
 
