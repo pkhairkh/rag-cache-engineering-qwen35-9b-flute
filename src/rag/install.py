@@ -53,6 +53,21 @@ the device analogue of the d/seed frame guards (a mixed-device fold
 would die deep inside torch's add; it dies HERE, loudly, naming the
 addend).
 
+W20.10.1 — THE BATCHED REQUANT CHAIN (PROPOSAL §3.6, the K4 serving
+side): on the kernel path (CUDA codes + the extension's TQ pair + an
+eligible geometry — the dispatcher's own predicate) a fold's units
+dequantize through ONE tq_dequant_batched call (the units' packed idx
+streams stack into the entry's (M, L) rows, the 0-dim norms into the
+(M,) vector), the sum is ONE torch reduction over the batched rows,
+and the single requant rides the dispatcher's q.quant → tq_quant_batched
+(W20.8.2: CUDA routes to the kernel ALWAYS when eligible). One kernel
+chain per unit-kind fold instead of one launch per addend. On every
+other box (CPU, pre-build, ineligible geometry, sketch-carrying codes)
+the fold is the legacy left fold VERBATIM — the torch twin path,
+bit-identical to the pre-W20.10 install, which the CPU gate suite pins.
+The W16 verbatim install (n<=1 hand-offs) is untouched: CODE-COPY,
+never recompute, bit-exact within a backend.
+
 Frame guard: every code must carry the kind's D3 seed — a mismatched frame
 would silently corrupt the sum (PROPOSAL D3); it raises loudly here.
 """
@@ -60,14 +75,68 @@ from __future__ import annotations
 
 from typing import Iterable, Optional, Sequence
 
+import torch
+
 import _paths  # noqa: F401
 from ingest import SystemState, load_system_state
 from snapshot import ChunkSnapshot
 from tq_cache import TQCache, TQLinearAttentionLayer, resolve_quantizer
-from turboquant import TQCodes
+from turboquant import TQCodes, _load_tq_kernel, _tq_kernel_available
 
 __all__ = ["sum_turboquant_codes", "install_snapshot", "install_from_disk",
            "sum_absolute_codes"]
+
+
+def _dequant_units_batched(q, units: Sequence[TQCodes]):
+    """W20.10.1 — ONE tq_dequant_batched over a fold's units (the serving
+    batch, PROPOSAL §3.6): the units' packed idx streams stack into the
+    entry's (M, L) rows, the 0-dim fp32 norms into the (M,) vector, and
+    the whole frame decode rides ONE stream-ordered kernel chain — the
+    same call turboquant's _dequant_kernel makes at M=1 (row ownership
+    is per-CTA and fixed-order, so each unit's reconstruction is the
+    M=1 decode exactly; no host round trip of any kind).
+
+    Returns the (M, d) fp32 rows on the units' device, or None when the
+    dispatcher would NOT route this decode to the kernel — the caller
+    then keeps the legacy left fold (the torch twin path, bit-identical
+    to the pre-W20.10 install). The routing decision is the
+    dispatcher's own predicate (q._dequant_kernel_eligible on the first
+    unit: CUDA codes + the kernel pair through the ONE
+    _tq_kernel_available probe + flat partition + no QJL sketch +
+    eligible geometry), evaluated with the dispatcher's call order —
+    the per-unit _check_codes belt runs FIRST (metadata-only, loud
+    frame drift), mirroring _dequant_flat. Every unit must sit on the
+    first unit's device (the mixed-device belt, _check_kernel_devices'
+    discipline — the install guards already pin this; the belt names
+    both devices loudly if a future caller forgets)."""
+    C = _load_tq_kernel()
+    if C is None or not units:
+        return None
+    first = units[0]
+    if not _tq_kernel_available(first.idx_lo):
+        return None
+    for i, u in enumerate(units):
+        q._check_codes(u)      # metadata-only; loud frame drift, the
+        # dispatcher's own belt (_dequant_flat calls it before routing)
+        if u.device != first.device:
+            raise RuntimeError(
+                f"install.py batched decode: unit {i} sits on {u.device} "
+                f"but the fold's first unit sits on {first.device} — a "
+                f"mixed-device frame; move the unit's codes to ONE device "
+                f"(one sanctioned .to) before installing")
+    if not q._dequant_kernel_eligible(first, torch.float32):
+        return None
+    dev = first.device
+    signs = q._device_signs(dev)
+    cb_lo, cb_hi = q._device_codebooks(dev)
+    codes_lo = torch.stack([u.idx_lo for u in units]).contiguous()
+    codes_hi = torch.stack([u.idx_hi for u in units]).contiguous()
+    norms = torch.stack([u.norm for u in units])
+    return C.tq_dequant_batched(
+        codes_lo, codes_hi, norms, signs,
+        cb_lo.centroids, cb_hi.centroids,
+        q.n_lo, q.bits_lo, q.n_hi, q.bits_hi,
+        torch.float32)
 
 
 def sum_turboquant_codes(system: TQCodes, deltas: Iterable[TQCodes],
@@ -86,17 +155,26 @@ def sum_turboquant_codes(system: TQCodes, deltas: Iterable[TQCodes],
 
     W20.4.2 torch: each codes dequantizes on ITS OWN device (the
     device-parametric decode — no forced transfer, no host hop); the
-    fold is the legacy accumulation EXACTLY (fp32, system first, then
-    the deltas in order); the requant lands on the accumulation device
-    as a torch TQCodes. The frame must be co-resident — a delta on
-    another device raises HERE (a metadata-only check, the device
-    analogue of the d/seed guards), not deep inside torch's add."""
+    requant lands on the accumulation device as a torch TQCodes. The
+    frame must be co-resident — a delta on another device raises HERE
+    (a metadata-only check, the device analogue of the d/seed guards),
+    not deep inside torch's add.
+
+    W20.10.1 — the batched requant chain: on the kernel path (CUDA +
+    eligible geometry — the dispatcher's own predicate) the fold's
+    units dequantize through ONE tq_dequant_batched call, the sum is
+    ONE torch reduction over the batched rows, and the requant rides
+    q.quant → tq_quant_batched (the dispatcher routes CUDA ALWAYS when
+    eligible — verified, no re-plumbing needed). On every other box
+    the fold below is the legacy left fold VERBATIM (fp32, system
+    first, then the deltas in retrieval order — the torch twin path
+    the CPU gate suite pins bit-exact). The signature is unchanged."""
     q = resolve_quantizer(kind, system.d, bits, qjl=qjl)
     if system.seed != q.seed:
         raise ValueError(
             f"sum_turboquant_codes({kind}): system codes seed {system.seed} "
             f"!= the kind's D3 seed {q.seed} — frame drift (PROPOSAL D3)")
-    acc = q.dequant(system)
+    deltas = list(deltas)
     for i, d in enumerate(deltas):
         if d.d != system.d:
             raise ValueError(
@@ -112,7 +190,20 @@ def sum_turboquant_codes(system: TQCodes, deltas: Iterable[TQCodes],
                 f"but the frame's system codes sit on {system.device} — a "
                 f"mixed-device frame; move the unit's codes to ONE device "
                 f"(one sanctioned .to) before installing")
-        acc = acc + q.dequant(d)
+    rows = _dequant_units_batched(q, [system, *deltas])
+    if rows is not None:
+        # the batched chain: ONE torch sum over the stacked rows (the
+        # stack order IS the legacy addend order — system first, then
+        # the deltas in retrieval order; an empty fold is the (1, d)
+        # sum, the system row exactly)
+        acc = rows.sum(dim=0)
+    else:
+        # the legacy left fold (the torch twin path), verbatim
+        acc = q.dequant(system)
+        for d in deltas:
+            acc = acc + q.dequant(d)
+    # ONE requant of the sum — q.quant routes CUDA+eligible to
+    # tq_quant_batched through the dispatcher (W20.8.2)
     return q.quant(acc)
 
 
@@ -152,7 +243,14 @@ def sum_absolute_codes(system: TQCodes, absolutes: Sequence[TQCodes],
     legacy order (fp32, (1-n)·dequant(sys) first, then the absolutes
     in order), one requant on the accumulation device. Co-residency is
     guarded like the delta path (the n<=1 hand-offs are placement-
-    agnostic — the cache's setters own placement)."""
+    agnostic — the cache's setters own placement).
+
+    W20.10.1 — the n>=2 fold is the batched requant chain on the kernel
+    path (ONE tq_dequant_batched over [sys, absolutes...], the (1-n)
+    scale on the sys row, ONE torch sum over the absolutes' rows, the
+    requant through the dispatcher's q.quant → tq_quant_batched); every
+    other box keeps the legacy left fold VERBATIM (the torch twin,
+    bit-identical). The n<=1 verbatim hand-offs are untouched."""
     q = resolve_quantizer(kind, system.d, bits, qjl=qjl)
     if system.seed != q.seed:
         raise ValueError(
@@ -160,6 +258,7 @@ def sum_absolute_codes(system: TQCodes, absolutes: Sequence[TQCodes],
             f"!= the kind's D3 seed {q.seed} — frame drift (PROPOSAL D3)")
     if not absolutes:
         return system
+    absolutes = list(absolutes)
     if len(absolutes) == 1:
         a = absolutes[0]
         if a.d != system.d or a.seed != system.seed:
@@ -193,7 +292,17 @@ def sum_absolute_codes(system: TQCodes, absolutes: Sequence[TQCodes],
                 f"{system.device} — a mixed-device frame; move the unit's "
                 f"codes to ONE device (one sanctioned .to) before "
                 f"installing")
-        acc = acc + q.dequant(a)
+    rows = _dequant_units_batched(q, [system, *absolutes])
+    if rows is not None:
+        # the batched chain: (1-n)·dequant(sys) + Σ dequant(abs_i) —
+        # the sys row scales, the absolutes' stacked rows take ONE
+        # torch sum (n == 2 is the single-row sum, the row exactly)
+        acc = rows[0] * (1 - len(absolutes)) + rows[1:].sum(dim=0)
+    else:
+        # the legacy left fold (the torch twin path), verbatim
+        acc = q.dequant(system) * (1 - len(absolutes))
+        for a in absolutes:
+            acc = acc + q.dequant(a)
     return q.quant(acc)
 
 
