@@ -207,7 +207,13 @@ COMMIT: "W20.1.1 — tag w20-baseline (the numpy-era tree, fixture
 capture point)"
 
 #### W20.1.2 — the fixture capture script (GPU-box; refuses CPU loudly)
-- [ ] done
+- [x] done
+Deviation note: `kind prod` does not exist in the pinned source — it
+IS the `qjl=True` flag (paper Alg. 2); split exists only for
+non-integer bits (`split = group>1 and not bits.is_integer()`), so the
+"plain split" probes are realized as the 3.5-bit lo/hi split (flat at
+G1/G3, the W15 outlier-split at G2 — the production conv geometry). 14
+probes, seeds 20260001+i.
 ROLE task-writer · READ `src/rag/turboquant.py:460-560, :640-710`;
 `src/rag/codebooks.py:190-260`; `PROPOSAL.md §5` · WRITE
 `scripts/gpu/w20_capture_fixtures.py` (new)
