@@ -74,7 +74,6 @@ the bottom of this file; exact repro in its docstring.
 """
 from __future__ import annotations
 
-import numpy as np
 import pytest
 import torch
 from transformers.cache_utils import (
@@ -157,7 +156,7 @@ def test_conv_quantize_on_write_dequantize_on_read(seed):
     codes = layer.conv_codes
     assert codes is not None
     assert codes.d == D_UNIT and codes.seed == 202
-    assert codes.idx_lo.dtype == np.uint8 and codes.idx_hi.dtype == np.uint8
+    assert codes.idx_lo.dtype == torch.uint8 and codes.idx_hi.dtype == torch.uint8
     assert codes.n_lo == codes.n_hi == D_UNIT // 2   # 3.5-bit half split
 
 
@@ -208,8 +207,8 @@ def test_no_fp16_invariant():
     assert dict.get(layer.recurrent_states, 0) is None
 
     # the persistent store is uint8 codes
-    assert layer.s_codes.idx_lo.dtype == np.uint8
-    assert layer.conv_codes.idx_lo.dtype == np.uint8
+    assert layer.s_codes.idx_lo.dtype == torch.uint8
+    assert layer.conv_codes.idx_lo.dtype == torch.uint8
 
     # direct assignment refuses in online mode (the cache never stores fp16)
     with pytest.raises(RuntimeError):
@@ -342,7 +341,9 @@ def test_inplace_mutation_capture(seed):
     assert _rel_mse(recaptured, state) < REL_MSE_GATE       # 0.015-0.022
     # the capture really re-quantized: new code bytes, still no fp16 stored
     assert layer.conv_codes is not None
-    assert not np.array_equal(layer.conv_codes.idx_lo, codes_before.idx_lo)
+    # torch.equal: np.array_equal cannot cross the device boundary the
+    # W20.3 device-parametric codes live on
+    assert not torch.equal(layer.conv_codes.idx_lo, codes_before.idx_lo)
     assert dict.get(layer.conv_states, 0) is None
     # and the re-capture was counter-transparent (contract 3's cross-check)
     assert layer.writes["conv"] == 1
@@ -399,7 +400,7 @@ def test_m1_m2_roundtrip_and_d3_seeds(seed):
     assert cache.m1_codes.seed == 303
     assert cache.m2_codes.seed == 404
     assert cache.m1_codes.d == D_UNIT
-    assert cache.m1_codes.idx_lo.dtype == np.uint8
+    assert cache.m1_codes.idx_lo.dtype == torch.uint8
 
 
 def test_m1_m2_read_before_write_is_none():
@@ -734,7 +735,7 @@ def test_nonpow2_conv_mutation_capture():
     assert recaptured is not state                      # fresh transient
     assert tuple(recaptured.shape) == CONV_NP2_UNIT     # pad stripped on read
     assert _rel_mse(recaptured, state) < REL_MSE_GATE   # measured 0.016
-    assert not np.array_equal(layer.conv_codes.idx_lo, codes_before.idx_lo)
+    assert not torch.equal(layer.conv_codes.idx_lo, codes_before.idx_lo)
     assert dict.get(layer.conv_states, 0) is None
     assert layer.writes["conv"] == 1                    # counter-transparent
 

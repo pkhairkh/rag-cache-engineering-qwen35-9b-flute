@@ -658,7 +658,20 @@ COMMIT: "W20.4.6.a — the G20 gate harness (THRESHOLDS 1:1, G20.P1
 implemented)"
 
 #### W20.4.6.b — the CUDA-gated K1 tests + mechanical pre-W20 adaptation
-- [ ] done
+- [x] done
+4 CUDA-gated tests (manifest-load, parametrized fixture parity,
+run-to-run determinism, device report); manifest-ABSENT = module skip
+(present-but-empty fails loudly — deliberate). Guard import: `from
+w20 import _gpu_guard` + sys.path insert of src/rag/tests (pytest
+prepend resolves w20.test_… with basedir src/rag/tests — the dotted
+src.rag form would NOT resolve; conftest anchors src/rag, not the
+repo root). The W20.3.2 blast radius resolved mechanically:
+parametrize constrained to b∈{3,4} + the in-code domain comment; the
+value-range rejection rows kept for b∈{1,2} (the idx VALUE check was
+removed with the numpy era — dead rows dropped, not re-pinned).
+Open: sibling test files (test_turboquant_split.py etc.) carry
+np.array_equal sites that break on the box — flagged for the owning
+sweep (G20.P1 time).
 ROLE task-writer · READ `_gpu_guard.py`, the fixtures layout,
 PROPOSAL.md §5 (the three-level parity contract), test_turboquant.py +
 test_tq_cache.py (the TQ-contract test surfaces) · WRITE

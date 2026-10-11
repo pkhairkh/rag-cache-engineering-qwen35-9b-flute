@@ -13,7 +13,8 @@ D2, D3; TurboQuant, arXiv:2504.19874):
       fraction -> 50/50 halves realize exactly 3.5 bits).
   4.  pack_bits/unpack_bits lossless bit packing (>= 5000 indices, both
       edge values, the 4-bit fast path, odd lengths) + loud rejection of
-      out-of-range indices.
+      out-of-domain bit widths (W20.3.2: the pack checks are metadata-
+      only — the array-era idx value-range check is gone).
   5.  TQCodes serialization: quant -> to_arrays -> from_arrays (dict AND
       npz round-trip) -> bit-identical dequant (torch.equal).
   6.  Full-chunk size gate (spec §3.3/§5, THE full-scale test, @slow):
@@ -154,38 +155,48 @@ def test_split_arithmetic(tmp_path, monkeypatch):
 
 
 # --- gate 4: lossless bit packing -------------------------------------------- #
-@pytest.mark.parametrize("b", [1, 2, 3, 4])
+@pytest.mark.parametrize("b", [3, 4])  # pack domain per W20.3.2 — the A10G gate (G20.P1) owns the domain decision
 def test_pack_bits_roundtrip_lossless(b):
     g = torch.Generator().manual_seed(2000 + b)
-    idx = torch.randint(0, 2 ** b, (5000,), generator=g).numpy() \
-        .astype(np.uint8)
+    # W20.3.2 mechanical adaptation: pack_bits_t takes uint8 TENSORS —
+    # the same draw the array era made (int64 randint off the same
+    # generator, then the uint8 cast; the .numpy().astype hop is gone)
+    idx = torch.randint(0, 2 ** b, (5000,), generator=g,
+                        dtype=torch.int64).to(torch.uint8)
     idx[0], idx[1] = 0, 2 ** b - 1                  # both edge values
 
     packed = pack_bits_t(idx, b)
-    assert packed.dtype == np.uint8 and packed.ndim == 1
-    assert packed.nbytes == (5000 * b + 7) // 8
+    assert packed.dtype == torch.uint8 and packed.ndim == 1
+    assert packed.numel() == (5000 * b + 7) // 8
     back = unpack_bits_t(packed, b, 5000)
-    assert back.dtype == np.uint8
-    assert np.array_equal(back, idx)
+    assert back.dtype == torch.uint8
+    assert torch.equal(back, idx)
 
     # odd lengths: the 4-bit fast path pads to a whole nibble pair, the
     # generic path leaves a partial trailing byte — both must trim to n
-    idx_odd = idx[:101].copy()
+    idx_odd = idx[:101].clone()
     p_odd = pack_bits_t(idx_odd, b)
-    assert p_odd.nbytes == (101 * b + 7) // 8
-    assert np.array_equal(unpack_bits_t(p_odd, b, 101), idx_odd)
+    assert p_odd.numel() == (101 * b + 7) // 8
+    assert torch.equal(unpack_bits_t(p_odd, b, 101), idx_odd)
 
 
 def test_pack_bits_rejects_out_of_range():
-    for b in (1, 2, 3, 4):
+    # W20.3.2 forced adaptation: pack_bits_t's checks are metadata-only
+    # — the array-era idx VALUE-range check is gone (searchsorted
+    # indices are < 2**bits by construction; the range check cost a host
+    # sync), so out-of-range VALUES no longer raise and the legacy
+    # b in (3, 4) rows are unreachable. bits outside {3, 4} raise
+    # ValueError (the domain check) — the b in (1, 2) rows still raise
+    # it, now from the domain side.
+    for b in (1, 2):
         with pytest.raises(ValueError):
-            pack_bits_t(np.array([0, 2 ** b], dtype=np.uint8), b)
+            pack_bits_t(torch.tensor([0, 2 ** b], dtype=torch.uint8), b)
     # the bits domain itself is validated loudly too
     for bad in (0, 9):
         with pytest.raises(ValueError):
-            pack_bits_t(np.zeros(4, np.uint8), bad)
+            pack_bits_t(torch.zeros(4, dtype=torch.uint8), bad)
         with pytest.raises(ValueError):
-            unpack_bits_t(np.zeros(1, np.uint8), bad, 4)
+            unpack_bits_t(torch.zeros(1, dtype=torch.uint8), bad, 4)
 
 
 # --- gate 5: code serialization round-trip ----------------------------------- #
@@ -194,8 +205,10 @@ def test_code_serialization_roundtrip(tmp_path):
     x = _unit_vectors(D, 1, seed=55)[0]
     codes = q.quant(x)
 
-    # nbytes is exactly the two packed streams + the fp32 norm
-    assert codes.nbytes() == codes.idx_lo.nbytes + codes.idx_hi.nbytes + 4
+    # nbytes is exactly the two packed streams + the fp32 norm (uint8
+    # streams: numel() == bytes — the tensor-era equivalent, same as
+    # TQCodes._tnbytes's version-robust accounting)
+    assert codes.nbytes() == codes.idx_lo.numel() + codes.idx_hi.numel() + 4
     assert codes.nbytes() == (512 * 3 + 7) // 8 + (512 * 4 + 7) // 8 + 4
 
     direct = q.dequant(codes, device=DEVICE)
@@ -208,8 +221,11 @@ def test_code_serialization_roundtrip(tmp_path):
     assert via_dict.bits_lo == codes.bits_lo and via_dict.bits_hi == codes.bits_hi
     assert via_dict.n_lo == codes.n_lo and via_dict.n_hi == codes.n_hi
     assert float(via_dict.norm) == float(codes.norm)
-    assert np.array_equal(via_dict.idx_lo, codes.idx_lo)
-    assert np.array_equal(via_dict.idx_hi, codes.idx_hi)
+    # torch.equal (the tensor equivalent of np.array_equal): from_arrays
+    # is CPU-resident by contract, so the DEVICE-side stream takes the
+    # one .cpu() hop the array era never needed
+    assert torch.equal(via_dict.idx_lo, codes.idx_lo.cpu())
+    assert torch.equal(via_dict.idx_hi, codes.idx_hi.cpu())
     assert torch.equal(q.dequant(via_dict, device=DEVICE), direct)
 
     # npz round-trip: exactly the path a chunk snapshot writes and reads
@@ -219,8 +235,8 @@ def test_code_serialization_roundtrip(tmp_path):
     assert loaded.kind == codes.kind and loaded.d == codes.d
     assert loaded.seed == codes.seed and loaded.partition == codes.partition
     assert float(loaded.norm) == float(codes.norm)
-    assert np.array_equal(loaded.idx_lo, codes.idx_lo)
-    assert np.array_equal(loaded.idx_hi, codes.idx_hi)
+    assert torch.equal(loaded.idx_lo, codes.idx_lo.cpu())
+    assert torch.equal(loaded.idx_hi, codes.idx_hi.cpu())
     assert torch.equal(q.dequant(loaded, device=DEVICE), direct)
 
 
@@ -290,8 +306,8 @@ def test_d3_frame_consistency():
     x = _unit_vectors(D, 1, seed=99)[0]
     c1, c2 = q1.quant(x), q2.quant(x)
     assert float(c1.norm) == float(c2.norm)
-    assert np.array_equal(c1.idx_lo, c2.idx_lo)
-    assert np.array_equal(c1.idx_hi, c2.idx_hi)
+    assert torch.equal(c1.idx_lo, c2.idx_lo)
+    assert torch.equal(c1.idx_hi, c2.idx_hi)
     assert torch.equal(q1.dequant(c1, device=DEVICE), q2.dequant(c2, device=DEVICE))
 
 
