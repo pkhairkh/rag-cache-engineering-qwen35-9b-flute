@@ -123,7 +123,7 @@ COMMIT: "W20.0.2 — A10G provisioning script (latest-stable, idempotent,
 sm_86-asserting)"
 
 #### W20.0.3 — the static auditor (the DoD vehicle — parses, never imports)
-- [ ] done
+- [x] done
 ROLE task-writer · READ `PROMPT.md §1.2, §5` · WRITE
 `scripts/w20_static_audit.py` (new)
 BRIEF: CLI: `--wave W20.<n> | --all | --list`. Check kinds: `exists`
