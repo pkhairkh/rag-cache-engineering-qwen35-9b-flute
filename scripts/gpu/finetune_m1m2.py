@@ -35,12 +35,39 @@ Examples:
     # single-layer isolation (the W20.14 H6 investigation knob)
     python3 scripts/gpu/finetune_m1m2.py --pairs-file mrpc_pairs.jsonl \
         --gates-out disk/m1m2_gates.npz --train-layers 5
+
+    # the W20.15 regime (per-epoch re-batching, 16-pair batches)
+    python3 scripts/gpu/finetune_m1m2.py --pairs-file data/pairs.jsonl \
+        --gates-out m1m2_gates_trained.npz --m1m2-mem-size 1024 \
+        --batch-pairs 16 --max-steps 600
+
+THE W20.15 REGIME (the box's post-fix 300-step run saw a SAWTOOTH:
+loss swinging 0.40..2.98 with the capture batch): the between-block
+loss variance measured 7,595x the within-block variance — the block
+difficulty IS the batch (its 8 pairs' own cross-side alignment; the
+in-batch-negative background cos_neg is stable while cos_pos swings
+0.35..0.74), only 600 of 14,469 train pairs were consumed (4.1%), and
+the v1 iterator FIXED every pair's in-batch negatives to its
+file-layout neighbors for the whole run. This driver now: shuffles
+the split (seeded — the val slice is a random sample, not the file's
+head block), re-batches per epoch (epoch_batches — fresh negative
+sets every epoch, deterministic), tallies coverage, and reports the
+held-out LADDER: true pairs vs the label-0 curated non-pairs (the
+17,519 rows v1 skipped — the datasets' own non-similar pairs, a
+cleaner control than in-batch negatives, which can be
+accidentally-similar cross pairs) vs the in-batch negatives, then
+the gap BUCKETED by lexical overlap (the position-addressed write —
+slot = p mod mem_size, one token per slot at T < mem_size — predicts
+the gap lives in the high-overlap bucket; the report makes that
+celling measurable instead of arguable). --fixed-batches restores
+the v1 file-order regime for the A/B.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import random
 import time
 
 import torch
@@ -50,30 +77,42 @@ from _bootstrap import DEFAULTS, boot, load_model
 boot()
 
 from ingest import prefill_system  # noqa: E402
-from m1m2_finetune import (GatesTrainConfig, cosine_spread,  # noqa: E402
-                            prefill_capture_calls, replay_states,
-                            save_gates, train_gates)
+from m1m2_finetune import (GatesTrainConfig, bucketed_spread,  # noqa: E402
+                            cosine_spread, epoch_batches,
+                            lexical_overlap, prefill_capture_calls,
+                            replay_states, save_gates, train_gates)
 from tq_cache import TQCache  # noqa: E402
 
 
 def load_pairs(path: str, limit: int = 0):
-    """The positive pairs from a general-similarity JSONL."""
-    pairs = []
+    """The positive pairs AND the label-0 curated non-pairs from a
+    general-similarity JSONL.
+
+    W20.15: the label-0 rows ride along as the held-out CONTROL GROUP
+    (their own pair cosines — the datasets' own NON-similar pairs, a
+    cleaner discrimination floor than in-batch negatives, which can be
+    accidentally-similar cross pairs). They stay OUT of training — the
+    v1 in-batch-negative design is unchanged (a future wave may mine
+    them as explicit hard negatives)."""
+    pairs, negatives = [], []
     with open(path) as f:
         for i, line in enumerate(f):
             if limit and len(pairs) >= limit:
                 break
             row = json.loads(line)
-            if int(row.get("label", 1)) != 1:
-                continue
+            label = int(row.get("label", 1))
             t1, t2 = row.get("text1"), row.get("text2")
-            if t1 and t2:
+            if not (t1 and t2):
+                continue
+            if label == 1:
                 pairs.append((t1, t2))
+            else:
+                negatives.append((t1, t2))
     if len(pairs) < 2:
         raise SystemExit(
             f"{path}: need >= 2 positive pairs (in-batch negatives); "
             f"got {len(pairs)}")
-    return pairs
+    return pairs, negatives
 
 
 def synthetic_pairs(n: int, vocab: int, length: int = 96, seed: int = 5):
@@ -202,6 +241,20 @@ def main() -> int:
                          "(zero grads + weight_decay 0) — the "
                          "isolate-single-layer experiment")
     ap.add_argument("--val-frac", type=float, default=0.1)
+    ap.add_argument("--val-pairs", type=int, default=64,
+                    help="W20.15: held-out pairs scored in [5] (the v1 "
+                         "hard-coded 32 starved the bucketed report; "
+                         "capped at the val split)")
+    ap.add_argument("--shuffle-seed", type=int, default=1234,
+                    help="W20.15: the regime seed — the val slice AND the "
+                         "per-epoch re-batching order derive from it "
+                         "(deterministic run to run)")
+    ap.add_argument("--fixed-batches", action="store_true",
+                    help="W20.15 A/B: the v1 regime — the fixed "
+                         "file-order batch cycle (a pair's in-batch "
+                         "negatives stay its file-layout neighbors "
+                         "forever; the val split is still the seeded "
+                         "shuffle)")
     ap.add_argument("--limit-pairs", type=int, default=0)
     args = ap.parse_args()
 
@@ -245,6 +298,8 @@ def main() -> int:
     # tensors and the H2D moves INTO the capture loop — each pool
     # refresh stages its prefill inputs there, the staging window
     # being the refresh cycle (transport only, values bit-identical)
+    pair_texts: list = []   # W20.15: the (t1, t2) texts, aligned with
+    neg_texts: list = []    # `pairs` / the label-0 control texts
     if args.self_test:
         raw = synthetic_pairs(64, vocab=tokenizer.vocab_size)
         pairs = [(_host_pinned(p[0]), _host_pinned(p[1])) for p in raw]
@@ -252,8 +307,15 @@ def main() -> int:
     else:
         if not args.pairs_file:
             raise SystemExit("--pairs-file is required (or --self-test)")
-        texts = load_pairs(args.pairs_file, limit=args.limit_pairs)
+        texts, neg_texts = load_pairs(args.pairs_file,
+                                      limit=args.limit_pairs)
         print(f"    {len(texts)} positive pairs from {args.pairs_file}")
+        # W20.15 — the seeded regime: the val slice is a RANDOM sample
+        # (v1 took the file's head block) and the epoch re-batching is
+        # reproducible; --fixed-batches restores the v1 batch cycle.
+        rng = random.Random(args.shuffle_seed)
+        rng.shuffle(texts)
+        rng.shuffle(neg_texts)
         pairs = []
         for t1, t2 in texts:
             ids1 = tokenizer.encode(t1, add_special_tokens=False)
@@ -263,6 +325,7 @@ def main() -> int:
             if not ids1 or not ids2:
                 continue
             pairs.append((_host_pinned(ids1), _host_pinned(ids2)))
+            pair_texts.append((t1, t2))
     n_val = max(2, int(len(pairs) * args.val_frac)) if len(pairs) > 4 else 0
     # W20.11.2: the held-out prefills' ids stage ONCE here (the same
     # pinned non_blocking transport — [5] runs the unchanged path)
@@ -270,10 +333,30 @@ def main() -> int:
         val_pairs = [(a.to(args.device, non_blocking=True),
                       b.to(args.device, non_blocking=True))
                      for a, b in pairs[:n_val]]
+        val_texts = pair_texts[:n_val]      # W20.15 — the bucket labels
     else:
         val_pairs = []
-    train_iter = _cycle_batches(pairs[n_val:] if n_val else pairs,
-                                args.batch_pairs)
+        val_texts = []
+    train_pairs = pairs[n_val:] if n_val else pairs
+    # W20.15 — the regime: per-epoch re-batching by default (fresh
+    # in-batch negative sets every epoch, deterministic per seed); the
+    # v1 fixed file-order cycle stays one flag away (the A/B)
+    if args.fixed_batches:
+        print(f"    [W20.15 A/B] FIXED file-order batches (the v1 "
+              f"regime; seed only fixes the val slice)")
+        train_iter = _cycle_batches(train_pairs, args.batch_pairs)
+    else:
+        train_iter = epoch_batches(train_pairs, args.batch_pairs,
+                                   seed=args.shuffle_seed)
+    consumed = {"batches": 0}   # W20.15 — the coverage tally
+
+    def _tallied(source):
+        while True:
+            batch = next(source)
+            consumed["batches"] += 1
+            yield batch
+
+    train_iter = _tallied(train_iter)
 
     print(f"\n[4] Training the gates ({args.max_steps} steps, "
           f"batch {args.batch_pairs}, tau {args.tau}, lr {args.lr})...")
@@ -297,6 +380,11 @@ def main() -> int:
           f"refresh_every {args.refresh_every} (capture pool), "
           f"{'delta' if not args.absolute_loss else 'absolute'} loss "
           f"(retrieval-frame matched)")
+    print(f"    [W20.15] {'FIXED file-order' if args.fixed_batches else 'epoch-rebatched'} "
+          f"batches, seed {args.shuffle_seed}; train {len(train_pairs)} / "
+          f"val {len(val_pairs)} (seeded random split); held-out eval "
+          f"{min(args.val_pairs, len(val_pairs)) if val_pairs else 0} "
+          f"pairs + the label-0 curated control")
 
     def cache_factory():
         return TQCache(config=model.config, bits=args.bits, online=True)
@@ -304,13 +392,23 @@ def main() -> int:
     t0 = time.perf_counter()
     cfg = train_gates(model, train_iter, system, cache_factory, cfg)
     print(f"    done in {time.perf_counter() - t0:.0f}s")
+    # W20.15 — the coverage tally: how much of the train split this run
+    # actually consumed (the box's v1 run: 600 of 14,469 = 4.1% — the
+    # single most under-reported number of the whole regime)
+    used = consumed["batches"] * args.batch_pairs
+    n_train = len(train_pairs)
+    print(f"    [W20.15] coverage: {consumed['batches']} capture batches "
+          f"~ {used} pair-uses of {n_train} train pairs "
+          f"({100.0 * min(used, n_train) / max(1, n_train):.1f}% unique "
+          f"this run; the tally includes the trailing prefetch)")
 
     if val_pairs:
-        print("\n[5] Held-out discrimination spread...")
+        print("\n[5] Held-out discrimination ladder...")
         module = inner.m1m2
+        n_eval = min(args.val_pairs, len(val_pairs))
         states = []
         with torch.no_grad():
-            for ids_a, ids_b in val_pairs[:32]:
+            for ids_a, ids_b in val_pairs[:n_eval]:
                 ps = []
                 for ids in (ids_a, ids_b):
                     c = cache_factory()
@@ -327,12 +425,74 @@ def main() -> int:
         m1_b = torch.stack([s[1][0] for s in states])
         m2_b = torch.stack([s[1][1] for s in states])
         pos, neg = cosine_spread(m1_a, m2_a, m1_b, m2_b)
-        print(f"    cos(true pairs) {pos:+.4f} vs cos(in-batch neg) "
+        print(f"    cos(true pairs)   {pos:+.4f} vs cos(in-batch neg) "
               f"{neg:+.4f} — gap {pos - neg:+.4f} over {len(states)} "
-              f"held-out pairs (the discrimination signal; the §4 "
-              f"vector's M1/M2 units carry this; W20.14: v1's "
-              f"\"shifted\" mean was a permutation of the true-pair "
-              f"mean — identically equal, spread structurally 0)")
+              f"held-out pairs (the in-batch negatives can be "
+              f"accidentally-similar cross pairs — a noisy floor)")
+
+        # W20.15 — the label-0 CURATED control line: the datasets' own
+        # non-pairs (17,519 rows the v1 loader skipped). The honest
+        # discrimination number is true-pairs vs THESE, not vs random
+        # cross pairs; they never enter training.
+        ctrl_pos = None
+        if neg_texts:
+            ctrl_ids = []
+            for t1, t2 in neg_texts[:n_eval]:
+                c1 = tokenizer.encode(t1, add_special_tokens=False)
+                c2 = tokenizer.encode(t2, add_special_tokens=False)
+                if args.max_tokens:
+                    c1, c2 = c1[:args.max_tokens], c2[:args.max_tokens]
+                if not c1 or not c2:
+                    continue
+                ctrl_ids.append((c1, c2))
+            if len(ctrl_ids) >= 2:
+                ctrl_states = []
+                with torch.no_grad():
+                    for a_ids, b_ids in ctrl_ids[:n_eval]:
+                        ps = []
+                        for ids in (a_ids, b_ids):
+                            c = cache_factory()
+                            calls, m1i, m2i = prefill_capture_calls(
+                                model, _host_pinned(ids).to(
+                                    args.device, non_blocking=True),
+                                c, system)
+                            m1, m2 = replay_states(module, calls, m1i, m2i)
+                            ps.append((m1 - m1i, m2 - m2i))
+                        ctrl_states.append(ps)
+                c1_a = torch.stack([s[0][0] for s in ctrl_states])
+                c2_a = torch.stack([s[0][1] for s in ctrl_states])
+                c1_b = torch.stack([s[1][0] for s in ctrl_states])
+                c2_b = torch.stack([s[1][1] for s in ctrl_states])
+                ctrl_pos, _ = cosine_spread(c1_a, c2_a, c1_b, c2_b)
+                print(f"    cos(label-0 pairs) {ctrl_pos:+.4f} — the "
+                      f"curated negatives ({len(ctrl_states)} pairs; "
+                      f"true-vs-curated gap {pos - ctrl_pos:+.4f})")
+
+        # W20.15 — the gap BUCKETED by lexical overlap: the position-
+        # addressed write (slot = p mod mem_size, ONE token per slot at
+        # T < mem_size — the state delta IS the key sequence) predicts
+        # the discrimination lives in the high-overlap bucket; the
+        # bucket profile decides between "regime" (fixable by training)
+        # and "ceiling" (architectural — next wave's conversation)
+        if val_texts:
+            labels = []
+            for t1, t2 in val_texts[:n_eval]:
+                ov = lexical_overlap(t1, t2)
+                labels.append("high" if ov >= 0.5 else
+                              ("med" if ov >= 0.2 else "low"))
+            rep = bucketed_spread(m1_a, m2_a, m1_b, m2_b, labels)
+            for lbl in ("high", "med", "low"):
+                if lbl in rep["buckets"]:
+                    bb = rep["buckets"][lbl]
+                    print(f"    overlap {lbl:4s} (n={bb['n']:3d}): "
+                          f"cos_pos {bb['cos_pos']:+.4f} "
+                          f"gap {bb['gap']:+.4f}")
+            print("    (gap living only in 'high' = the surface-locked "
+                  "state signature; flat buckets = the signal is not "
+                  "surface-locked — capacity/optimization instead)")
+        if ctrl_pos is None and not val_texts:
+            print("    (self-test: no texts — the ladder/buckets are "
+                  "data-path reports)")
 
     out = save_gates(inner.m1m2, args.gates_out, extra_meta={
         "pairs_file": args.pairs_file or "self-test",
