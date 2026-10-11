@@ -88,6 +88,19 @@ raw (uncentered) keys/values. The two knobs are orthogonal on purpose
 — the driver's held-out ladder sweeps the four corners plus the
 κ ladder, all offline on the captured k/v (no re-prefill per config).
 
+W22 — THE READ (the last proven piece, adopted): every reference
+key-value memory retrieves SPARSELY — Product-Key Memory's top-32 of
+2^26 slots (Lample et al. 2019), Memorizing Transformers' exact kNN
+(Wu et al. 2022), RETRO's top-k chunks (Borgeaud et al. 2022) — a
+dense softmax over an accumulating memory averages the state into a
+blur. `read_topk` (default None = the spec §2.2 dense softmax,
+bit-identical; an int k softmaxes the top-k score row only, the rest
+exact zeros) is the module-side knob; the ingest/query drivers expose
+--m1m2-read-topk. The §7 fine-tune never reads (it scores WRITTEN
+states), so the gates artifact stays regime-valid at any k — the
+knob is a deployment-time retrieval-quality A/B, measured by the
+retrieval evals (eval_retrieval.py), not the pair-similarity ladder.
+
 CRITICAL ARCHITECTURAL FACT: M1/M2 are RUNTIME CACHE STATE, not weights.
 They start zero, accumulate during prefill, and are snapshotted /
 quantized / installed as TurboQuant codes through `TQCache.update_m1 /
@@ -171,7 +184,8 @@ Refs: SPECIFICATION.md §2.2 (the memories), §3.2 (online loop),
 gates), D4 (the delta protocol), Phase 3/4; W21 (this wave — the
 content address + centering + per-head gates); Lample et al. 2019
 (arXiv:1907.05242), Wu et al. 2022 (arXiv:2203.08913), Su et al. 2021
-(whitening/centering), Charikar 2002 (simhash).
+(whitening/centering), Charikar 2002 (simhash); W22 (read_topk —
+Lample 2019 / Wu 2022 / Borgeaud et al. 2022, arXiv:2112.04426).
 """
 from __future__ import annotations
 
@@ -261,7 +275,7 @@ class M1M2(nn.Module):
     def __init__(self, num_heads: int = 32, head_dim: int = 128,
                  mem_size: int = 128, num_linear_layers: int = 24,
                  write_addr: str = "content", center_write: bool = True,
-                 addr_blocks: int = 4):
+                 addr_blocks: int = 4, read_topk: Optional[int] = None):
         num_heads = _pos_int("num_heads", num_heads)
         head_dim = _pos_int("head_dim", head_dim)
         mem_size = _pos_int("mem_size", mem_size)
@@ -279,6 +293,19 @@ class M1M2(nn.Module):
             raise ValueError(
                 f"M1M2: addr_blocks must be <= 8 (the sign-block budget; "
                 f"the ladder tops out at 8), got {addr_blocks}")
+        # W22 — the sparse-read knob: None (the default) is the spec
+        # §2.2 dense softmax, bit-identical to every pre-W22 read; an
+        # int k in [1, mem_size] softmaxes over the TOP-k slots only
+        # (every proven key-value memory retrieves sparsely — see read).
+        if read_topk is not None:
+            if isinstance(read_topk, bool) or not isinstance(read_topk, int):
+                raise TypeError(
+                    f"M1M2: read_topk must be None or a python int, got "
+                    f"{type(read_topk).__name__} ({read_topk!r})")
+            if not 1 <= read_topk <= _pos_int("mem_size", mem_size):
+                raise ValueError(
+                    f"M1M2: read_topk must be in [1, mem_size={mem_size}], "
+                    f"got {read_topk}")
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -287,6 +314,7 @@ class M1M2(nn.Module):
         self.write_addr = write_addr
         self.center_write = center_write
         self.addr_blocks = addr_blocks
+        self.read_topk = read_topk
         self._sqrt_d = math.sqrt(head_dim)
         # GATES — the only weights (the §7 fine-tune trains these).
         self.write_gate_k = nn.Parameter(
@@ -329,7 +357,8 @@ class M1M2(nn.Module):
                 f"num_linear_layers={self.num_linear_layers}, "
                 f"write_addr={self.write_addr!r}, "
                 f"center_write={self.center_write}, "
-                f"addr_blocks={self.addr_blocks}")
+                f"addr_blocks={self.addr_blocks}, "
+                f"read_topk={self.read_topk}")
 
     def _addr_geometry(self) -> Tuple[int, int, int]:
         """Validate the addressing config and derive (blocks, stride,
@@ -462,6 +491,23 @@ class M1M2(nn.Module):
                 f"{tuple(m.shape)}")
 
     # ---------------------------------------------------------------- read --
+    def _read_k(self) -> Optional[int]:
+        """Validate the read_topk knob at read time (the module is a
+        long-lived object whose knobs are set post-init by the drivers —
+        the same loudness the write knobs get at _addr_geometry)."""
+        k = self.read_topk
+        if k is None:
+            return None
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise TypeError(
+                f"M1M2.read: read_topk must be None or a python int, got "
+                f"{type(k).__name__} ({k!r})")
+        if not 1 <= k <= self.mem_size:
+            raise ValueError(
+                f"M1M2.read: read_topk must be in [1, mem_size="
+                f"{self.mem_size}], got {k}")
+        return k
+
     def read(self, q: torch.Tensor, m1: torch.Tensor, m2: torch.Tensor,
              layer_idx: int) -> torch.Tensor:
         """softmax(q @ M1ᵀ) @ M2, scaled by read_gate[layer_idx] (spec §2.2).
@@ -477,6 +523,23 @@ class M1M2(nn.Module):
         with a centered M2 the retrieved value is that cluster's centered
         deviation — the q's own common direction dots to ~0 against the
         zero-slot-mean state, so the read self-centers.
+
+        W22 — read_topk (the sparse retrieval every proven key-value
+        memory uses): when set to k, the softmax runs over the TOP-k
+        slots of the score row only (the rest stay at exactly zero
+        probability). Product-Key Memory retrieves its top-32 of 2^26
+        slots (Lample et al. 2019, arXiv:1907.05242 — the sparse read is
+        what makes a large memory USEFUL rather than a blur); Memorizing
+        Transformers read exact kNN (Wu et al. 2022, arXiv:2203.08913);
+        RETRO attends to its top-k chunks (Borgeaud et al. 2022). A
+        dense softmax over 1024 accumulating slots is a near-uniform
+        average — the top-k read makes the query pull the CONTENT
+        clusters it actually matches. None (the default) keeps the
+        spec §2.2 dense contract bit-identically (a deployment knob:
+        the ingest/query drivers expose --m1m2-read-topk; the §7
+        fine-tune never reads, so the gates artifact is regime-valid
+        either way). k = mem_size is the dense softmax up to the
+        softmax's own summation order.
         """
         self._check_layer_idx("read", layer_idx)
         self._check_qkv("read", "q", q)
@@ -490,7 +553,16 @@ class M1M2(nn.Module):
         scores = torch.matmul(q.to(torch.float32),
                               m1.to(torch.float32).transpose(-1, -2))
         scores = scores / self._sqrt_d
-        probs = torch.softmax(scores, dim=-1)          # over the mem dim
+        k = self._read_k()
+        if k is None:
+            probs = torch.softmax(scores, dim=-1)   # over the mem dim
+        else:
+            # top-k sparse: softmax the k gathered scores, scatter the
+            # probabilities back — the unselected slots hold EXACT zeros
+            top_vals, top_idx = torch.topk(scores, k, dim=-1)
+            top_probs = torch.softmax(top_vals, dim=-1)
+            probs = torch.zeros_like(scores)
+            probs = probs.scatter(-1, top_idx, top_probs)
         out = torch.matmul(probs, m2.to(torch.float32))   # (B, H, T, D)
         out = out * self.read_gate[layer_idx]          # per-layer scalar gate
         return out.to(q.dtype)
