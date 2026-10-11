@@ -665,6 +665,15 @@ times and the gate-gradient magnitudes ride every history entry (the
 gates off the P3 exact saddle BEFORE step 0; delta_loss scores the
 states the centered retrieval frame scores (m - m_init).
 
+W20.14 — the discrimination is finally VISIBLE: every history entry
+carries the _pair_sim_stats fields (cos_pos/cos_neg/spread/off_max/
+diag_min — read off the same B x B matrix the loss trains on; the v1
+cos(neg) was the rolled true-pair mean, identically equal to cos(pos),
+so the box's 300-step run could never see a spread) plus the pool
+phase (steps_on_batch — the refresh-cycle position that makes the
+loss oscillate on the log grid: log_every=25 against refresh_every=4
+aliases the pool cycle, an artifact, not non-convergence).
+
     W20.11.2 — the loader pinning: each pool refresh stages its prefill
 inputs on the capture device (a non_blocking H2D — the driver hands
 pinned HOST id tensors; ids already on the device pass through), and
@@ -808,11 +817,15 @@ over the captured k/v) is untouched.
         opt.zero_grad(set_to_none=True)
         tb = time.perf_counter()
         loss.backward()
+        # W20.14 — the discrimination the loss optimizes, finally
+        # measurable: the same B x B sim matrix, read as stats (the v1
+        # metric reported the negatives as the ROLLED true-pair mean —
+        # a permutation, identical mean, spread structurally 0)
+        stats = _pair_sim_stats(m1_a, m2_a, m1_b, m2_b)
         # W19 — the saddle/health detector: the gate-grad magnitudes the
         # box asked for (recorded BEFORE the clip; 0.0 = dead path)
         gk_absmax = _grad_absmax(module.write_gate_k)
         gv_absmax = _grad_absmax(module.write_gate_v)
-        pos, neg = cosine_spread(m1_a, m2_a, m1_b, m2_b)
         # W18: the replay graphs (the recorded k/v refs + the state
         # outputs) free here; explicit del after the metrics are read
         # keeps the peak flat across steps on the A10G.
@@ -824,13 +837,18 @@ over the captured k/v) is untouched.
         phase["backward_s"] += time.perf_counter() - tb
         cfg.history.append({
             "step": step, "loss": float(loss.item()),
-            "cos_pos": pos, "cos_neg": neg,
             "lr": opt.param_groups[0]["lr"],
             "gk_absmax": gk_absmax, "gv_absmax": gv_absmax,
-            **phase})
+            "pool": steps_on_batch,
+            **stats, **phase})
         if cfg.log_every and step % cfg.log_every == 0:
-            print(f"    [gates] step {step:4d} loss {loss.item():.4f} "
-                  f"cos(pos) {pos:+.3f} cos(neg) {neg:+.3f} "
+            print(f"    [gates] step {step:4d} pool {steps_on_batch}/"
+                  f"{cfg.refresh_every} loss {loss.item():.4f} "
+                  f"cos(pos) {stats['cos_pos']:+.3f} "
+                  f"cos(neg) {stats['cos_neg']:+.3f} "
+                  f"spread {stats['spread']:+.3f} "
+                  f"[worst neg {stats['off_max']:+.3f} "
+                  f"weakest pos {stats['diag_min']:+.3f}] "
                   f"lr {opt.param_groups[0]['lr']:.2e} "
                   f"|g| {gk_absmax:.2e}/{gv_absmax:.2e} "
                   f"cap {phase['capture_s'] / (step + 1):.2f}s "
