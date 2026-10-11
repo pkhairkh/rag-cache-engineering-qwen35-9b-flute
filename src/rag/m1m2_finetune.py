@@ -118,6 +118,30 @@ a layer subset (zeroed grads; the default weight_decay=0 keeps them
 bit-anchored) — the "isolate single layer" experiment without code
 changes on the box.
 
+W20.15 — THE REGIME (what the fixed metric revealed on the box's
+300-step re-run): a SAWTOOTH. The between-capture-block loss variance
+measured 7,595x the within-block variance (the block difficulty IS
+the batch — its 8 pairs' own cross-side alignment; the background
+cos_neg is stable while cos_pos swings 0.35..0.74), the pre-clip
+|gv| swung 160x with the batch, only 600 of 14,469 train pairs were
+consumed (4.1% — one pass never completed), and the spread plateaued
+at ~0.12-0.13. Three instruments + one regime fix landed:
+  * epoch_batches — per-epoch RE-BATCHING: the v1 cycle re-yielded the
+    SAME file-order slices forever, so a pair's in-batch negatives
+    were fixed by the file layout for the whole run; every epoch now
+    draws fresh negative sets (deterministic per seed+epoch).
+  * the gate VALUE stats (gk/gv min/max/absmean) + the capture batch
+    ordinal ride every history entry — 300 steps of |g| said nothing
+    about WHERE the gates actually were.
+  * lexical_overlap + bucketed_spread — the held-out gap bucketed by
+    the pair's SURFACE overlap: the write is position-addressed
+    (slot = p mod mem_size, ONE token per slot at T < mem_size, so the
+    state delta IS the key sequence and state-cos = position-aligned
+    key correlation); the bucket report makes the predicted ceiling
+    (high-overlap pairs separate, low-overlap pairs do not) measurable
+    instead of arguable. The label-0 rows (17,519 curated non-pairs,
+    unused by the v1 loader) become the driver's CONTROL LINE.
+
 WHAT IS TRAINED: ONLY the M1M2 module's gate vectors
 (write_gate_k/write_gate_v per linear layer, optionally read_gate) —
 `freeze_all_but_gates` turns off every other parameter of the model
@@ -152,6 +176,7 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -166,7 +191,8 @@ __all__ = [
     "GatesTrainConfig", "save_gates", "load_gates",
     "freeze_all_but_gates", "M1M2CallRecorder",
     "prefill_capture_calls", "replay_states", "infonce_pairs_loss",
-    "cosine_spread", "train_gates",
+    "cosine_spread", "epoch_batches", "lexical_overlap",
+    "bucketed_spread", "train_gates",
 ]
 
 
@@ -562,6 +588,136 @@ def cosine_spread(m1_a, m2_a, m1_b, m2_b) -> Tuple[float, float]:
     return s["cos_pos"], s["cos_neg"]
 
 
+# ------------------------------------------------- W20.15 the regime -----
+def epoch_batches(pairs: Sequence, batch: int, seed: int = 1234):
+    """W20.15 — the per-epoch RE-BATCHING generator (the trainer's
+    `pairs` iterator: yields lists of `batch` (ids_a, ids_b) tuples,
+    forever).
+
+    WHY (the box's 300-step run): the v1 `_cycle_batches` walked the
+    pair list in ONE fixed order forever, so a pair's in-batch
+    negatives — the InfoNCE's ENTIRE negative signal — were fixed by
+    the file layout for the whole run; 300 steps at B=8/refresh 4
+    consumed 600 of 14,469 train pairs (4.1%, never one full epoch),
+    and longer runs would have looped the SAME 75 batches' neighbor
+    sets indefinitely. Every epoch here re-shuffles with
+    Random(seed*100003 + epoch) and partitions into fresh batches —
+    new negative combinations per epoch, deterministic and
+    reproducible run to run.
+
+    THE TAIL: the last slice of an epoch wraps with the epoch's FIRST
+    pairs so every batch holds exactly `batch` pairs (the loss's own
+    B >= 2 contract). The wrap is DISJOINT from the tail slice (the
+    wrap takes indices [0, batch - tail_len), which are all < the
+    last slice's start whenever batch < n), so no pair appears TWICE
+    in ONE batch — the duplicated members only straddle two batches
+    of the same epoch (harmless: a batch's negatives are its other
+    members, which remain distinct pairs). n <= batch yields the
+    whole shuffled set as ONE batch (nothing to wrap).
+    """
+    if isinstance(batch, bool) or not isinstance(batch, int) or batch < 2:
+        raise ValueError(
+            f"epoch_batches: batch must be an int >= 2 (the InfoNCE "
+            f"needs in-batch negatives), got {batch!r}")
+    items = list(pairs)
+    n = len(items)
+    if n < 2:
+        raise ValueError(
+            f"epoch_batches: {n} pair cannot form a batch — the "
+            f"InfoNCE needs >= 2 (in-batch negatives)")
+    epoch = 0
+    while True:
+        order = list(range(n))
+        random.Random(seed * 100003 + epoch).shuffle(order)
+        if n <= batch:
+            yield [items[i] for i in order]
+            epoch += 1
+            continue
+        for s in range(0, n, batch):
+            take = order[s:s + batch]
+            if len(take) < batch:
+                take = take + order[:batch - len(take)]
+            yield [items[i] for i in take]
+        epoch += 1
+
+
+def lexical_overlap(text_a: str, text_b: str) -> float:
+    """W20.15 — the pair's SURFACE alignment: the word-multiset
+    containment |A ∩ B| / min(|A|, |B|) over lowercased whitespace
+    words (1.0 = the shorter text is lexically contained in the
+    longer; 0.0 = disjoint vocabularies).
+
+    THE DIAGNOSSTIC ROLE: the M1/M2 write is position-addressed
+    (slot = p mod mem_size) and at T < mem_size every slot holds
+    EXACTLY ONE token, so a pair-side's state delta IS its key/value
+    sequence and the state cosine is the POSITION-ALIGNED key
+    correlation — a pair separates only if its two sides carry
+    similar tokens at the same positions (surface alignment), no
+    matter the semantics. Bucketing the held-out gap by this overlap
+    makes that ceiling MEASURABLE: a gap that lives only in the
+    high-overlap bucket is the position-lock signature; a flat bucket
+    profile means the signal is not surface-locked and the question
+    moves to capacity/optimization."""
+    if not isinstance(text_a, str) or not isinstance(text_b, str):
+        raise TypeError(
+            f"lexical_overlap: both members must be str, got "
+            f"{type(text_a).__name__} / {type(text_b).__name__}")
+    from collections import Counter
+    ca = Counter(text_a.lower().split())
+    cb = Counter(text_b.lower().split())
+    inter = sum((ca & cb).values())
+    denom = min(sum(ca.values()), sum(cb.values()))
+    return float(inter) / denom if denom else 0.0
+
+
+def bucketed_spread(m1_a, m2_a, m1_b, m2_b,
+                    buckets: Sequence[str]) -> Dict[str, dict]:
+    """W20.15 — the held-out stats BUCKETED per pair: `_pair_sim_stats`'s
+    overall row (the same B x B matrix the loss trains on) plus, per
+    bucket label, the members' mean TRUE-pair cosine (the diagonal)
+    and their gap against the OVERALL off-diagonal mean (the shared
+    in-batch-negative background).
+
+    buckets[i] labels pair i (len(buckets) == B required). The report
+    reads: bucket cos_pos - overall cos_neg. A high-overlap bucket at
+    gap ~ +0.3 with a low-overlap bucket at ~ 0.0 is the
+    position-locked-write signature (see lexical_overlap); a flat
+    profile is the negative result that redirects the investigation.
+    Labels are reported verbatim — the caller owns the bucketing
+    rule (the driver uses lexical overlap thirds)."""
+    b = int(m1_a.shape[0])
+    if len(buckets) != b:
+        raise ValueError(
+            f"bucketed_spread: {len(buckets)} bucket labels for {b} "
+            f"pairs — one label per pair, aligned with the stacked "
+            f"sides")
+    with torch.no_grad():
+        sim = 0.5 * (_flat_unit(m1_a) @ _flat_unit(m1_b).T
+                     + _flat_unit(m2_a) @ _flat_unit(m2_b).T)
+        diag = torch.diagonal(sim)
+        off = sim[~torch.eye(b, dtype=torch.bool, device=sim.device)]
+        cos_neg = float(off.mean()) if b >= 2 else float("nan")
+        diag_list = [float(x) for x in diag]
+    out: Dict[str, Dict[str, float]] = {
+        "overall": {
+            "cos_pos": float(diag.mean()), "cos_neg": cos_neg,
+            "spread": float(diag.mean() - off.mean()) if b >= 2
+            else float("nan"),
+            "off_max": float(off.max()) if b >= 2 else float("nan"),
+            "diag_min": float(diag.min()),
+        },
+        "buckets": {},
+    }
+    for label in dict.fromkeys(buckets):          # first-seen order
+        members = [diag_list[i] for i, x in enumerate(buckets) if x == label]
+        pos = sum(members) / len(members)
+        out["buckets"][label] = {
+            "n": len(members), "cos_pos": pos,
+            "gap": pos - cos_neg,
+        }
+    return out
+
+
 # ------------------------------------------------------------- the loop ---
 @dataclass
 class GatesTrainConfig:
@@ -634,6 +790,21 @@ def _grad_absmax(param) -> float:
     return float(param.grad.detach().abs().max())
 
 
+def _gate_value_stats(module) -> Dict[str, float]:
+    """W20.15 — WHERE THE GATES ARE (not just their gradients): min /
+    max / absmean of both write-gate vectors. The box's 300-step run
+    logged 300 |g| absmax values and ZERO parameter locations — the
+    gates could have gone anywhere (negative = subtractive writes are
+    legal and unbounded) and the history could not say where they
+    ended; these fields pin it per step, post-update."""
+    gk = module.write_gate_k.detach().float()
+    gv = module.write_gate_v.detach().float()
+    return {"gk_min": float(gk.min()), "gk_max": float(gk.max()),
+            "gk_absmean": float(gk.abs().mean()),
+            "gv_min": float(gv.min()), "gv_max": float(gv.max()),
+            "gv_absmean": float(gv.abs().mean())}
+
+
 def _stage_ids(ids, dev):
     """W20.11.2 — the loader pinning: one prefill input onto the capture
 device (non_blocking H2D — a pinned host source rides async DMA;
@@ -682,6 +853,15 @@ so the box's 300-step run could never see a spread) plus the pool
 phase (steps_on_batch — the refresh-cycle position that makes the
 loss oscillate on the log grid: log_every=25 against refresh_every=4
 aliases the pool cycle, an artifact, not non-convergence).
+
+W20.15 — the entry also carries the capture-batch ORDINAL ("batch" —
+the block id the loss sawtooths on; the post-hoc analysis groups by
+it) and the gate VALUE stats (gk/gv min/max/absmean, read post-update:
+WHERE the gates are, not just how hard they are pushed — the box's
+run logged 300 |g| values and zero parameter locations). The `pairs`
+iterable is normally the driver's epoch_batches generator (per-epoch
+re-batching: fresh in-batch negative sets every epoch, deterministic
+per seed).
 
     W20.11.2 — the loader pinning: each pool refresh stages its prefill
 inputs on the capture device (a non_blocking H2D — the driver hands
@@ -756,6 +936,7 @@ over the captured k/v) is untouched.
     phase = {"capture_s": 0.0, "replay_s": 0.0, "backward_s": 0.0}
     cap_batch: Optional[List[List[Tuple]]] = None   # the retained sides
     steps_on_batch = 0
+    batch_idx = 0       # W20.15 — the capture-batch ordinal (the block id)
     pool_bytes = 0
     pending = iter(pairs)
     step = -1
@@ -817,6 +998,7 @@ over the captured k/v) is untouched.
             except StopIteration:
                 staged = None
             steps_on_batch = 0
+            batch_idx += 1      # W20.15 — a new capture block starts
             phase["capture_s"] += time.perf_counter() - tc
             if cfg.log_every:
                 print(f"    [gates] capture batch prefilled: "
@@ -882,6 +1064,8 @@ over the captured k/v) is untouched.
             "lr": opt.param_groups[0]["lr"],
             "gk_absmax": gk_absmax, "gv_absmax": gv_absmax,
             "pool": steps_on_batch,
+            "batch": batch_idx,          # W20.15 — the block id
+            **_gate_value_stats(module),  # W20.15 — where the gates ARE
             **stats, **phase})
         if cfg.log_every and step % cfg.log_every == 0:
             print(f"    [gates] step {step:4d} pool {steps_on_batch}/"
@@ -898,6 +1082,7 @@ over the captured k/v) is untouched.
                   f"bwd {phase['backward_s'] / (step + 1):.2f}s "
                   f"({time.perf_counter() - t0:.0f}s)", flush=True)
     if cfg.history:
+        gv_stats = _gate_value_stats(module)
         print(f"    [gates] done: {len(cfg.history)} steps in "
               f"{time.perf_counter() - t0:.1f}s — capture "
               f"{phase['capture_s']:.1f}s / replay "
@@ -905,5 +1090,9 @@ over the captured k/v) is untouched.
               f"{phase['backward_s']:.1f}s "
               f"({100 * phase['capture_s'] / max(1e-9, sum(phase.values())):.0f}% "
               f"capture), final |gk| "
-              f"{_grad_absmax(module.write_gate_k):.2e}", flush=True)
+              f"{_grad_absmax(module.write_gate_k):.2e}, gates "
+              f"k[{gv_stats['gk_min']:+.3f}..{gv_stats['gk_max']:+.3f}] "
+              f"v[{gv_stats['gv_min']:+.3f}..{gv_stats['gv_max']:+.3f}] "
+              f"(|k| {gv_stats['gk_absmean']:.3f} / |v| "
+              f"{gv_stats['gv_absmean']:.3f})", flush=True)
     return cfg
