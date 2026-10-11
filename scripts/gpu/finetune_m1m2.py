@@ -74,6 +74,34 @@ vectors (no stacked (B, mem, H, D) states — the 4 x 1.07 GiB stacks
 that OOM'd), frees the replay graphs per side, and every report
 section is a try/except that WARNS and continues (a report failure
 never loses the artifact again).
+
+W22 — THE LADDER OOM, ROOT-CAUSED (the box's W21.6 run): the W21
+streaming kept the units ON THE GPU — 128 captured pair-sides (~2.6
+GiB k/v) + four (64, dim) unit stacks + their python lists (~6 GiB
+transient) on top of the model and the allocator's un-returnable
+residue: the first ladder row hit the 22 GiB ceiling at a 16 MiB
+allocation. The ladder now runs HOST-STAGED: the capture moves every
+recorded k/v + m_init to (pinned) host memory the moment a side's
+prefill ends, the replay streams one side's calls to the device and
+frees them, the units stack on the HOST, and _sim_from_units stages
+only (chunk, dim) row/col blocks onto the device for the matmul —
+the ladder's GPU footprint beyond the model is bounded at < 1 GiB
+no matter how many pairs or rows. The [4] residue (the epoch
+iterator, the trailing prefetch, the system cache) is released
+before [6] (gc + empty_cache). The UnboundLocalError crash after the
+ladder (the box's traceback: `del val_group` then a later
+`if val_group is not None` — `del` UNBINDS the name) is fixed: the
+groups rebind to None, never del.
+
+W22 — THE CURATED HARD NEGATIVES (--neg-pairs N, default 8): the
+label-0 rows the loader already carries join the TRAINING loss as
+shared negative columns (see m1m2_finetune's W22 note — DPR/MoCo's
+proven small-batch fix; the box's B=8 loss swung 0.28..1.64 on seven
+random in-batch draws). The train negatives draw from the label-0
+pool EXCLUDING the held-out control slice (the first n_eval rows
+after the seeded shuffle — the control line stays untouched by
+training), re-batched per epoch under the same seed. --neg-pairs 0
+restores the exact W21 loss (the A/B).
 """
 from __future__ import annotations
 
@@ -215,28 +243,34 @@ def _overlap_profile(text_pairs, cap: int = 4000):
 
 
 # ----------------------------------------------- the [6] streaming ladder --
-def _side_units(module, calls, m1_i, m2_i):
-    """One pair side -> (u1, u2): the L2-normalized flat DELTA vectors
-    (fp32, (dim,), on the capture device) — the pair_sim_matrix
-    operands. Runs the replay under no_grad and frees the graph before
-    returning (the [6] OOM fix: no stacked states, no retained
-    autograd; the gates' requires_grad is irrelevant under no_grad —
-    this is the metric path, not the training path)."""
-    with torch.no_grad():
-        m1, m2 = replay_states(module, calls, m1_i, m2_i)
-        u1 = flat_unit(m1 - m1_i)[0]
-        u2 = flat_unit(m2 - m2_i)[0]
-    u1, u2 = u1.detach(), u2.detach()
-    del m1, m2
-    return u1, u2
+def _to_host(t, pin: bool):
+    """W22 — one tensor to (optionally pinned) HOST memory with its own
+    storage (the ladder's host staging; a no-op returning the same
+    object when already there — .to() semantics)."""
+    if t is None:
+        return None
+    h = t.detach().to("cpu")
+    return h.pin_memory() if pin and h.device.type == "cpu" else h
 
 
-def _capture_group(model, system, cache_factory, id_pairs):
+def _capture_group(model, system, cache_factory, id_pairs,
+                   host_stage: bool = False):
     """Streaming capture of a group of pairs: per pair, per side —
     prefill through the production path and KEEP ONLY the calls +
     m_init (the ladder replays them under every addressing config; the
     cache and the graphs are dropped per side). Returns the list of
-    [(calls_a, m1i_a, m2i_a), (calls_b, m1i_b, m2i_b)] per pair."""
+    [(calls_a, m1i_a, m2i_a), (calls_b, m1i_b, m2i_b)] per pair.
+
+    W22 — host_stage=True (the ladder's mode): the recorded k/v and
+    the m_init land on (pinned) HOST memory the moment the side's
+    prefill ends — the GPU keeps nothing per side beyond the prefill
+    transients (the W21.6 box run OOM'd at the first ladder row with
+    ~2.6 GiB of retained device-side k/v on top of the unit stacks).
+    The ladder streams each side back to the device at replay time
+    (_side_units) — the values are bit-identical, only the residence
+    moved. host_stage=False keeps the W21 device-resident behavior
+    for any other caller."""
+    pin = host_stage and torch.cuda.is_available()
     sides = []
     for ids_a, ids_b in id_pairs:
         ps = []
@@ -244,19 +278,61 @@ def _capture_group(model, system, cache_factory, id_pairs):
             c = cache_factory()
             calls, m1i, m2i = prefill_capture_calls(model, ids, c, system)
             del c
+            if host_stage:
+                calls = [(_to_host(k, pin), _to_host(v, pin), li,
+                          _to_host(pos, pin))
+                         for (k, v, li, pos) in calls]
+                m1i, m2i = _to_host(m1i, pin), _to_host(m2i, pin)
             ps.append((calls, m1i, m2i))
         sides.append(ps)
     return sides
 
 
-def _group_units(module, group):
+def _side_units(module, calls, m1_i, m2_i, dev=None):
+    """One pair side -> (u1, u2): the L2-normalized flat DELTA vectors
+    (fp32, (dim,), HOST) — the pair_sim_matrix operands. Runs the
+    replay under no_grad and frees the graph before returning (the
+    [6] OOM fix: no stacked states, no retained autograd; the gates'
+    requires_grad is irrelevant under no_grad — this is the metric
+    path, not the training path).
+
+    W22 — device streaming: the calls/m_init may live on HOST (the
+    host-staged capture); each call's k/v (+ positions) stages to
+    `dev` (the module's device) for the replay and frees after, so
+    the replay's device footprint is one call's k/v + the states
+    (~O(50 MiB)) regardless of the group size. Values bit-identical
+    (transport only). The returned units land on HOST (the stacks
+    and the sim-matmul chunks stage back per block — bounded)."""
+    if dev is None:
+        dev = module.write_gate_k.device
+    fast = dev.type == "cuda"
+    staged = [(k.to(dev, non_blocking=fast),
+               v.to(dev, non_blocking=fast), li,
+               pos.to(dev, non_blocking=fast) if pos is not None else None)
+              for (k, v, li, pos) in calls]
+    m1d, m2d = m1_i.to(dev), m2_i.to(dev)
+    with torch.no_grad():
+        m1, m2 = replay_states(module, staged, m1d, m2d)
+        u1 = flat_unit(m1 - m1d)[0]
+        u2 = flat_unit(m2 - m2d)[0]
+    u1, u2 = u1.detach().to("cpu"), u2.detach().to("cpu")
+    del m1, m2, m1d, m2d, staged
+    return u1, u2
+
+
+def _group_units(module, group, dev=None):
     """Replay every side of a captured group under the module's CURRENT
     addressing knobs -> (A1, A2, B1, B2): the four (B, dim) fp32 unit
-    matrices (a-side m1/m2, b-side m1/m2)."""
+    matrices (a-side m1/m2, b-side m1/m2).
+
+    W22 — the stacks build on the HOST (each side's unit comes back
+    from _side_units resident there): 4 x 1.07 GiB of HOST fp32 at 64
+    pairs, zero device pressure (the W21 device-side stacks + their
+    lists were the OOM's second term)."""
     u1a, u2a, u1b, u2b = [], [], [], []
     for (ca, i1a, i2a), (cb, i1b, i2b) in group:
-        a1, a2 = _side_units(module, ca, i1a, i2a)
-        b1, b2 = _side_units(module, cb, i1b, i2b)
+        a1, a2 = _side_units(module, ca, i1a, i2a, dev)
+        b1, b2 = _side_units(module, cb, i1b, i2b, dev)
         u1a.append(a1)
         u2a.append(a2)
         u1b.append(b1)
@@ -265,22 +341,35 @@ def _group_units(module, group):
             torch.stack(u1b), torch.stack(u2b))
 
 
-def _sim_from_units(A1, A2, B1, B2, chunk: int = 16):
+def _sim_from_units(A1, A2, B1, B2, chunk: int = 16, dev=None):
     """0.5*(cos_m1 + cos_m2) from the unit matrices — the pair_sim_matrix
     arithmetic, CHUNKED so no full (B, dim) @ (dim, B) fp32 operand pair
     is ever live (the [6] OOM fix: the transients are (chunk, dim) x
     (dim, chunk)). The values are identical to the unchunked matmul up
-    to fp32 accumulation order (a report, not a gradient)."""
+    to fp32 accumulation order (a report, not a gradient).
+
+    W22 — the units are HOST-stacked; when `dev` is a CUDA device each
+    (chunk, dim) row block and (dim, chunk) col block stages to the
+    device for the matmul and the (chunk, chunk) result lands back on
+    host — the matmul's device footprint is ~2 x chunk x dim fp32
+    (~0.5 GiB at chunk 16 / dim 2^22) regardless of B. dev=None or a
+    cpu device computes the blocks in place (the no-CUDA self-test
+    path)."""
     B = A1.shape[0]
+    fast = (dev if dev is not None else A1.device)
+    if fast.type != "cuda" or A1.device.type != "cpu":
+        fast = A1.device       # compute where the units live
     sim = torch.zeros(B, B, device=A1.device, dtype=torch.float32)
     for r in range(0, B, chunk):
-        ra1 = A1[r:r + chunk].float()
-        ra2 = A2[r:r + chunk].float()
+        ra1 = A1[r:r + chunk].to(fast).float()
+        ra2 = A2[r:r + chunk].to(fast).float()
         for c in range(0, B, chunk):
-            cb1 = B1[c:c + chunk].float().T
-            cb2 = B2[c:c + chunk].float().T
-            sim[r:r + chunk, c:c + chunk] = \
-                0.5 * (ra1 @ cb1 + ra2 @ cb2)
+            cb1 = B1[c:c + chunk].to(fast).float().T
+            cb2 = B2[c:c + chunk].to(fast).float().T
+            block = 0.5 * (ra1 @ cb1 + ra2 @ cb2)
+            sim[r:r + chunk, c:c + chunk] = block.to(sim.device)
+            del cb1, cb2, block
+        del ra1, ra2
     return sim
 
 
@@ -384,6 +473,13 @@ def main() -> int:
     ap.add_argument("--batch-pairs", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--tau", type=float, default=0.07)
+    ap.add_argument("--neg-pairs", type=int, default=8,
+                    help="W22: curated label-0 SIDES attached to every "
+                         "capture pool as shared InfoNCE hard-negative "
+                         "columns (DPR/MoCo's proven small-batch fix; the "
+                         "B=8 in-batch pool is 7 random draws). 0 = the "
+                         "exact W21 loss (the A/B). Drawn from the label-0 "
+                         "rows EXCLUDING the held-out control slice")
     ap.add_argument("--train-read-gate", action="store_true",
                     help="unfreeze read_gate too (the contrastive loss "
                          "itself never sees it — the read affects "
@@ -528,6 +624,44 @@ def main() -> int:
 
     train_iter = _tallied(train_iter)
 
+    # W22 — the curated hard-negative feed: the label-0 rows EXCLUDING
+    # the held-out control slice (the first n_ctrl rows after the seeded
+    # shuffle — [6]'s control line stays untouched by training), encoded
+    # as single b-SIDES (the loss's candidate columns: an anchor must
+    # rank its OWN text2 above a curated non-pair's text2). Capped at
+    # 2048 sides (75 pools x 8 = 600 uses — one epoch, no reuse; the
+    # cap is an encode-time guard, not a semantic one). The feed rides
+    # the same epoch-rebatch regime (a different seed so the negative
+    # order never correlates with the pair order).
+    n_ctrl = min(args.val_pairs, len(val_pairs)) if val_pairs else 0
+    neg_iter = None
+    if args.neg_pairs and not args.self_test and len(neg_texts) > n_ctrl + 1:
+        if args.neg_pairs < 2:
+            print("    [W22] --neg-pairs < 2 — the shared-negative design "
+                  "needs a batch (training on in-batch negatives only)")
+        else:
+            cap = 2048
+            neg_train = neg_texts[n_ctrl:n_ctrl + cap]
+            neg_sides = []
+            for _t1, t2 in neg_train:
+                ids = tokenizer.encode(t2, add_special_tokens=False)
+                if args.max_tokens:
+                    ids = ids[:args.max_tokens]
+                if ids:
+                    neg_sides.append(_host_pinned(ids))
+            if len(neg_sides) >= args.neg_pairs:
+                neg_iter = epoch_batches(neg_sides, args.neg_pairs,
+                                         seed=args.shuffle_seed + 1)
+                print(f"    [W22] hard negatives: {len(neg_sides)} curated "
+                      f"label-0 sides (of {len(neg_texts) - n_ctrl} "
+                      f"non-control rows), {args.neg_pairs} per pool")
+            else:
+                print("    [W22] too few encodable label-0 sides — "
+                      "training on in-batch negatives only")
+    elif args.neg_pairs and args.self_test:
+        print("    [W22] the self-test carries no label-0 rows — no "
+              "curated negatives (mechanics path)")
+
     # [3.5] — the data-quality profile (text-only, no model): the
     # lexical-overlap distribution of the positives vs the label-0
     # controls — "is the data good" answered with numbers
@@ -560,6 +694,7 @@ def main() -> int:
         refresh_every=args.refresh_every,
         delta_loss=not args.absolute_loss,
         train_layers=_parse_layer_spec(args.train_layers),
+        neg_pairs=(args.neg_pairs if neg_iter is not None else 0),
         memopt=False if args.no_memopt else None)
     if args.no_memopt:
         print("    [A/B] plain autograd replay (the W17 OOM path) — "
@@ -576,12 +711,20 @@ def main() -> int:
           f"val {len(val_pairs)} (seeded random split); held-out eval "
           f"{min(args.val_pairs, len(val_pairs)) if val_pairs else 0} "
           f"pairs + the label-0 curated control")
+    if neg_iter is not None:
+        print(f"    [W22] loss: in-batch negatives + {args.neg_pairs} "
+              f"curated hard-negative columns per pool (the control "
+              f"slice stays held out)")
+    else:
+        print("    [W22] loss: in-batch negatives only (the W21 "
+              "regime; pass --neg-pairs 8 for the curated columns)")
 
     def cache_factory():
         return TQCache(config=model.config, bits=args.bits, online=True)
 
     t0 = time.perf_counter()
-    cfg = train_gates(model, train_iter, system, cache_factory, cfg)
+    cfg = train_gates(model, train_iter, system, cache_factory, cfg,
+                      negatives=neg_iter)
     print(f"    done in {time.perf_counter() - t0:.0f}s")
     # W20.15 — the coverage tally: how much of the train split this run
     # actually consumed (the box's v1 run: 600 of 14,469 = 4.1% — the
@@ -605,18 +748,33 @@ def main() -> int:
         "final_loss": cfg.history[-1]["loss"] if cfg.history else -1.0,
         "write_addr": args.write_addr,
         "center_write": not args.no_center_write,
-        "addr_blocks": args.addr_blocks})
+        "addr_blocks": args.addr_blocks,
+        "neg_pairs": (args.neg_pairs if neg_iter is not None else 0)})
     print(f"\n[5] Gates artifact: {out}")
     hist_path = os.path.splitext(out)[0] + "_history.json"
     with open(hist_path, "w") as f:
         json.dump(cfg.history, f, indent=1)
     print(f"    history: {hist_path}")
 
-    # release the training pool's cached blocks before the reports
+    # W22 — release the [4] residue before the reports: the epoch
+    # iterators (their cached batches + the trailing prefetch), and the
+    # [2] system cache hand their device blocks back; empty_cache alone
+    # only frees UNALLOCATED cached segments (the W21.6 run's 21.6 GiB
+    # "allocated" at the first ladder row — live references, not
+    # fragmentation). gc.collect() first: the generators' frames hold
+    # the staged tensors. (val_pairs STAYS — [6] captures from it; the
+    # ids are ~1 MiB.)
+    run_ladder = bool(val_pairs) and not args.no_m1m2
+    train_iter = None
+    neg_iter = None
+    cache = None
+    system_ids = None
+    import gc
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    if val_pairs and not args.no_m1m2:
+    if run_ladder:
         print("\n[6] Held-out discrimination ladder (W21: one capture, "
               "every addressing config replayed offline)...")
         module = inner.m1m2
@@ -630,10 +788,13 @@ def main() -> int:
                    args.addr_blocks)] + _ADDR_LADDER
 
         # ---- capture the held-out group ONCE (streaming; the labels
-        # and the ctrl texts ride along) ----
+        # and the ctrl texts ride along). W22: HOST-STAGED — the k/v +
+        # m_init land on (pinned) host per side; the ladder replays each
+        # side streamed to the module's device ----
+        ladder_dev = module.write_gate_k.device
         try:
             val_group = _capture_group(model, system, cache_factory,
-                                       val_pairs[:n_eval])
+                                       val_pairs[:n_eval], host_stage=True)
         except RuntimeError as exc:
             print(f"    [WARN] held-out capture failed ({exc}) — "
                   f"skipping the ladder (artifact already saved)")
@@ -661,7 +822,7 @@ def main() -> int:
                     model, system, cache_factory,
                     [(_host_pinned(a).to(args.device, non_blocking=True),
                       _host_pinned(b).to(args.device, non_blocking=True))
-                     for a, b in ctrl_ids[:n_eval]])
+                     for a, b in ctrl_ids[:n_eval]], host_stage=True)
             except RuntimeError as exc:
                 print(f"    [WARN] control capture failed ({exc}) — "
                       f"the ladder runs without the label-0 line")
@@ -681,8 +842,9 @@ def main() -> int:
                 module.write_addr = write_addr
                 module.center_write = center_write
                 module.addr_blocks = addr_blocks
-                A1, A2, B1, B2 = _group_units(module, val_group)
-                sim = _sim_from_units(A1, A2, B1, B2)
+                A1, A2, B1, B2 = _group_units(module, val_group,
+                                              dev=ladder_dev)
+                sim = _sim_from_units(A1, A2, B1, B2, dev=ladder_dev)
                 del A1, A2, B1, B2
                 st = sim_matrix_stats(sim)
                 print(f"    {label:34s} {_fmt_stats(st)}")
@@ -696,8 +858,9 @@ def main() -> int:
                                   f"gap {bb['gap']:+.4f}")
                 del sim
                 if ctrl_group is not None:
-                    C1, C2, D1, D2 = _group_units(module, ctrl_group)
-                    csim = _sim_from_units(C1, C2, D1, D2)
+                    C1, C2, D1, D2 = _group_units(module, ctrl_group,
+                                                  dev=ladder_dev)
+                    csim = _sim_from_units(C1, C2, D1, D2, dev=ladder_dev)
                     del C1, C2, D1, D2
                     cst = sim_matrix_stats(csim)
                     print(f"      label-0 control (the curated negatives, "
@@ -714,15 +877,21 @@ def main() -> int:
         module.write_addr = args.write_addr
         module.center_write = not args.no_center_write
         module.addr_blocks = args.addr_blocks
-        if val_group is not None:
-            del val_group
-        if ctrl_group is not None:
-            del ctrl_group
-        if ctrl_ids:
-            del ctrl_ids
+        # W22 — REBIND, never `del`: the trailing report below reads the
+        # binding, and `del val_group` UNBINDS the name (the box's W21.6
+        # traceback — UnboundLocalError at the exact `if val_group is
+        # not None` that follows a `del` four lines up). None releases
+        # the group's host tensors just as completely, without the
+        # unbinding.
+        ladder_ran = val_group is not None
+        val_group = None
+        ctrl_group = None
+        ctrl_ids = None
+        import gc as _gc
+        _gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        if val_group is not None:
+        if ladder_ran:
             print("    (cos(neg) ~0.36 on uncentered rows = the anisotropy "
                   "pedestal; the low-overlap bucket separating on content "
                   "rows but not on positional rows = the position lock, "
@@ -730,6 +899,8 @@ def main() -> int:
     elif not val_pairs:
         print("\n[6] (self-test: no held-out pairs — the ladder is a "
               "data-path report)")
+
+    val_pairs = None
 
     print("\n" + "=" * 60)
     print("GATE FINE-TUNE COMPLETE — re-ingest with --m1m2-gates "
