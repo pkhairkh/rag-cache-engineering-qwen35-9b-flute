@@ -72,6 +72,20 @@ outbound query, the inbound labels). The W16 frame side file rides
 snapshot.py's save/load edge (the npz hop lives THERE; this module
 stays host-array-free outside the faiss boundary).
 
+W20.10.2 — THE BATCHED FRAME BUILDS (PROPOSAL §3.6, the K4 serving
+side): the §4 vector builds (dequant + concat + L2-normalize) are
+batched GPU passes. The loader's per-unit dequant loops group their
+units by quantizer (resolve_quantizer's registry identity = one
+geometry: same d/bits/seed; the S units and M1/M2 are separate
+groups), and each group rides ONE tq_dequant_batched call (the kernel
+path, CUDA+eligible — the dispatcher's own predicate; every other box
+keeps the per-unit q.dequant loop, bit-identical to 4.3's build). The
+cosine-frame normalize is ONE batched pass per train/add block —
+tq_l2norm_rows when the extension provides it (the availability probe
+idiom; torch's .norm(dim=-1) twin otherwise). faiss still receives
+its vectors ONCE at the boundary: the same single FAISS-EDGE host hop
+per site, now feeding from the GPU-produced rows.
+
 Provenance (turboquant.py: "seeds persist in the index side-metadata"):
 build_index(path=...) writes <path>.meta.json with the config fields, the
 four D3 rotation SEEDS, sha256 digests of the production-frame codebook
@@ -110,7 +124,7 @@ from codebooks import get_codebook
 from ingest import MANIFEST_NAME, load_system_state
 from snapshot import load_chunk, load_frame_npz, save_frame_npz
 from tq_cache import resolve_quantizer
-from turboquant import SEEDS
+from turboquant import SEEDS, _load_tq_kernel, _tq_kernel_available
 
 __all__ = [
     "IndexConfig",
@@ -141,6 +155,103 @@ _FRAME_BITS = (3, 4)
 _FRAME_UNIT_D = 524_288
 
 _CODEBOOK_SHA_CACHE: Dict[Tuple[int, int], str] = {}
+
+
+# ------------------------------------------- W20.10.2: the batched passes --
+def _dequant_rows(q, codes_list):
+    """ONE tq_dequant_batched over one geometry group's codes (the serving
+    batch, PROPOSAL §3.6): the group's packed idx streams stack into the
+    entry's (M, L) rows, the 0-dim fp32 norms into the (M,) vector, and
+    the whole group decode rides ONE stream-ordered kernel chain — the
+    same call turboquant's _dequant_kernel makes at M=1 (row ownership
+    is per-CTA and fixed-order, so each unit's reconstruction is the
+    M=1 decode exactly; no host round trip of any kind).
+
+    Returns the (M, d) fp32 rows on the codes' device, or None when the
+    dispatcher would NOT route this decode to the kernel (CPU codes,
+    pre-build, ineligible geometry, sketch-carrying codes) — the caller
+    falls back to the per-unit q.dequant loop, bit-identical to 4.3's
+    build. The routing decision is the dispatcher's own predicate
+    (q._dequant_kernel_eligible on the first unit), evaluated after the
+    per-unit _check_codes belt (metadata-only, loud frame drift — the
+    dispatcher's own call order); the co-residency belt names both
+    devices loudly (_check_kernel_devices' discipline)."""
+    C = _load_tq_kernel()
+    if C is None or not codes_list:
+        return None
+    first = codes_list[0]
+    if not _tq_kernel_available(first.idx_lo):
+        return None
+    for i, c in enumerate(codes_list):
+        q._check_codes(c)      # metadata-only; loud frame drift, the
+        # dispatcher's own belt (_dequant_flat calls it before routing)
+        if c.device != first.device:
+            raise RuntimeError(
+                f"index.py batched decode: unit {i} sits on {c.device} "
+                f"but the group's first unit sits on {first.device} — a "
+                f"mixed-device frame; the loader's codes must be "
+                f"co-resident before the frame build")
+    if not q._dequant_kernel_eligible(first, torch.float32):
+        return None
+    dev = first.device
+    signs = q._device_signs(dev)
+    cb_lo, cb_hi = q._device_codebooks(dev)
+    codes_lo = torch.stack([c.idx_lo for c in codes_list]).contiguous()
+    codes_hi = torch.stack([c.idx_hi for c in codes_list]).contiguous()
+    norms = torch.stack([c.norm for c in codes_list])
+    return C.tq_dequant_batched(
+        codes_lo, codes_hi, norms, signs,
+        cb_lo.centroids, cb_hi.centroids,
+        q.n_lo, q.bits_lo, q.n_hi, q.bits_hi,
+        torch.float32)
+
+
+def _frame_rows(q, codes_list) -> torch.Tensor:
+    """(M, d) fp32 rows for one geometry group — ONE tq_dequant_batched on
+    the kernel path (W20.10.2), the per-unit q.dequant dispatcher loop
+    stacked otherwise (bit-identical to 4.3's per-unit build; each
+    q.dequant routes itself — the M=1 kernel call on CUDA+eligible, the
+    torch twin everywhere else)."""
+    rows = _dequant_rows(q, codes_list)
+    if rows is None:
+        rows = torch.stack([q.dequant(c) for c in codes_list])
+    return rows
+
+
+def _l2norm_rows(mat: torch.Tensor) -> torch.Tensor:
+    """The (M,) row L2 norms of an (M, N) block — tq_l2norm_rows when the
+    extension provides it for these rows (the availability probe idiom:
+    the kernel-pair probe plus the W20.9.2 name check, so a pre-W20.9
+    build falls back), torch's x.norm(dim=-1) otherwise (the
+    dispatcher-level convention — the W20.9.3 differential's own twin
+    reference)."""
+    C = _load_tq_kernel()
+    if (C is not None and hasattr(C, "tq_l2norm_rows")
+            and _tq_kernel_available(mat) and mat.dim() == 2
+            and mat.is_contiguous()
+            and mat.dtype in (torch.float32, torch.float16)):
+        return C.tq_l2norm_rows(mat)
+    return mat.norm(dim=-1)
+
+
+def _group_by_quantizer(units):
+    """W20.10.2 — the per-geometry grouping: (q, codes) pairs in
+    first-appearance order → [(q, positions, codes)] with `positions`
+    the pairs' §4 indices. resolve_quantizer's registry identity IS the
+    geometry (same instance = same d/bits/seed frame; different kinds or
+    dims never share an instance), so id(q) groups exactly the units a
+    single tq_dequant_batched call can serve."""
+    groups = []
+    by_q = {}
+    for pos, (q, codes) in enumerate(units):
+        g = by_q.get(id(q))
+        if g is None:
+            g = (q, [], [])
+            by_q[id(q)] = g
+            groups.append(g)
+        g[1].append(pos)
+        g[2].append(codes)
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -372,17 +483,28 @@ class ChunkVectorLoader:
 
     def _system_pieces(self) -> List[torch.Tensor]:
         """dequant(sys) per unit in §4 order (S ascending, M1, M2) — the
-        shared zero-point vector of the delta protocol."""
-        pieces = []
+        shared zero-point vector of the delta protocol.
+
+        W20.10.2: the units group by their quantizer (one geometry per
+        group — the S units and M1/M2 are separate groups), each group's
+        system codes ride ONE tq_dequant_batched on the kernel path
+        (CUDA+eligible — the dispatcher's own predicate); the fallback is
+        the per-unit q.dequant loop, bit-identical to 4.3's build."""
+        units = []
         for L in sorted(self.system.s_codes):
             sysc = self.system.s_codes[L]
-            pieces.append(resolve_quantizer(
-                "S", int(sysc.d), self.bits).dequant(sysc))
+            units.append((resolve_quantizer("S", int(sysc.d), self.bits),
+                          sysc))
         for name, sysc in (("M1", self.system.m1_codes),
                            ("M2", self.system.m2_codes)):
             if sysc is not None:
-                pieces.append(resolve_quantizer(
-                    name, int(sysc.d), self.bits).dequant(sysc))
+                units.append((resolve_quantizer(
+                    name, int(sysc.d), self.bits), sysc))
+        pieces: List[Optional[torch.Tensor]] = [None] * len(units)
+        for q, positions, codes_group in _group_by_quantizer(units):
+            rows = _frame_rows(q, codes_group)
+            for j, u in enumerate(positions):
+                pieces[u] = rows[j]
         return pieces
 
     def system_vector(self) -> torch.Tensor:
@@ -486,13 +608,39 @@ class ChunkVectorLoader:
                 f"{'...' if len(known) > 8 else ''} ({len(known)} total)")
         snap = self._load_snap(chunk_id, cid)
         pairs = self._unit_pairs(snap)
-        pieces = []
-        for _name, kind, sysc, chunk_codes in pairs:
+        # W20.10.2 — the batched frame build: the units group by their
+        # quantizer (one geometry per group — the S units and M1/M2 are
+        # separate groups), each group rides ONE tq_dequant_batched on
+        # the kernel path (CUDA+eligible — the dispatcher's own
+        # predicate; the fallback is the per-unit q.dequant loop,
+        # bit-identical to 4.3's build), and the §4 pieces land in unit
+        # order.
+        q_groups = []               # (q, positions, sys_group, chunk_group)
+        by_q = {}
+        for u, (_name, kind, sysc, chunk_codes) in enumerate(pairs):
             q = resolve_quantizer(kind, int(sysc.d), self.bits)
+            g = by_q.get(id(q))
+            if g is None:
+                g = (q, [], [], [])
+                by_q[id(q)] = g
+                q_groups.append(g)
+            g[1].append(u)
+            g[2].append(sysc)
+            g[3].append(chunk_codes)
+        pieces: List[Optional[torch.Tensor]] = [None] * len(pairs)
+        for q, positions, sys_group, chunk_group in q_groups:
             if snap.protocol == "absolute":
-                pieces.append(q.dequant(chunk_codes))
+                rows = _frame_rows(q, chunk_group)
+                for j, u in enumerate(positions):
+                    pieces[u] = rows[j]
             else:
-                pieces.append(q.dequant(sysc) + q.dequant(chunk_codes))
+                # delta-v1: the double-round absolute — the group's sys and
+                # chunk codes ride ONE stacked batched decode (sys rows
+                # first, then the chunk rows; the add is per unit)
+                rows = _frame_rows(q, [*sys_group, *chunk_group])
+                m = len(positions)
+                for j, u in enumerate(positions):
+                    pieces[u] = rows[j] + rows[m + j]
         vec = torch.cat(pieces).to(torch.float32)
         if vec.shape != (self._dims,):
             raise ValueError(
@@ -524,13 +672,36 @@ class ChunkVectorLoader:
                 f"manifest — known: {self.chunk_ids()[:8]}")
         snap = self._load_snap(chunk_id, cid)
         pairs = self._unit_pairs(snap)
-        pieces = []
-        for _name, kind, sysc, chunk_codes in pairs:
+        # W20.10.2 — the batched frame build (the delta twin of vector():
+        # per-geometry groups, ONE tq_dequant_batched per group on the
+        # kernel path; the fallback is the per-unit q.dequant loop,
+        # bit-identical to 4.3's build; the operand order is the legacy
+        # one — chunk first for the absolute subtraction).
+        q_groups = []               # (q, positions, sys_group, chunk_group)
+        by_q = {}
+        for u, (_name, kind, sysc, chunk_codes) in enumerate(pairs):
             q = resolve_quantizer(kind, int(sysc.d), self.bits)
+            g = by_q.get(id(q))
+            if g is None:
+                g = (q, [], [], [])
+                by_q[id(q)] = g
+                q_groups.append(g)
+            g[1].append(u)
+            g[2].append(sysc)
+            g[3].append(chunk_codes)
+        pieces: List[Optional[torch.Tensor]] = [None] * len(pairs)
+        for q, positions, sys_group, chunk_group in q_groups:
             if snap.protocol == "absolute":
-                pieces.append(q.dequant(chunk_codes) - q.dequant(sysc))
+                # dequant(end codes) - dequant(sys): the chunk rows first,
+                # then the sys rows — the legacy subtraction order
+                rows = _frame_rows(q, [*chunk_group, *sys_group])
+                m = len(positions)
+                for j, u in enumerate(positions):
+                    pieces[u] = rows[j] - rows[m + j]
             else:
-                pieces.append(q.dequant(chunk_codes))
+                rows = _frame_rows(q, chunk_group)
+                for j, u in enumerate(positions):
+                    pieces[u] = rows[j]
         vec = torch.cat(pieces).to(torch.float32)
         if vec.shape != (self._dims,):
             raise ValueError(
@@ -770,10 +941,12 @@ def iter_centered_vectors(loader: "ChunkVectorLoader", frame: RetrievalFrame
 # ---------------------------------------------------------------------------
 # build / load
 # ---------------------------------------------------------------------------
-def _normalize_streamed(v, config: IndexConfig, pos: int) -> torch.Tensor:
-    """Validate + L2-normalize one streamed corpus vector (fp32, (d,)).
-    W20.4.3: torch-native — host-array inputs coerce zero-copy at the
-    tensor boundary; the norm check and the divide stay tensor-space."""
+def _validate_streamed(v, config: IndexConfig, pos: int) -> torch.Tensor:
+    """Validate ONE streamed corpus vector → an fp32 (d,) row (W20.10.2
+    split of 4.3's _normalize_streamed: host-array inputs coerce
+    zero-copy at the tensor boundary; the per-row norm guards moved to
+    the batched _normalize_rows — same messages, same 1-based stream
+    positions)."""
     row = torch.as_tensor(v)
     if row.dim() != 1:
         raise ValueError(
@@ -786,19 +959,35 @@ def _normalize_streamed(v, config: IndexConfig, pos: int) -> torch.Tensor:
             f"build an index over a mismatched frame (SPECIFICATION §8 "
             f"fixes d=13,631,488; the loader/stream and IndexConfig must "
             f"agree)")
-    row = row.to(torch.float32)
-    norm = torch.linalg.vector_norm(row)
-    if not torch.isfinite(norm):
+    return row.to(torch.float32)
+
+
+def _normalize_rows(mat: torch.Tensor, base: int) -> torch.Tensor:
+    """L2-normalize an (M, d) block of validated fp32 stream rows — the
+    frame's cosine normalize as ONE batched pass (W20.10.2, PROPOSAL
+    §3.6): ONE tq_l2norm_rows launch + ONE broadcast divide on the
+    kernel path (via _l2norm_rows' availability probe); torch's
+    .norm(dim=-1) twin otherwise. The per-row guards keep 4.3's
+    semantics and messages (non-finite first, then zero-norm; `base` is
+    the block's first 1-based stream position) — the only host reads
+    are the .all()/.any() guard checks and the raise's own message
+    edge, one per BLOCK now instead of one per vector."""
+    norms = _l2norm_rows(mat)
+    if not bool(torch.isfinite(norms).all()):
+        bad = (~torch.isfinite(norms)).nonzero().reshape(-1)
+        j = int(bad[0])
         raise ValueError(
-            f"build_index: stream position {pos}: non-finite vector "
-            f"(norm {float(norm)!r})")
-    if norm == 0.0:
+            f"build_index: stream position {base + j}: non-finite vector "
+            f"(norm {float(norms[j])!r})")
+    if bool((norms == 0.0).any()):
+        bad = (norms == 0.0).nonzero().reshape(-1)
+        j = int(bad[0])
         raise ValueError(
-            f"build_index: stream position {pos}: zero-norm vector — the "
-            f"cosine frame cannot normalize it (a zero §4 vector means "
+            f"build_index: stream position {base + j}: zero-norm vector — "
+            f"the cosine frame cannot normalize it (a zero §4 vector means "
             f"every unit collapsed; investigate the corpus, don't index "
             f"it)")
-    return row / norm
+    return mat / norms.unsqueeze(1)
 
 
 def _index_metadata(config: IndexConfig, n_train: int, ntotal: int,
@@ -856,13 +1045,15 @@ def _write_index_and_meta(index: faiss.IndexIVFPQ, path: str,
     os.replace(tmp_meta, meta_path)
 
 
-def _faiss_add(index, rows: List[torch.Tensor]) -> None:
-    """One ADD flush (D5 batching): stack the normalized torch rows and
-    hand faiss ONE contiguous host fp32 block — the foreign boundary,
-    once per flush (W20.4.3; the call sequence itself is unchanged)."""
-    if not rows:
+def _faiss_add(index, mat: torch.Tensor) -> None:
+    """One ADD flush (D5 batching): the normalized (M, d) torch block
+    handed to faiss as ONE contiguous host fp32 matrix — the foreign
+    boundary, once per flush (W20.4.3; the call sequence itself is
+    unchanged). W20.10.2: the block arrives ALREADY normalized from the
+    batched frame pass (_normalize_rows — GPU-produced rows; faiss is
+    fed once at the boundary, PROPOSAL §3.6)."""
+    if mat.shape[0] == 0:
         return
-    mat = torch.stack(rows)
     # FAISS-EDGE: the one sanctioned host crossing — faiss consumes host
     # float32 (PROPOSAL rev 2, the foreign boundary).
     index.add(mat.detach().to("cpu", torch.float32)
@@ -923,7 +1114,7 @@ def build_index(vectors_iter, config: IndexConfig = IndexConfig(),
     # ---- train: materialize ONLY the first train_sample vectors --------
     train_rows: List[torch.Tensor] = []
     for v in stream:
-        train_rows.append(_normalize_streamed(v, config, len(train_rows) + 1))
+        train_rows.append(_validate_streamed(v, config, len(train_rows) + 1))
         if len(train_rows) >= train_sample:
             break
     n_train = len(train_rows)
@@ -941,7 +1132,10 @@ def build_index(vectors_iter, config: IndexConfig = IndexConfig(),
             f" — the coarse/PQ stages will be under-trained. Expected at "
             f"small test scale; NOT a failure (the gate kwargs exist for "
             f"this).", RuntimeWarning, stacklevel=2)
-    train_mat = torch.stack(train_rows)   # the ONE dense block (D5)
+    # the ONE dense block (D5), L2-normalized as ONE batched pass
+    # (W20.10.2: ONE tq_l2norm_rows + one divide on the kernel path —
+    # the faiss train block feeds from the GPU-produced rows)
+    train_mat = _normalize_rows(torch.stack(train_rows), base=1)
     # FAISS-EDGE: the one sanctioned host crossing — faiss consumes host
     # float32 (PROPOSAL rev 2, the foreign boundary). The train block
     # crosses ONCE here; the add loop below reuses the same host block.
@@ -966,12 +1160,17 @@ def build_index(vectors_iter, config: IndexConfig = IndexConfig(),
     pos = n_train
     for v in stream:
         pos += 1
-        batch.append(_normalize_streamed(v, config, pos))
+        batch.append(_validate_streamed(v, config, pos))
         if len(batch) >= ADD_BATCH:
-            _faiss_add(index, batch)
+            # W20.10.2: the flush block normalizes as ONE batched pass
+            # (ONE tq_l2norm_rows + one divide on the kernel path) —
+            # faiss is fed once at the boundary, from the GPU rows
+            _faiss_add(index, _normalize_rows(
+                torch.stack(batch), base=pos - len(batch) + 1))
             batch.clear()
     if batch:
-        _faiss_add(index, batch)
+        _faiss_add(index, _normalize_rows(
+            torch.stack(batch), base=pos - len(batch) + 1))
 
     index.nprobe = int(config.nprobe)
 
