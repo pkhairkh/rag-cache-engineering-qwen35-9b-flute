@@ -4294,3 +4294,259 @@ torch::Tensor tq_qjl_compensate(
     // a later launch on this stream cannot observe the freed blocks.
     return out;
 }
+
+// ===========================================================================
+// W20.9.2 -- tq_l2norm_rows: the serving index frame's normalize kernel.
+// TASKS.md:1216-1225 (W20.9.2); G20.5's INDEX leg (TASKS.md:1443: "protocol
+// integrity -- TRAIN -> RE-INGEST -> INDEX -> EVAL -> QUERY on the kernel
+// path") -- the index's L2-normalized cosine frame (index.py:29-33: every
+// corpus/query vector is "L2-NORMALIZED before train/add and the metric is
+// INNER PRODUCT ... the pre-normalization norms are NOT stored"). The
+// frame's per-row torch.linalg.vector_norm (index.py:790, the
+// _normalize_streamed body at index.py:773-801) becomes ONE batched kernel
+// call here: (M, N) -> (M,) fp32 norms, the normalize step W20.10.2's
+// index-frame vectors batched pass (TASKS.md:1276) consumes. The DIVIDE
+// stays the caller's (the frame's own row / norm, index.py:801), and the
+// frame's zero-norm REFUSAL stays the caller's policy too (index.py:795-
+// 801 raises; the kernel only computes -- it never judges, and it never
+// branches: see the zero-row note below).
+//
+// THE SHAPE (7.1's discipline, the SMALLER TILE -- TASKS.md:1220-1221:
+// "per-warp shfl.sync tree + the fixed-order cross-warp fold (the same
+// discipline, smaller tile)"): ONE CTA per row (grid.x = M, 256 threads =
+// 8 whole warps), NO partial axis and NO second launch -- the serving
+// frame's rows (the embedding widths, N ~ 10^2..10^4) fit one CTA's thread
+// sweep where 7.1's prefill rows (K = 2^19..2^22) needed the 64-partial
+// two-launch chain. The ASSOCIATION CONTRACT is 7.1's verbatim
+// (kernel_tq.cu:1408-1423, the norm chain's fixed order):
+//   * per thread: the block-stride map over j = tid, tid+256, ..., in
+//     ascending j -- ONE fmaf(v, v, acc) per element (the product is
+//     exact, the add single-rounded; the x32 cast widens fp16 exactly and
+//     is the identity on fp32 -- the square is always fp32,
+//     turboquant.py:505's discipline, kernel_tq.cu:1530-1534); the
+//     unroll overlaps LOADS only -- every fmaf consumes acc, so the add
+//     chain stays sequential in j (the data dependence pins the order);
+//   * per warp: the __shfl_xor_sync butterfly at fixed widths 16 -> 1
+//     (fp32 has no redux.sync.add -- PTX ISA 9.7.13.12; the shfl tree IS
+//     the fp32 warp path, kernel_tq.cu:1537-1545); all 32 lanes execute
+//     the uniform code (full mask), and every lane converges to the warp
+//     total BIT-IDENTICALLY (IEEE addition is commutative; only
+//     ASSOCIATION is order-sensitive, and the tree's levels are fixed);
+//   * per CTA: the 8 warp sums red[0..7] fold in FIXED ASCENDING warp
+//     order by thread 0 -- red[0] + red[1] + ... + red[7],
+//     left-associated (kernel_tq.cu:1547-1560;
+//     kernel_gemv_splitk.cu:338-339's red[row][0..3] fold, the family
+//     precedent's shape);
+//   * the epilogue: __fsqrt_rn -- sqrt.rn.f32 regardless of the build's
+//     --use_fast_math (setup.py:171; a plain sqrtf would lower to
+//     sqrt.approx.f32), and torch's own final sqrt is sqrt.rn, so given
+//     the same accumulated bits the epilogue rounds IDENTICALLY to
+//     torch's path (kernel_tq.cu:1425-1436's rationale, the fold's own
+//     store at :1594-1598). The only divergence from x.norm(dim=-1) is
+//     the SUM's association -- the 7.1 class the §4 gate's 1-ulp
+//     threshold owns (never a parity question, kernel_tq.cu:1457-1465).
+//
+// THE ZERO ROW, BRANCHLESS: an all-zero row sums to exactly 0.0 through
+// the whole chain (fmaf(0, 0, 0) = 0; 0 + 0 = 0 at every exchange), and
+// __fsqrt_rn(0.0f) = +0.0 exactly -- norms[m] lands 0.0 with NO host
+// read, NO branch, NO sync (the family's no-D2H discipline). The torch
+// twin's zero-norm branch (index.py:795-801's loud refusal) is the
+// CALLER's policy on the computed value -- the kernel itself is the pure
+// function the frame interrogates.
+//
+// THE ENVELOPE (the TORCH_CHECK family, tq_quant_norm_check_args's shape
+// at kernel_tq.cu:1605-1628): 2-D contiguous (M, N) CUDA fp32/fp16 (the
+// serving frame's two widths; bf16 and every other dtype stay on
+// torch.linalg.vector_norm -- refused loudly here, never silently
+// re-routed), M on grid.x (<= INT32_MAX), N any positive int-sized count
+// -- NO power-of-two requirement and NO partial floor: the block-stride
+// map plus the int64 row base handle every width, and threads past N
+// contribute exact zeros to the tree (a row narrower than the CTA is a
+// degenerate, not a refusal; N == 0 is the refusal -- the empty row has
+// no norm to define, torch's own (M, 0) edge is out of contract).
+//
+// DETERMINISM CONTRACT: run-to-run torch.equal assertable -- the
+// element->thread map is a pure function of (M, N) (no device query
+// feeds any launch), every fold is a fixed left association, and
+// norms[m] has exactly ONE writer (CTA m -- the exclusive-ownership
+// discipline with no workspace at all). NOT a bit-identity claim vs
+// torch.norm (torch's reduction tree carries its own association): the
+// W20.9.3 suite and §4's 1-ulp threshold own the differential, the
+// determinism gate owns kernel-to-kernel.
+//
+// NO reduction primitive of ANY kind (the 7.1 invariant,
+// kernel_tq.cu:1447-1455: the module grep stays at zero): no tickets,
+// no fences, no cross-CTA shared state -- one CTA per row needs no
+// cross-CTA anything (even 7.1's stream-ordered second launch is
+// gone: with no partial axis there is nothing left to fold). The CTA's
+// ONE __syncthreads is a barrier, not a reduction (7.1's own red-fold
+// shape, kernel_tq.cu:1552). FLUTE_TQ_CANARY does not extend to the
+// norms (7.1's precedent, kernel_tq.cu:2026): the single writer plus
+// the W20.9.3/G20.P3 differential own this output.
+//
+// Resource accounting (sm_86): 256 threads/CTA, 32 B static shared
+// (red[8]), M CTAs on grid.x; at N = 1,024 each thread owns 4 elements
+// (one 16 B read per iteration on fp32); at M = 1 a single CTA runs --
+// the shape the per-vector serving path presents. The fp16 surface
+// halves the read bytes; the accumulation is fp32 either way.
+//
+// COMPILE RECORD: nvcc is ABSENT on this authoring box (env/W20_ENV.md)
+// -- compile and behavioral verification defer to the A10G box (the
+// W20.5.4 TU registration carries this file; W20.9.3's suite and G20.P3/
+// G20.5's legs run there). Authored statically, re-read for review;
+// every defect found here is a box-side discovery.
+// ===========================================================================
+
+namespace {
+
+// The launch geometry: ONE CTA per row, 256 threads (8 whole warps) --
+// a compile-time constant pair (the launch geometry must never query the
+// device -- the determinism contract).
+constexpr int kTqL2Threads = 256;
+
+static_assert(kTqL2Threads % 32 == 0,
+              "the warp butterfly needs whole 32-lane warps");
+static_assert(kTqL2Threads == 256,
+              "TASKS.md:1220's rows x 256 threads geometry");
+
+// ---------------------------------------------------------------------------
+// tq_l2norm_rows_kernel -- the row L2 norm, one CTA per row (the banner's
+// association contract, 7.1's discipline at the smaller tile). grid.x = M
+// exactly (no tail CTA: the grid IS the row set), 256 threads; the row's
+// squares accumulate per thread, fold through the warp butterfly and the
+// fixed-order cross-warp red fold, and thread 0 stores __fsqrt_rn of the
+// CTA total. Threads with tid >= N contribute exact zeros -- a row
+// narrower than the CTA folds zeros harmlessly (0 + v = v, bit-exact).
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void __launch_bounds__(kTqL2Threads)
+tq_l2norm_rows_kernel(
+    const scalar_t* __restrict__ x,  // (M, N) input, read-only
+    float* __restrict__ norms,       // (M,) fp32 OUT: one writer per row
+    int N) {                         // the row width
+    const int unit = blockIdx.x;     // grid.x = M rows: CTA m OWNS row m
+    const int tid  = threadIdx.x;
+    const int64_t base = static_cast<int64_t>(unit) * N;
+
+    // ---- per-thread accumulation: the block-stride map, ascending j --
+    // One fmaf per element (the product exact, the add single-rounded);
+    // the sequence is a left fold over the thread's ascending elements
+    // (the unroll overlaps loads only -- the acc dependence pins the
+    // order, kernel_tq.cu:1522-1527's note).
+    float acc = 0.0f;
+    #pragma unroll 4
+    for (int j = tid; j < N; j += kTqL2Threads) {
+        // the x32 cast: exact widening for fp16, identity for fp32 -- the
+        // square is always fp32 (turboquant.py:505, kernel_tq.cu:1530-
+        // 1534).
+        const float v = static_cast<float>(x[base + j]);
+        acc = fmaf(v, v, acc);
+    }
+
+    // ---- the warp butterfly: shfl_xor at fixed widths 16 -> 1 --------
+    // (fp32 redux.sync.add does not exist -- PTX ISA 9.7.13.12; the shfl
+    // tree IS the fp32 warp path.) All 32 lanes execute this uniform
+    // code, so the full mask is legal; every lane ends with the warp
+    // total, bit-identical across lanes (commutativity).
+    #pragma unroll
+    for (int w = 16; w >= 1; w >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, w);
+    }
+
+    // ---- the CTA fold: the warps in fixed ascending warp order ------
+    __shared__ float red[kTqL2Threads / 32];
+    if ((tid & 31) == 0) {
+        red[tid >> 5] = acc;  // lane 0 publishes (every lane holds it)
+    }
+    __syncthreads();
+    if (tid == 0) {
+        // red[0] + red[1] + ... + red[7], left-associated ascending --
+        // kernel_tq.cu:1554-1560's fold, 7.1's exact shape.
+        float cta = red[0];
+        #pragma unroll
+        for (int w = 1; w < kTqL2Threads / 32; ++w) {
+            cta += red[w];
+        }
+        // __fsqrt_rn: the IEEE correctly-rounded root -- the
+        // flag-independent form (a plain sqrtf would lower to
+        // sqrt.approx under the build's --use_fast_math, setup.py:171),
+        // and the bit torch's own final sqrt produces on the same sum.
+        // The zero row lands HERE, branchless: the chain summed exact
+        // zeros, and sqrt.rn(+0.0) = +0.0 -- no host read, no branch.
+        norms[unit] = __fsqrt_rn(cta);
+    }
+    // No trailing barrier: the CTA exits -- nothing downstream in this
+    // launch reads norms (the caller's divide is a later stream-ordered
+    // op; there is no second launch to order, unlike 7.1's chain).
+}
+
+// ---------------------------------------------------------------------------
+// Argument validation -- the family's loud TORCH_CHECK discipline
+// (tq_quant_norm_check_args's shape, kernel_tq.cu:1605-1628; this
+// kernel's own envelope: any positive N, no power-of-two clause, the
+// serving frame's two input widths).
+// ---------------------------------------------------------------------------
+void tq_l2norm_rows_check_args(const torch::Tensor& x) {
+    TORCH_CHECK(x.is_cuda(), "tq_l2norm_rows: x must be a CUDA tensor");
+    TORCH_CHECK(x.dim() == 2,
+                "tq_l2norm_rows: x must be 2-D (M, N) - the frame's row "
+                "matrix (the caller flattens (..., N) to rows)");
+    TORCH_CHECK(x.is_contiguous(), "tq_l2norm_rows: x must be contiguous");
+    TORCH_CHECK(x.scalar_type() == at::kFloat ||
+                x.scalar_type() == at::kHalf,
+                "tq_l2norm_rows: x dtype must be float32/float16 (the "
+                "serving index frame's two widths; other dtypes stay on "
+                "torch.linalg.vector_norm), got ", x.scalar_type());
+    TORCH_CHECK(x.size(0) <= static_cast<int64_t>(INT32_MAX),
+                "tq_l2norm_rows: M must fit a grid.x launch (got M=",
+                x.size(0), ")");
+    TORCH_CHECK(x.size(1) > 0 && x.size(1) <= static_cast<int64_t>(INT32_MAX),
+                "tq_l2norm_rows: N must be a positive int-sized count "
+                "(the block-stride map's j bound; an empty row has no "
+                "norm to define), got N=", x.size(1));
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// tq_l2norm_rows -- the public entry (bound by src/bindings.cpp in
+// W20.9.2): the row L2 norms of an (M, N) fp32/fp16 CUDA matrix as ONE
+// launch -- grid = M rows x 256 threads, 7.1's per-warp shfl butterfly +
+// the fixed-order cross-warp fold + __fsqrt_rn (the same association
+// contract at the smaller tile), the zero row 0.0 branchless. The output
+// is the (M,) fp32 norms tensor on x's device; the host NEVER reads the
+// device values (no .item(), no .cpu(), no D2H sync). The dtype dispatch
+// is the explicit two-width surface (the 8.1 precedent,
+// kernel_tq.cu:3494-3505: the AT_DISPATCH family would admit dtypes this
+// surface does not serve -- check_args has already refused them).
+// ---------------------------------------------------------------------------
+torch::Tensor tq_l2norm_rows(torch::Tensor x) {
+    tq_l2norm_rows_check_args(x);
+    const int M = static_cast<int>(x.size(0));
+    const int N = static_cast<int>(x.size(1));
+
+    // (M,) fp32 on x's device: element m is row m's norm, written by
+    // exactly one CTA (the exclusive-ownership discipline, no zeroing).
+    torch::Tensor norms =
+        torch::empty({x.size(0)}, x.options().dtype(at::kFloat));
+    if (M == 0) {
+        return norms;  // nothing to reduce; a zero-size grid is not a
+                       // legal launch (the family's discipline,
+                       // kernel_tq.cu:577-580 / 1647-1650)
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream();  // the house kernels'
+                                                     // stream
+    if (x.scalar_type() == at::kFloat) {
+        tq_l2norm_rows_kernel<float>
+            <<<M, kTqL2Threads, 0, stream>>>(
+                x.data_ptr<float>(), norms.data_ptr<float>(), N);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
+        tq_l2norm_rows_kernel<at::Half>
+            <<<M, kTqL2Threads, 0, stream>>>(
+                x.data_ptr<at::Half>(), norms.data_ptr<float>(), N);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return norms;
+}

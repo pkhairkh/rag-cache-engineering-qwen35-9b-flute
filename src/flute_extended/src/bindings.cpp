@@ -179,6 +179,20 @@ torch::Tensor tq_qjl_compensate(
     torch::Tensor g, torch::Tensor qjl_signs, torch::Tensor gamma,
     torch::Tensor qjl_rotation);
 
+// W20.9.2 -- the serving index frame's normalize kernel (also defined in
+// src/kernel_tq.cu at global scope, this declaration family's pattern):
+// the row L2 norms of an (M, N) fp32/fp16 CUDA matrix as ONE launch --
+// grid = M rows x 256 threads, 7.1's per-warp shfl butterfly + the
+// fixed-order cross-warp fold + __fsqrt_rn (the same association
+// contract at the smaller tile: one CTA per row, no partial axis, no
+// second launch, any positive N), the zero row 0.0 branchless. The
+// normalize step of the serving index frame's cosine vectors (G20.5's
+// INDEX leg, TASKS.md:1443; index.py:29-33's L2-normalized frame, the
+// per-row torch.linalg.vector_norm of index.py:790 batched -- the
+// W20.10.2 index-frame vectors pass consumes it). Returns the (M,) fp32
+// norms on x's device; the wrapper never reads device memory (no D2H).
+torch::Tensor tq_l2norm_rows(torch::Tensor x);
+
 // Unified dispatcher. Accepts either (indices, lut) for the quantized path
 // or (W_dense) for the dense CUTLASS baseline. Pass an empty Tensor for the
 // unused variants. q_layout selects the packed-indices layout:
@@ -515,4 +529,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("qjl_signs"),
           py::arg("gamma"),
           py::arg("qjl_rotation"));
+
+    // W20.9.2 -- the serving index frame's normalize kernel (src/
+    // kernel_tq.cu): the row L2 norms as ONE launch -- 7.1's shfl tree +
+    // the fixed-order cross-warp fold per row CTA (256 threads, one CTA
+    // per row, any positive N), __fsqrt_rn, the zero row 0.0 branchless;
+    // G20.5's INDEX leg (TASKS.md:1443) is the protocol-integrity
+    // consumption, W20.9.3's CUDA-gated suite the differential.
+    m.def("tq_l2norm_rows", &tq_l2norm_rows,
+          "Row L2 norms, one launch: (M, N) fp32/fp16 CUDA matrix -> "
+          "(M,) fp32 (per-warp shfl butterfly + fixed-order cross-warp "
+          "fold + __fsqrt_rn per row CTA; the zero row is 0.0 "
+          "branchless; the serving index frame's normalize step -- "
+          "G20.5's INDEX leg, index.py:29-33/790's cosine frame)",
+          py::arg("x"));
 }

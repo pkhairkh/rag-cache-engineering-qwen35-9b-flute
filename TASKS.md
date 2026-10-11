@@ -1214,7 +1214,7 @@ compile record.
 COMMIT: "W20.9.1 — the QJL kernel chain (flag-off, complete)"
 
 #### W20.9.2 — tq_l2norm_rows
-- [ ] done
+- [x] done
 ROLE task-writer · READ `kernel_tq.cu` (7.1's shfl tree) · WRITE
 `kernel_tq.cu`, `bindings.cpp`
 BRIEF: rows × 256 threads; per-warp shfl.sync tree + the fixed-order
