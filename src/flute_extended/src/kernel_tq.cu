@@ -1685,3 +1685,227 @@ torch::Tensor tq_quant_norm_rows(const torch::Tensor& x) {
 }
 
 }  // namespace
+
+// ===========================================================================
+// W20.7.2 -- the scaled-boundary compare ladder: the encode pass's
+// bucketize primitive (PROPOSAL.md:53's "in-register bucketize fused in
+// tq_quant (§3.3) -- a <=16-entry compare, no search"; §3.3 step 3's
+// ladder -- "the vectorization the paper demands"). Two device
+// primitives land here, both consumed by W20.7.3's multi-tile butterfly
+// + bfi packing kernel; NOTHING is launched, wrapped, or bound in this
+// section (the kernel is 7.3's, the registration 7.4's -- the hand-off
+// 7.1's forward-build note already planned, kernel_tq.cu:1467-1475):
+//
+//   * tq_scale_boundaries_smem -- the boundary-scaling step: the CTA's
+//     first B threads scale the codebook's (B,) fp32 boundary table by
+//     the unit's norm into shared memory, ONE __fmul_rn multiply per
+//     boundary (B <= 15 multiplies -- PROPOSAL.md:152-154's "16
+//     multiplies, in smem" capacity at b = 4), ONCE per CTA: the scaled
+//     table is shared by every coordinate the CTA encodes.
+//   * tq_ladder_index -- the per-coordinate compare ladder: an
+//     in-register linear scan of the <= 16 scaled boundaries, the FIRST
+//     k with v <= b_scaled[k], else B -- no search structure, no
+//     branch tree deeper than the table, uint8 out.
+//
+// THE IDENTITY -- boundary-scaling identity (PROPOSAL.md §3.3 step 2,
+// lines 149-155; turboquant.py:533-536's comment, the W20.3.1 encode
+// rewrite that first folded it in): the paper's encode is
+// argmin_k|y_j/norm - c_k|; multiplying every comparison by norm > 0
+// gives argmin_k|y_j - norm*c_k| -- IDENTICAL bucket decisions
+// (monotone, exact). The rotated coordinate y_j therefore arrives
+// UNSCALED (the FHT is linear, turboquant.py:525-529: fht(x) =
+// norm*fht(x/norm), so 7.3's butterfly output carries the norm) and
+// the boundaries scale instead: THE NORMALIZED VECTOR IS NEVER
+// MATERIALIZED -- no x/norm pass, no y/norm pass, no division ANYWHERE
+// in this section; the whole cost of the normalization is B multiplies
+// in smem. n > 0 is the CALLER's contract (the identity's
+// precondition -- the degenerate zero-norm unit is W20.7.4's
+// DEVICE-side branch, turboquant.py:511-523's host branch eliminated
+// by the kernel design; it never reaches the ladder).
+//
+// THE CARDINALITY -- codebooks.py:219-228, the Codebook contract:
+// bits b in {3, 4} (the 3.5-bit recipe's fixed 50/50 coordinate
+// split), centroids (2**b,) ascending symmetric +/-, boundaries
+// (2**b - 1,) ascending Voronoi edges (boundaries[i] =
+// (centroids[i] + centroids[i+1]) / 2). So B = 2^b - 1: 7 boundaries
+// for the b=3 lo half, 15 for the b=4 hi half; the ladder's index
+// range is 0..B -- B + 1 = 2^b cells, one per centroid: the uint8
+// output's domain is exactly Codebook.encode's (codebooks.py:237-240).
+// PROPOSAL.md:158's "2^b <= 16" counts the LEVELS; the boundary table
+// that partitions them is B = 2^b - 1 -- the ladder scans the
+// boundaries, the index names the cell. tq_boundary_count pins the
+// formula in one place; kTqLadderMaxB is the 7.3 smem array capacity.
+//
+// THE INDEX MATH -- searchsorted parity, the tie direction pinned.
+// The torch path is torch.searchsorted(cb.boundaries * norm, y,
+// right=False) (turboquant.py:542-545); the numpy original is
+// np.searchsorted(boundaries, x) -- side='left' (codebooks.py:239);
+// turboquant.py:539-541 pins the equivalence ("leftmost insertion
+// point; cell i = (boundaries[i-1], boundaries[i]]", the W16-verified
+// CPU/GPU parity; the frozen fixtures pin the same behavior,
+// turboquant.py:146-149). side='left' returns the count of boundaries
+// STRICTLY LESS than v -- equivalently the FIRST index i with
+// b[i] >= v. The ladder is that definition, linearized over the
+// ascending table:
+//     idx = B;  for k in 0..B-1:  if (v <= b_scaled[k]) { idx = k; break; }
+// The comparison direction is v <= b_scaled[k] -- a value landing
+// exactly ON a boundary takes that boundary's OWN index (v ==
+// b_scaled[k] is true at k: leftmost insertion, the right-closed cell
+// (b[k-1], b[k]]); v strictly above every boundary returns B, the top
+// overflow cell -- searchsorted's len(a) return. ASCENDING b is the
+// precondition (codebooks.py:445-446 validates strict ascent at
+// load): the linear scan is exact because the table is sorted.
+//
+// TIE SEMANTICS -- the level-2 acceptance, documented where it lives.
+// The COMPARISONS are exact (fp32 <= is exact; no rounding rides the
+// ladder itself), and given the same norm bits and the same y bits the
+// ladder's index is EXACTLY torch.searchsorted's: __fmul_rn(b[k], n)
+// is the same single round-to-nearest fp32 multiply torch's
+// `boundaries * norm` performs (mul.rn), and the compares are exact
+// both sides. The divergence is entirely in the INPUT bits: the
+// norm's own bits differ at the association level (7.1's banner: the
+// shfl tree's fixed association vs torch.norm's tree -- tolerance-
+// gated, never bit-equal, kernel_tq.cu:1457-1465), and y_j's bits
+// ride the FHT passes' numerics (the same class). A coordinate within
+// an ulp of a scaled boundary can therefore flip to the adjacent cell
+// vs the torch path -- the boundary-exact flip class the G20.P3 gate
+// counts (TASKS.md:1382: TQ kernel parity, G20.P1 thresholds on
+// kernel outputs), level-2 accepted at ties <= 0.01% -- the same
+// exposure the torch path itself carries across its own norm and
+// rotation rounding. Production inputs are N(0,1) rows: the mass
+// within an ulp of a boundary is vanishingly small, and the gate
+// MEASURES it rather than assumes it. Finite y_j is the envelope: a
+// NaN compares false at every rung and falls out the top (numpy's
+// own searchsorted leaves NaN placement undefined -- out of contract
+// on both paths, never a production input).
+//
+// Numerics scope: __fmul_rn is REQUIRED for the same reason 7.1 chose
+// __fsqrt_rn (kernel_tq.cu:1594-1597): this build compiles with
+// --use_fast_math (setup.py:171), the _rn intrinsics lower to the
+// correctly-rounded IEEE op regardless of the flag, and a bare
+// `a * b` could contract with a neighboring add under fast-math (fma
+// contraction) -- _rn pins the ONE multiply the identity performs.
+// The scaling step is a predicated store + __syncthreads: no
+// reduction primitive of ANY kind appears in this section (the module
+// grep stays at zero, the 7.1 invariant, kernel_tq.cu:1447-1448) --
+// the ladder is per-thread control flow over shared read-only data.
+//
+// THE 7.3 CALL PATTERN (the contract these primitives pin):
+//     __shared__ float b_lo[kTqLadderMaxB];  // 7 live slots (b=3)
+//     __shared__ float b_hi[kTqLadderMaxB];  // 15 live slots (b=4)
+//     const float n = norms[unit];  // 7.1's (M,) output: ONE broadcast
+//                                   // read per CTA (every thread loads
+//                                   // the same address; the sector is
+//                                   // served once) -- the VALUE feeds
+//                                   // the ladder, never re-reduced
+//     tq_scale_boundaries_smem(cb_lo_boundaries, n, B_lo, b_lo);
+//     tq_scale_boundaries_smem(cb_hi_boundaries, n, B_hi, b_hi);
+//     ... 7.3's multi-tile butterfly leaves v in a register ...
+//     const uint8_t idx = (j < n_lo) ? tq_ladder_index(v, b_lo, B_lo)
+//                                    : tq_ladder_index(v, b_hi, B_hi);
+// (a CTA whose tile lies wholly in one half scales only that half's
+// table -- the 3.5-bit split never forces both).
+//
+// Resource accounting (sm_86): the ladder adds B fp32 of static
+// shared memory per CTA (28 B at b=3, 60 B at b=4) beside 7.3's
+// 64 KiB tile staging -- a rounding error. Every CTA of a unit
+// re-scales its own copy: the <= 16-entry re-scale per (unit, tile)
+// is the price of PROPOSAL.md:156-165's tile independence -- tiles
+// are disjoint, no cross-tile dependency, therefore no cross-CTA
+// sharing of the scaled table and no sync beyond the CTA's own
+// barrier.
+//
+// COMPILE RECORD: nvcc is ABSENT on this authoring box (env/W20_ENV.md)
+// -- compile and behavioral verification defer to the A10G box (the
+// W20.5.4 TU registration carries this file; W20.6/W20.7.5 run the
+// gates). Authored statically, re-read for review; every defect found
+// here is a box-side discovery.
+// ===========================================================================
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// The cardinality, pinned in ONE place: B = 2^bits - 1 (codebooks.py:220,
+// boundaries shape (2**bits - 1,)). Host+device: the 7.3 kernel's runtime
+// B and the 7.4 wrapper's TORCH_CHECKs both derive from this one line.
+// ---------------------------------------------------------------------------
+__host__ __device__ constexpr int tq_boundary_count(int bits) {
+    return (1 << bits) - 1;
+}
+
+// The ladder's compile-time capacity: the b=4 table. 7.3 declares its
+// shared scaled-boundary arrays [kTqLadderMaxB] regardless of b -- the
+// b=3 half uses the first 7 slots.
+constexpr int kTqLadderMaxB = tq_boundary_count(4);
+
+static_assert(tq_boundary_count(3) == 7, "the b=3 (lo half) boundary count");
+static_assert(kTqLadderMaxB == 15, "the b=4 (hi half) boundary count");
+static_assert(kTqLadderMaxB < 32,
+              "the scaling step rides the CTA's first warp (tid < B)");
+
+// ---------------------------------------------------------------------------
+// The boundary-scaling step -- PROPOSAL.md §3.3 step 2's "16 multiplies,
+// in smem". The CTA's first B threads each scale ONE boundary by the
+// unit's norm; the barrier publishes the table to the whole CTA.
+//
+// CONTRACT (the caller's, all of it):
+//   * EVERY thread of the CTA calls this -- the __syncthreads() is
+//     cooperative (the standard smem-staging discipline; a divergent
+//     call is UB, exactly like every other barrier in this family).
+//   * blockDim.x >= B (the family geometry is 256 threads, B <= 15).
+//   * n > 0 -- the identity's precondition; the degenerate zero-norm
+//     unit is 7.4's device-side branch and never reaches here.
+//   * boundaries[0..B-1] ASCENDING fp32 in global memory (the
+//     codebooks.py:445-446-validated table via the 2.2 device mirror,
+//     turboquant.py:556-570).
+//   * smem_scaled has capacity >= B (declare [kTqLadderMaxB]).
+// One __fmul_rn per boundary: the correctly-rounded single multiply --
+// the same round torch's `boundaries * norm` performs, so given the
+// same norm bits the scaled table is BIT-IDENTICAL to the torch
+// path's (the tie banner above owns the norm-bits divergence).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void tq_scale_boundaries_smem(
+    const float* __restrict__ boundaries,  // global: (B,) ascending, unscaled
+    float n,                               // the unit's norm, n > 0
+    int B,                                 // 2^bits - 1 (7 or 15)
+    float* smem_scaled) {                  // shared: [>= B] out
+    if (threadIdx.x < B) {
+        smem_scaled[threadIdx.x] = __fmul_rn(boundaries[threadIdx.x], n);
+    }
+    __syncthreads();  // the scaled table is CTA-visible from here on
+}
+
+// ---------------------------------------------------------------------------
+// The compare ladder -- the per-coordinate bucketize (PROPOSAL.md:53's
+// "a <=16-entry compare, no search"; §3.3 step 3's "in-register linear
+// scan of the <=16 scaled boundaries ... the vectorization the paper
+// demands"). np.searchsorted(side='left') == torch.searchsorted(
+// right=False), linearized over the ASCENDING scaled table:
+//     idx = B;  for k in 0..B-1:  if (v <= b_scaled[k]) { idx = k; break; }
+// -- the FIRST k with b_scaled[k] >= v, else B. The tie direction is
+// v <= b_scaled[k]: a boundary-exact v takes that boundary's OWN index
+// (leftmost insertion, cell i = (b[i-1], b[i]], turboquant.py:539-541);
+// v above every boundary takes the top overflow cell B. v arrives
+// UNSCALED -- the identity: the norm lives in the boundaries, never
+// in the coordinate. The scan runs entirely in registers: v and the
+// emitted idx never touch memory, and b_scaled is read-only shared
+// (or a register array the caller built -- the pointer serves both).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ uint8_t tq_ladder_index(
+    float v,                      // the UNSCALED rotated coordinate (finite)
+    const float* b_scaled,        // ASCENDING, norm-scaled boundaries
+    int B) {                      // 2^bits - 1 (7 or 15)
+    int idx = B;  // the overflow default: searchsorted's len(a) return
+                  // (v above every boundary -> the top cell)
+    for (int k = 0; k < B; ++k) {
+        if (v <= b_scaled[k]) {  // >= with the tie on the boundary's OWN
+                                 // side: leftmost insertion
+            idx = k;
+            break;               // the FIRST hit only -- the table is
+                                 // ascending, the later rungs are moot
+        }
+    }
+    return static_cast<uint8_t>(idx);
+}
+
+}  // namespace

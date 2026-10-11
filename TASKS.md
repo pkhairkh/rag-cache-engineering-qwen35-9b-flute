@@ -988,7 +988,7 @@ COMMIT: "W20.7.1 — the deterministic norm pass (shfl tree + finalizer,
 no atomics)"
 
 #### W20.7.2 — boundary scaling + the in-register compare ladder
-- [ ] done
+- [x] done
 ROLE task-writer · READ `kernel_tq.cu` (7.1), `src/rag/codebooks.py`
 (boundary tables), `turboquant.py` (3.1's identity comment — the SAME
 identity) · WRITE `kernel_tq.cu`
