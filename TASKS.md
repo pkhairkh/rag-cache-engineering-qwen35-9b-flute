@@ -716,7 +716,16 @@ the fht.py eligibility extension. The existing ≤16,384 kernel stays
 VERBATIM (byte-identical file diff — the auditor checks it).
 
 #### W20.5.1 — the fht_large header contract (`include/flute/fht_large.cuh`)
-- [ ] done
+- [x] done
+Boundary resolution (orchestrator, binding for 5.2): the PROPOSAL's
+canonical numbers (13 local stages; cross = log2 K − 13 → 6 at 2^19, 9
+at 2^22) are the authority — the split criterion is the HALF-TILE line
+(2·len_ ≤ 8,192, i.e. sh 0..12 local). The TASKS prose "2·len_ ≤
+16,384" would yield 14/5/8 (the len_=8,192 stage's pair window equals
+exactly one full tile) — a prose off-by-one in this ledger; the
+len_=8,192 stage is classified cross (degenerate, intra-tile-capable;
+the header's Boundary note records that 5.2 MAY execute it
+intra-tile while keeping the 13/6/9 accounting). 13/6/9 shipped.
 ROLE task-writer · READ `include/flute/fht.cuh` (the existing math
 contract style), `src/kernel_fht.cu:1-80` (the resource accounting
 discipline), `fht.py:118-160` (segments/rotation_signs conventions) ·
