@@ -100,7 +100,7 @@ COMMIT: "W20.0.1 — CPU-box provisioning at latest stable, evidenced
 (env/W20_ENV.md)"
 
 #### W20.0.2 — the A10G provisioning script (idempotent, latest-stable)
-- [ ] done
+- [x] done
 ROLE task-writer · READ `PROMPT.md §6`; `src/flute_extended/setup.py`
 (header comment: FLUTE_CUDA_ARCHES, MAX_JOBS, ninja parallelism) · WRITE
 `scripts/gpu/w20_provision.sh` (new)
