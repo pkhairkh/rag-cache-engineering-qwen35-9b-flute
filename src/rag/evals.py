@@ -156,12 +156,13 @@ def measure_roundtrip(bits_list=(1, 2, 3, 3.5, 4), n_vectors: int = 16,
     deleted); the only host crossings are the REPORT-EDGE floats below
     — taken for the printed lines / the JSON artifact AFTER the device
     math. The sweep structure (the bits_list loop, the per-vector round
-    trips) is unchanged. OPEN ITEM (W20.3.2, flagged NOT constrained):
-    pack_bits_t asserts bits in {3, 4} (the TQ index stream widths)
-    while this sweep's default bits_list = (1, 2, 3, 3.5, 4); nothing
-    in this file documents that domain (no module constant), so the
-    values are LEFT AS-IS — the 1/2-bit rows will raise at quant() and
-    the A10G gate owns the resolution.
+    trips) is unchanged. RESOLVED (W20.13.1): pack_bits_t /
+    unpack_bits_t now accept the integer domain 1..8 — the legacy pack
+    domain restored on the torch twin — so this sweep's default
+    bits_list = (1, 2, 3, 3.5, 4) runs to completion (the 1/2-bit rows
+    on the torch twin, exactly as the routing note below describes; the
+    kernel pack stays {3, 4}, dispatcher-gated). The A10G box's first
+    full 237-suite run (W20.13's evidence) drove the resolution.
 
     W20.10.3: the round trips ride the batched entries when the
     dispatcher routes this geometry to the kernels (CUDA + eligible):

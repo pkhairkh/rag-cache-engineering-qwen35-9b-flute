@@ -343,6 +343,37 @@ def _check_kernel_devices(dev: torch.device, named: tuple) -> None:
 
 
 # ------------------------------------------------------------- bit packs ---
+def _check_pack_width(bits, ctx: str) -> int:
+    """The shared pack/unpack width domain (W20.13.1): integer bits in
+    1..8 — the LEGACY pack domain restored on the torch twin. The TQ
+    index streams are {3, 4} (production); {1, 2} ride the evals
+    bits_list sweep and the uniform-bits tests (the box's first full
+    237-suite run: 15 failures at the authored {3, 4}-only guard —
+    the W20.4.4 open item's resolution). The KERNEL pack/unpack stays
+    {3, 4} by its own TORCH_CHECKs, and the dispatcher's
+    _kernel_geometry_eligible gates the kernel path to production
+    geometry, so no non-production width can ever reach a kernel.
+    Accepts int-like values (int, np.integer, x.0 floats — the old
+    guard's float-equality semantics); rejects bools, non-integral
+    floats, and out-of-domain widths loudly."""
+    if isinstance(bits, bool):
+        raise ValueError(
+            f"{ctx}: bits must be an integer width in 1..8, got {bits!r}")
+    try:
+        b = int(bits)
+        integral = (b == bits)
+    except (TypeError, ValueError):
+        integral = False
+    if not integral or not 1 <= b <= 8:
+        raise ValueError(
+            f"{ctx}: bits must be an integer width in 1..8 — the TQ index "
+            f"streams are {{3, 4}} (production; the kernel pack stays "
+            f"there, dispatcher-gated), {{1, 2}} ride the evals sweep and "
+            f"the uniform-bits tests (the legacy domain, W20.13.1) — got "
+            f"{bits!r}")
+    return b
+
+
 def pack_bits_t(idx: torch.Tensor, bits: int) -> torch.Tensor:
     """Pack uint8 quantization indices into the packed uint8 bit-stream
     (the canonical W20.3.2 encode side — promoted from the W20.3.1
@@ -361,9 +392,15 @@ def pack_bits_t(idx: torch.Tensor, bits: int) -> torch.Tensor:
     * bits == 4 fast path: two nibbles per byte — byte j = idx[2j] |
       (idx[2j+1] << 4), the EARLIER index in the LOW nibble; an odd
       tail pads with one zero nibble (the last byte's high nibble 0);
-    * bits == 3: the general shift/mask path.
-    Supported widths: bits in {3, 4} — the TQ index streams (the lo/hi
-    split packs its halves separately, the callers already do); other
+    * bits != 4: the general shift/mask path (1, 2, 3, 5..8; bits == 8
+      degenerates to the identity byte stream).
+    Supported widths: integer bits in 1..8 (W20.13.1 — the LEGACY
+    domain restored). The TQ index streams are {3, 4} (production;
+    the lo/hi split packs its halves separately, the callers already
+    do), {1, 2} ride the evals bits_list sweep and the uniform-bits
+    tests — and the KERNEL pack stays {3, 4} (the dispatcher's
+    _kernel_geometry_eligible gates the kernel path to production
+    geometry, so non-production widths can never reach it). Other
     widths raise a clear ValueError.
     Indices stay uint8 at the boundary; the general path widens to
     int64 internally for the shift/mask arithmetic (device-resident,
@@ -377,10 +414,7 @@ def pack_bits_t(idx: torch.Tensor, bits: int) -> torch.Tensor:
 
     byte layout pinned by the frozen fixtures — G20.P1 is the pinning
     gate (pack_bits/unpack_bits parity against the legacy array era)."""
-    if bits not in (3, 4):
-        raise ValueError(
-            f"pack_bits_t: bits must be 3 or 4 (the TQ index stream "
-            f"widths), got {bits}")
+    bits = _check_pack_width(bits, "pack_bits_t")
     idx = idx.reshape(-1)
     n = idx.numel()
     if n == 0:
@@ -425,19 +459,18 @@ def unpack_bits_t(packed: torch.Tensor, bits: int, n: int) -> torch.Tensor:
       (the LOW nibble, the earlier index) and idx[2j+1] = byte >> 4
       (the HIGH nibble); an odd tail's last byte carries the zero pad
       in its high nibble (read, then trimmed by [:n]);
-    * bits == 3: the general shift/mask regroup with weights 2**k.
-    Supported widths: bits in {3, 4} — matching pack_bits_t (other
-    widths raise a clear ValueError).
+    * bits != 4: the general shift/mask regroup with weights 2**k
+      (the exact inverse of pack's general path for every width).
+    Supported widths: integer bits in 1..8 — matching pack_bits_t
+    (W20.13.1, the legacy domain; the kernel unpack stays {3, 4}).
+    Other widths raise a clear ValueError.
     Packed bytes in uint8, indices out uint8 (the general path widens
     to int64 internally for the shift/mask arithmetic — documented
     widening; the output folds back to uint8).
 
     byte layout pinned by the frozen fixtures — G20.P1 is the pinning
     gate (pack_bits/unpack_bits parity against the legacy array era)."""
-    if bits not in (3, 4):
-        raise ValueError(
-            f"unpack_bits_t: bits must be 3 or 4 (the TQ index stream "
-            f"widths), got {bits}")
+    bits = _check_pack_width(bits, "unpack_bits_t")
     p = packed.reshape(-1)
     if p.dtype != torch.uint8:
         p = p.to(torch.uint8)
@@ -450,7 +483,7 @@ def unpack_bits_t(packed: torch.Tensor, bits: int, n: int) -> torch.Tensor:
         out[0::2] = p & 0xF
         out[1::2] = p >> 4
         return out[:n]
-    # general path (bits == 3): expand each byte to its 8 flat bits
+    # general path (bits != 4): expand each byte to its 8 flat bits
     # LSB-first, keep the first n*bits, regroup into (n, bits) rows,
     # fold with the powers-of-two weights
     sh = torch.arange(8, device=p.device)
