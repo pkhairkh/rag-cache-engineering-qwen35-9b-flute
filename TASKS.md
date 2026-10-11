@@ -889,7 +889,18 @@ record (conditional).
 COMMIT: "W20.6.1 — the fht_large scalar twins (test-only)"
 
 #### W20.6.2 — canary/trap build variants
-- [ ] done
+- [x] done
+Backward coverage was MISSING (5.3's ledger note) — extended
+additions-only (+71/0): the backward's local kernel TRAP (smem pair
+re-store on clock64), its final cross TRAP, and the backward runner's
+CANARY poison-launch; the transit stages were already trapped (the
+verbatim reuse). Artifact mechanism: variant builds in separate build
+dirs (env-macro via a torch CUDAExtension monkeypatch wrapper —
+setup.py byte-identical), .so copied aside as _C_canary.so/_C_trap.so,
+production restored bit-exact from a pre-run backup (EXIT-trap; built
+clean if absent). W20.6.3's load contract: ExtensionFileLoader on the
+named .so. TRAP's proof is behavioral (G20.6's determinism gate must
+FAIL).
 ROLE task-writer · READ `kernel_tq.cu` (the macros from 5.4),
 `setup.py` · WRITE `scripts/gpu/w20_build_variants.sh` (new),
 `kernel_tq.cu` (the guarded blocks, if not already in 5.4)

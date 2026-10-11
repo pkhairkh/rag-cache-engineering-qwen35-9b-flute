@@ -744,6 +744,33 @@ fht_large_local_backward_kernel(const scalar_t* __restrict__ g,  // (M, K) gradi
          j += flute::FHT_LARGE_THREADS) {
         ws[base + j] = smem[j];
     }
+
+#ifdef FLUTE_TQ_TRAP
+    // W20.6.2: the adjoint pass 1's share of the negative control
+    // (FLUTE_TQ_TRAP, default OFF; the forward's trap lives in
+    // fht_large_cross_kernel above, and the adjoint's transit stages
+    // inherit it through the verbatim reuse). fht_block itself is
+    // shared with kernel_fht.cu and stays untouched (additions-only),
+    // so the flip rides this kernel's own write-back: on a timing bit
+    // (clock64 of the executing SM) the element stored at base + j
+    // becomes its butterfly-pair partner's value -- j ^ (TILE >> 1) is
+    // exactly the boundary stage's (len_ = 8192, fht_large.cuh's
+    // Boundary note) pair mate, and both members of that pair live in
+    // this CTA's tile. smem is butterfly-final and published (fht_block's
+    // trailing __syncthreads, fht.cuh:174-177), and the re-store hits an
+    // address this thread just wrote (program order), so no barrier is
+    // needed. Two runs of the same backward launch produce different
+    // bits; a run-to-run torch.equal assert that PASSES with the trap
+    // armed is a broken assert. OFF, this loop compiles to nothing and
+    // the write-back above stands alone.
+    for (int j = threadIdx.x; j < flute::FHT_LARGE_TILE;
+         j += flute::FHT_LARGE_THREADS) {
+        if ((clock64() & 1) != 0) {
+            ws[base + j] = smem[j ^ (flute::FHT_LARGE_TILE >> 1)];
+        }
+    }
+#endif  // FLUTE_TQ_TRAP
+
     // No trailing barrier: the CTA exits; the launch boundary orders the
     // next kernel's reads of ws (the only cross-CTA sync this family has).
 }
@@ -810,6 +837,24 @@ fht_large_cross_backward_kernel(float* __restrict__ ws,     // (M, K) fp32 butte
         // store. One dtype cast, at the final store only.
         gx[rbase + i] = static_cast<scalar_t>(lo * inv_sqrt_b);
         gx[rbase + i + len] = static_cast<scalar_t>(hi * inv_sqrt_b);
+
+#ifdef FLUTE_TQ_TRAP
+        // W20.6.2: the adjoint FINAL stage's mirror of the forward cross
+        // kernel's trap (fht_large_cross_kernel above): the pair's
+        // (u+w)/(u-w) assignment flips on a timing bit (clock64 of the
+        // executing SM). The flip re-stores the pair the owning thread
+        // just wrote -- same thread, same two addresses, program order,
+        // the ownership contract untouched -- so the armed build's
+        // visible store is the swapped pair. lo/hi stay const above; the
+        // trap never edits them, and with the macro OFF the stores
+        // above stand exactly as written. Two runs of the same backward
+        // launch produce different bits; a run-to-run torch.equal assert
+        // that PASSES with the trap armed is a broken assert.
+        if ((clock64() & 1) != 0) {
+            gx[rbase + i] = static_cast<scalar_t>(hi * inv_sqrt_b);
+            gx[rbase + i + len] = static_cast<scalar_t>(lo * inv_sqrt_b);
+        }
+#endif  // FLUTE_TQ_TRAP
     }
 }
 
@@ -846,6 +891,32 @@ void fht_backward_large_run(const scalar_t* g, const float* signs,
 
     // (The CANARY poison-fill lives in the forward's runner, W20.5.2;
     // W20.6 extends the coverage control to the backward path.)
+
+#ifdef FLUTE_TQ_CANARY
+    // W20.6.2: the backward path's share of the write-coverage control
+    // -- the extension the comment above assigned to W20.6 (the
+    // banner's "the local and final stages are W20.6's to arm"). The
+    // forward's runner poisons its out/ws identically (above). Here:
+    // gx takes every element's LAST write from the final cross stage;
+    // ws takes every element's write from the local kernel's write-back
+    // (the transit stages rewrite it in place, pair by pair); g itself
+    // is only ever READ (out-of-place). Zero poison must survive -- any
+    // NaN in gx on a finite input marks an unwritten element (a
+    // coverage hole). The poison kernel is the forward's (the unnamed
+    // namespace blocks above are the same namespace), and the launches
+    // mirror fht_large_run's, including the ws == gx aliasing guard
+    // (fp32 I/O folds the state into the output). OFF, these launches
+    // compile away entirely.
+    const int64_t poison_n = static_cast<int64_t>(M) * K;
+    const int poison_blocks = fht_large_cross_blocks(poison_n);
+    fht_large_poison_kernel<scalar_t>
+        <<<poison_blocks, flute::FHT_LARGE_THREADS, 0, stream>>>(gx, poison_n);
+    if (static_cast<const void*>(ws) != static_cast<const void*>(gx)) {
+        fht_large_poison_kernel<float>
+            <<<poison_blocks, flute::FHT_LARGE_THREADS, 0, stream>>>(ws, poison_n);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif  // FLUTE_TQ_CANARY
 
     // ---- pass 1: the tile-local butterflies with the sign prologue ----
     const int tiles = K / flute::FHT_LARGE_TILE;
