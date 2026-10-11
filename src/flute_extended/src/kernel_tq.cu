@@ -601,3 +601,340 @@ torch::Tensor fht_forward_large(torch::Tensor x, torch::Tensor signs) {
     });
     return out;
 }
+
+// ===========================================================================
+// W20.5.3 -- fht_backward_large: the adjoint, gx = g @ T^T.
+//
+// THE ORIENTATION (the one decision this unit owns): the sign moves to
+// the INPUT side; the 1/sqrt(K) fold stays on the OUTPUT side --
+//
+//     gx = g @ T^T = ((g * s) @ H) / sqrt(K)
+//
+// exactly fht_reference_adjoint (fht.py:225-238: the input is
+// multiplied by s at line 236, the butterfly runs on (g * s), the
+// output takes * 1/sqrt(b) at line 237) and exactly kernel_fht.cu's
+// single-block adjoint (fht_backward_kernel, kernel_fht.cu:100-131):
+//
+//   * PROLOGUE, at FIRST LOAD (pass 1's staging):
+//         smem[j] = float(g[col + j]) * signs[col + j]
+//     -- kernel_fht.cu:118-121's converting stage load with the
+//     input-side sign, verbatim. The +-1 multiply is exact (a flip),
+//     so no rounding rides the prologue.
+//   * BUTTERFLY: the SAME one. H is symmetric and H @ H = b * I
+//     (fht.cuh:21-26), so the adjoint of the FWHT butterfly is the
+//     butterfly itself: kernel_fht.cu:124 calls the same fht_block
+//     the forward calls, in the same ascending stage order -- so does
+//     this file. Same stage split (13 local + the lowered len_ = 8192
+//     boundary stage, then len_ = 16384..K/2 cross), same pairing
+//     (low = u + w at the lower index, high = u - w at the higher),
+//     same ownership, same launch-boundary sync.
+//   * EPILOGUE, at the FINAL STORE (pass 2's last cross stage, len_ =
+//     K/2 -- every element's last write):
+//         out = bfly * rsqrtf(K)
+//     -- kernel_fht.cu:116+126-128's fold, verbatim placement AND
+//     instruction: an rsqrtf (NOT a reciprocal divide), computed in
+//     the kernel, applied ONCE per element after the butterfly, with
+//     NO sign (the signs already rode the load). The contract header
+//     pins this placement: "adjoint in[j] = v[j] * s[j] at the load
+//     and out[j] = bfly[j] * (1/sqrt(b)) at the store"
+//     (fht_large.cuh:94-95; the transit round-trips carry neither,
+//     fht_large.cuh:87-96).
+//
+// REUSE DECISIONS (evaluated, then chosen):
+//   * pass 1 local kernel: CLONED, not reused. fht_large_local_kernel
+//     is epilogue-free (its stores are unsigned and unscaled) but has
+//     no PROLOGUE slot: the adjoint's sign-at-load cannot be injected
+//     without editing the committed forward kernel, and the W20.5.3
+//     contract is additions-only (the forward path stays
+//     byte-identical). The clone, fht_large_local_backward_kernel,
+//     differs in one substantive line: the staging multiply.
+//   * cp.async is DROPPED in the adjoint's pass 1, for every dtype:
+//     the forward's 16 B raw copies cannot carry a multiply, and the
+//     sign prologue needs one between the global read and the shared
+//     write. Applying the signs as a second smem pass after an async
+//     copy would cost an extra shared round-trip and a barrier to
+//     save nothing; kernel_fht.cu's adjoint itself stages with the
+//     plain converting loop (kernel_fht.cu:119-121). Determinism is
+//     unaffected: the staging map stays the same fixed
+//     thread->element function, and the values are identical bits.
+//   * pass 2 transit stages: REUSED VERBATIM. The unsigned, unscaled
+//     butterfly is orientation-free by construction -- the transit
+//     epilogue carries neither s nor 1/sqrt(K)
+//     (fht_large.cuh:84-86: "the butterfly itself is UNSIGNED -- the
+//     same H both directions") -- so the adjoint's cross stages ARE
+//     fht_large_cross_kernel<scalar_t, false>. This also inherits
+//     W20.6's FLUTE_TQ_TRAP on those stages for free.
+//   * pass 2 final stage: a kBackward-style template flag on the
+//     forward's cross kernel was the 5.2 report's suggestion; it is
+//     REJECTED here -- retrofitting the flag edits the committed
+//     kernel (violating additions-only), and on a fresh clone the
+//     flag is dead weight (the adjoint's final kernel only ever runs
+//     final). One new kernel, fht_large_cross_backward_kernel,
+//     carries the adjoint epilogue: the scale, no signs.
+//
+// The CANARY/TRAP scaffolding stays forward-only in this unit: W20.6
+// extends both controls to the backward (the transit stages already
+// share the forward's trapped cross kernel through the reuse above;
+// the local and final stages are W20.6's to arm).
+//
+// Everything else is the forward's discipline, mirrored: out-of-place
+// (g is never written), dtype-templated (fp16/bf16 in and out with a
+// distinct fp32 state, cast once at the final store), the 64 KiB smem
+// opt-in on the local pass, launch-boundary sync, unique writers by
+// construction, __launch_bounds__(1024) on both new __global__s.
+// ===========================================================================
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Adjoint pass 1 -- the tile-local butterfly with the sign prologue.
+//
+// CTA (row r, tile t) stages row r's tile t into 64 KiB dynamic shared
+// memory WITH the input-side sign (the adjoint prologue), butterflies
+// it with the same fht_block the forward's pass 1 runs, and writes the
+// fp32 state back UNSIGNED and UNSCALED -- the 1/sqrt(K) fold is pass
+// 2's final-store epilogue (kernel_fht.cu:116+126-128's placement; the
+// transit round-trips carry neither sign nor scale, fht_large.cuh:87-96).
+//
+// Staging: kernel_fht.cu:118-121's prologue verbatim -- the converting
+// stage load with the sign multiply folded in, for EVERY dtype (the
+// forward's cp.async path is dropped; see the W20.5.3 banner). The
+// sign index is the COLUMN index (signs is (K,)): col0 + j with
+// col0 = tile * FHT_LARGE_TILE -- NOT the flat base, which carries the
+// row offset kernel_fht.cu's per-row pointers never had.
+//
+// grid = (M rows, K/FHT_LARGE_TILE tiles) -- the forward pass 1's map.
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void __launch_bounds__(flute::FHT_LARGE_THREADS)
+fht_large_local_backward_kernel(const scalar_t* __restrict__ g,  // (M, K) gradient, read-only
+                                const float* __restrict__ signs, // (K,) +-1
+                                float* __restrict__ ws,          // (M, K) fp32 butterfly state
+                                int K) {
+    // The forward's aligned-declaration idiom (kernel_streaming.cu:865),
+    // kept for family consistency even though the adjoint's staging is
+    // compute-carrying (no cp.async here to require the alignment).
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    float* smem = reinterpret_cast<float*>(smem_raw);
+
+    const int row = blockIdx.x;   // grid.x = M
+    const int tile = blockIdx.y;  // grid.y = K / FHT_LARGE_TILE
+    const int col0 = tile * flute::FHT_LARGE_TILE;  // this tile's column offset
+    const int64_t base = static_cast<int64_t>(row) * K + col0;
+
+    // ---- staging + prologue: the signs at FIRST LOAD --------------------
+    // kernel_fht.cu:118-121 verbatim ("input-side sign, no output
+    // sign"): the fp32 cast, then the exact +-1 multiply. Every dtype
+    // takes this loop -- the W20.5.3 banner's cp.async rationale.
+    for (int j = threadIdx.x; j < flute::FHT_LARGE_TILE;
+         j += flute::FHT_LARGE_THREADS) {
+        smem[j] = static_cast<float>(g[base + j]) * signs[col0 + j];
+    }
+    __syncthreads();  // the staged (and signed) tile is published
+
+    // ---- the tile-local butterfly: the SAME one -------------------------
+    // The forward pass 1's exact call: the self-adjoint butterfly
+    // (kernel_fht.cu runs the same fht_block in both directions). sh =
+    // 0..13 -- the 13 local stages PLUS the boundary stage len_ = 8192
+    // lowered intra-tile (the header's Boundary note, fht_large.cuh:53-62).
+    flute::fht_block<flute::FHT_LARGE_THREADS>(smem, flute::FHT_LARGE_TILE);
+
+    // ---- write-back: fp32 state, unsigned and unscaled ------------------
+    for (int j = threadIdx.x; j < flute::FHT_LARGE_TILE;
+         j += flute::FHT_LARGE_THREADS) {
+        ws[base + j] = smem[j];
+    }
+    // No trailing barrier: the CTA exits; the launch boundary orders the
+    // next kernel's reads of ws (the only cross-CTA sync this family has).
+}
+
+// ---------------------------------------------------------------------------
+// Adjoint pass 2, FINAL cross stage only (len_ = K/2): the same
+// elementwise global pair op as the forward's cross kernel -- the fixed
+// grid-stride pair->thread map over the whole (M, K/2) pair space, the
+// shift/mask pair index i = ((q >> sh) << (sh+1)) + (q & (len_-1)), u
+// at the LOWER index, one fp32 add and one fp32 subtract, the owning
+// thread the ONLY writer of both i and i+len_ (the ownership contract,
+// fht_large.cuh:99-127) -- with the ADJOINT epilogue at the store:
+//
+//     gx[i]      = lo * rsqrtf(K)     (NO sign -- it rode the load)
+//     gx[i+len_] = hi * rsqrtf(K)
+//
+// kernel_fht.cu:116+126-128's fold verbatim: rsqrtf of the segment
+// size (b = K for the single-segment powers of two), computed in the
+// kernel, multiplied at the final store -- the epilogue's one fp32
+// rounding per element. For fp32 I/O gx IS ws (in-place per pair: the
+// same-thread same-address load->store dependency the forward's kFinal
+// stage already carries, fht_large_cross_kernel's in-place note); for
+// fp16/bf16 gx is the distinct output tensor and this store is the
+// transform's ONE dtype cast. The non-final (transit) cross stages
+// are the forward's kernel, reused verbatim (see the banner):
+// unsigned, unscaled, orientation-free.
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void __launch_bounds__(flute::FHT_LARGE_THREADS)
+fht_large_cross_backward_kernel(float* __restrict__ ws,     // (M, K) fp32 butterfly state
+                                scalar_t* __restrict__ gx,  // (M, K) output; == ws allowed for fp32
+                                int M, int K, int sh, int row_shift) {
+    const int len = 1 << sh;          // the pair distance len_ (= K/2 here)
+    const int lmask = len - 1;
+    const int64_t total_pairs = static_cast<int64_t>(M) << row_shift;  // M * K/2
+
+    // kernel_fht.cu:116's convention, verbatim: rsqrtf (not a
+    // reciprocal divide), b = K, computed in the kernel at the
+    // epilogue -- matching the forward's kFinal fold exactly, minus
+    // the signs the adjoint moved to the load.
+    const float inv_sqrt_b = rsqrtf(static_cast<float>(K));
+
+    const int64_t stride =
+        static_cast<int64_t>(gridDim.x) * flute::FHT_LARGE_THREADS;
+    const int64_t tid =
+        static_cast<int64_t>(blockIdx.x) * flute::FHT_LARGE_THREADS + threadIdx.x;
+
+    for (int64_t p = tid; p < total_pairs; p += stride) {
+        const int row = static_cast<int>(p >> row_shift);
+        const int q = static_cast<int>(p & ((static_cast<int64_t>(1) << row_shift) - 1));
+        // fht_stage_sh's pair index (fht.cuh:91): shift/mask only, no
+        // runtime division -- the fixed pair->element map.
+        const int i = ((q >> sh) << (sh + 1)) + (q & lmask);
+        const int64_t rbase = static_cast<int64_t>(row) * K;
+
+        const float u = ws[rbase + i];        // the LOWER index's value
+        const float w = ws[rbase + i + len];  // the HIGHER index's value
+        const float lo = u + w;  // low  = u + w  (the pairing contract)
+        const float hi = u - w;  // high = u - w
+
+        // the adjoint epilogue: butterfly first (u+w / u-w above), then
+        // the scale, NO sign -- exactly fht_reference_adjoint's
+        // out = seg * (1/sqrt(b)) (fht.py:237) and kernel_fht.cu:127's
+        // store. One dtype cast, at the final store only.
+        gx[rbase + i] = static_cast<scalar_t>(lo * inv_sqrt_b);
+        gx[rbase + i + len] = static_cast<scalar_t>(hi * inv_sqrt_b);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-side launcher -- the adjoint's pass structure. Identical geometry
+// to the forward's fht_large_run (same grids, same ascending stage loop,
+// same launch-boundary synchronization); the differences are exactly the
+// two kernels that carry the orientation (the sign-prologue local kernel,
+// the scaled no-sign final cross stage).
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+void fht_backward_large_run(const scalar_t* g, const float* signs,
+                            scalar_t* gx, float* ws, int M, int K,
+                            cudaStream_t stream) {
+    const int smem_bytes = flute::FHT_LARGE_SMEM_BYTES;  // 65536
+
+    // The 64 KiB opt-in for the adjoint's local kernel: the attribute is
+    // per-function, so the clone needs its own call even though the
+    // forward's runner already opted in fht_large_local_kernel
+    // (kernel_fht.cu:202-220's discipline, checked and loud).
+    int device = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    int max_smem = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(
+        &max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    TORCH_CHECK(smem_bytes <= max_smem,
+                "fht_backward_large: the 64 KiB tile needs ", smem_bytes,
+                " bytes of shared memory per block, but this device's "
+                "opt-in maximum is ", max_smem);
+    const void* kfn =
+        reinterpret_cast<const void*>(&fht_large_local_backward_kernel<scalar_t>);
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+
+    // (The CANARY poison-fill lives in the forward's runner, W20.5.2;
+    // W20.6 extends the coverage control to the backward path.)
+
+    // ---- pass 1: the tile-local butterflies with the sign prologue ----
+    const int tiles = K / flute::FHT_LARGE_TILE;
+    dim3 grid(M, tiles);  // grid.x = rows (2^31-1 axis), grid.y = tiles
+    fht_large_local_backward_kernel<scalar_t>
+        <<<grid, flute::FHT_LARGE_THREADS, smem_bytes, stream>>>(g, signs, ws, K);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    // ---- pass 2: the cross stages, ONE LAUNCH PER STAGE ---------------
+    // The SAME ascending sequence as the forward's (sh = 14..log2(K)-1,
+    // len_ = 16384..K/2): the butterfly is self-adjoint, so the stage
+    // list is the forward's verbatim. Transit stages launch the
+    // FORWARD's cross kernel (kFinal = false: unsigned, unscaled,
+    // orientation-free); the final stage (len_ = K/2) launches the
+    // adjoint's epilogue kernel. K is a power of two > 16384 (checked),
+    // so the loop always runs at least once -- the 1/sqrt(K) fold
+    // always has a carrier stage.
+    const int row_shift = flute::fht_large_log2_floor(K) - 1;  // log2(K/2)
+    const int blocks =
+        fht_large_cross_blocks(static_cast<int64_t>(M) << row_shift);
+    for (int sh = kFirstCrossSh; (1 << sh) < K; ++sh) {
+        const bool is_final = ((1 << sh) << 1) == K;  // len_ == K/2
+        if (is_final) {
+            fht_large_cross_backward_kernel<scalar_t>
+                <<<blocks, flute::FHT_LARGE_THREADS, 0, stream>>>(
+                    ws, gx, M, K, sh, row_shift);
+        } else {
+            // The forward's transit kernel, reused verbatim: signs and
+            // gx are the (void)-discarded parameters of this
+            // instantiation (the pair loop touches ws only) -- the
+            // orientation rides the prologue and the final stage,
+            // never the transit.
+            fht_large_cross_kernel<scalar_t, false>
+                <<<blocks, flute::FHT_LARGE_THREADS, 0, stream>>>(
+                    ws, signs, gx, M, K, sh, row_shift);
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Public entrypoint (bound by src/bindings.cpp in W20.5.4; plain
+// torch::Tensor f(torch::Tensor, torch::Tensor) signature).
+//
+//   fht_backward_large(g, signs) -> gx = g @ T^T   (out-of-place, fresh
+//   output; g is never written)
+//
+// gx = ((g * s) @ H) / sqrt(K) over the whole row -- signs BEFORE the
+// butterfly, scale after it (the adjoint convention; the W20.5.3 banner
+// above). Same surface as the forward: fp32 / fp16 / bf16 in and out
+// (identical dtype), a (K,) fp32 +-1 sign vector, 2-D contiguous
+// (M, K) CUDA tensors, K a power of two > 16384 -- the shared
+// fht_large_check_args gate (kernel_fht.cu:304-327's precedent of one
+// checker serving fht_forward AND fht_backward, so the "fht_large: "
+// message prefix is the family's, both entrypoints). The butterfly
+// state is fp32 throughout: for fp32 I/O the output IS the state (the
+// final cross stage finishes in place); for fp16/bf16 a distinct fp32
+// state tensor carries the cross stages and the dtype cast happens
+// once, at the final store.
+// ---------------------------------------------------------------------------
+torch::Tensor fht_backward_large(torch::Tensor g, torch::Tensor signs) {
+    fht_large_check_args(g, signs);
+    const int M = static_cast<int>(g.size(0));
+    const int K = static_cast<int>(g.size(1));
+
+    torch::Tensor gx = torch::empty_like(g);  // fresh, out-of-place
+    if (M == 0) {
+        return gx;  // nothing to transform; a zero-size grid is not
+                    // a legal launch
+    }
+
+    // The fp32 butterfly state: `gx` itself for fp32 I/O (the final
+    // cross stage reads and writes the same indices per pair -- the
+    // forward's in-place precedent); a distinct fp32 workspace for
+    // fp16/bf16 so every cross-stage round-trip stays fp32 and the
+    // I/O dtype is cast exactly once, at the final store.
+    torch::Tensor ws = (g.scalar_type() == at::kFloat)
+        ? gx
+        : torch::empty(g.sizes(), g.options().dtype(at::kFloat));
+
+    auto stream = at::cuda::getCurrentCUDAStream();  // the house kernels' stream
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, g.scalar_type(),
+                                    "fht_backward_large", [&] {
+        fht_backward_large_run<scalar_t>(g.data_ptr<scalar_t>(),
+                                         signs.data_ptr<float>(),
+                                         gx.data_ptr<scalar_t>(),
+                                         ws.data_ptr<float>(), M, K, stream);
+    });
+    return gx;
+}

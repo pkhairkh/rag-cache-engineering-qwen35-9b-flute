@@ -778,7 +778,18 @@ COMMIT: "W20.5.2 — kernel_tq.cu: fht_forward_large (13 local stages +
 cross passes, deterministic)"
 
 #### W20.5.3 — fht_backward_large (the adjoint orientation)
-- [ ] done
+- [x] done
+Orientation (three concordant authorities: kernel_fht.cu's adjoint,
+fht.py:236-237, fht_large.cuh:94-95): signs at the FIRST LOAD (the
+input-side sign multiply), the 1/sqrt(K) rsqrtf fold at the FINAL
+STORE — the butterfly itself is orientation-free (H symmetric ⇒
+self-adjoint). Pass 1 CLONED (the sign multiply can't ride cp.async —
+raw 16 B copies — so the adjoint's local pass uses the converting
+loop for ALL dtypes, kernel_fht.cu's own adjoint precedent); the
+transit cross stages REUSED VERBATIM (unsigned ⇒ orientation-free,
+inherits TRAP); the final cross stage is a new kernel (no kBackward
+retrofit — additions-only). W20.6 must arm CANARY/TRAP on the
+backward's local+final stages.
 ROLE task-writer · READ `kernel_tq.cu` (5.2's result), `kernel_fht.cu`
 (the backward/adjoint kernel's sign placement) · WRITE
 `src/flute_extended/src/kernel_tq.cu`
