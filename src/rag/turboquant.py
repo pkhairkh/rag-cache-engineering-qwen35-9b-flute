@@ -1,12 +1,19 @@
 """turboquant.py — the TurboQuant quantizer core (SPECIFICATION.md §3).
 
 Online, data-oblivious vector quantization (arXiv:2504.19874), mapped to
-this repo's cache tensors per PROPOSAL.md §1–§2:
+this repo's cache tensors per PROPOSAL.md §1–§2. Torch-native and
+device-parametric end-to-end since the W20.3.1–W20.3.4 rewrites — the
+REV-2 RUNTIME CONTRACT at the end of this docstring is the binding
+statement of the runtime semantics:
 
   quant(x):    norm (fp, stored) → r = x/‖x‖ → FHT rotation (y = r @ T,
                the repo's `flute_extended/fht.py`, O(d log d)) → per-set
                scalar Lloyd-Max encode (`codebooks.py`) → packed uint8 codes
   dequant:     unpack → centroids → adjoint FHT (y @ Tᵀ) → × norm
+
+(r itself is never materialized on the encode side: the
+boundary-scaling identity in quant() folds the normalization into the
+codebook boundaries.)
 
 Quantization units (PROPOSAL D2 / SPECIFICATION §3.3–§5):
 
@@ -19,8 +26,9 @@ Quantization units (PROPOSAL D2 / SPECIFICATION §3.3–§5):
 The 3.5-bit recipe (§3.3, PROPOSAL §1.3/D2): a fixed 50/50 coordinate
 split — the first half of coordinates at 3 bits, the second half at 4 —
 (no calibration, data-oblivious; the paper's outlier-split variant is the
-W9 flag, never the default). Per unit one fp32 norm scalar is stored and
-never quantized (the paper's recipe).
+W9 flag, never the default). Per unit one fp32 norm — a 0-dim float32
+TENSOR since the W20.2 codes contract (TQCodes rev-1: never a host
+scalar) — is stored and never quantized (the paper's recipe).
 
 Rotation sharing (PROPOSAL D3): ONE rotation instance per tensor kind —
 every quantization of a given kind (system prompt, chunk deltas, query,
@@ -101,12 +109,52 @@ is compensated in expectation: E‖r−c‖² ≈ (π/2−1)·γ² vs. γ², wit
 Serialization is BACKWARD-COMPATIBLE: codes quantized without the flag
 carry qjl_signs/gamma == None and write NONE of the new keys; from_arrays
 loads old npz/snapshots (no qjl keys) with the fields None.
+
+REV-2 RUNTIME CONTRACT (W20.3.5 — the module contract after the
+W20.3.1–W20.3.4 torch-native rewrites; this block reconciles the
+docstring to the code as it stands):
+
+(a) The torch path is THE device-parametric single path: the input's
+    device decides the compute device — there is no CPU-reference
+    variant and no device switch. CPU-resident tensors quantize and
+    dequantize as CPU torch (the GPU-less dev box's path — this box
+    runs static audits only), CUDA-resident tensors compute on CUDA
+    with no host round trips. The documented host-visible exceptions:
+    quant()'s zero-norm branch, its exact twin in _attach_qjl
+    (γ == 0), and TQCodes' metadata-only type cops — every other
+    value stays on-device (W20.7's kernel design removes the branch).
+
+(b) The torch path is the differential twin for the kernel family:
+    kernel-first dispatch arrives in W20.8 — flute_extended's
+    kernel_tq.cu entries will take precedence on CUDA when they land,
+    and this torch path remains the reference implementation and the
+    CPU path (the fht.py auto-backend discipline — CUDA kernel when
+    built + CUDA input, the torch butterfly otherwise — lifted from
+    the rotation up to the TurboQuant level). The twin pins the
+    kernels' semantics: a kernel/torch divergence is a bug, never
+    drift.
+
+(c) The legacy array era is confined to two OFFLINE edges — this
+    module imports no array library. It survives ONLY at (i) the
+    TQCodes.to_arrays/from_arrays npz disk edge (tq_codes.py) and
+    (ii) the Lloyd-Max codebook solve, the documented
+    OFFLINE-NUMPY-ISLAND in codebooks.py (authored offline, cached);
+    the quant/dequant paths read its tables only through the 2.2
+    DeviceCodebook mirrors — fp32 torch tensors on the compute
+    device.
+
+(d) The legacy semantics are pinned by the frozen fixtures (G20.P1):
+    the byte layouts (pack_bits_t/unpack_bits_t, the MSB-first split
+    mask), the searchsorted tie behavior (leftmost insertion), the
+    stable-argsort determinism, and the qjl estimator round-trip.
+    Behavioral verification is G20.P1 on the A10G box — this module
+    is statically audited on the dev box: py_compile is the only
+    box-side guarantee (no test runs, no repo-module imports on this
+    box; the consumers are swept in W20.4).
 """
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Tuple
 import math
 
 import torch
@@ -117,6 +165,11 @@ import fht
 from tq_codes import TQCodes  # W20.2.1 — the torch-native codes container (rev-1 contract; re-export for callers)
 
 __all__ = [
+    # the consumer surface (swept in W20.4): tq_cache imports the
+    # module handle (get_quantizer + the process registry) plus
+    # KINDS/SEEDS/TQCodes/TurboQuant; install/hooks/snapshot import
+    # TQCodes; index imports SEEDS; evals imports the module handle;
+    # query/m1m2 consume through tq_cache (no direct import).
     "KINDS", "SEEDS", "TQCodes", "TurboQuant", "get_quantizer",
     "pack_bits_t", "unpack_bits_t",
 ]
@@ -158,9 +211,9 @@ QJL_C = math.sqrt(math.pi / 2.0)
 # ------------------------------------------------------------- bit packs ---
 def pack_bits_t(idx: torch.Tensor, bits: int) -> torch.Tensor:
     """Pack uint8 quantization indices into the packed uint8 bit-stream
-    (the canonical W20.3.2 encode side — the promoted W20.3.1 stand-in
-    `_pack_bits_t`). uint8 in -> uint8 out, same device, no host hop,
-    no host arrays anywhere in the body.
+    (the canonical W20.3.2 encode side — promoted from the W20.3.1
+    stand-in it replaced). uint8 in -> uint8 out, same device, no host
+    hop, no host arrays anywhere in the body.
 
     Byte layout — bit-precise (the EXACT pack_bits layout of the
     legacy array era):
@@ -483,9 +536,9 @@ class TurboQuant:
             #   normalized vector is never materialized (PROPOSAL §3.3).
             # The device fp32 boundaries (the 2.2 mirror) scale by the
             # 0-dim norm tensor ON the device; y stays UNSCALED.
-            # Ties: np side='left' ≡ torch right=False — the W16-verified
-            # CPU/GPU parity (leftmost insertion point; cell i =
-            # (boundaries[i-1], boundaries[i]]).
+            # Ties: the legacy array-era searchsorted side='left' ≡ torch
+            # right=False — the W16-verified CPU/GPU parity (leftmost
+            # insertion point; cell i = (boundaries[i-1], boundaries[i]]).
             idx_lo = torch.searchsorted(cb_lo.boundaries * norm,
                                         y[: self.n_lo], right=False)
             idx_hi = torch.searchsorted(cb_hi.boundaries * norm,

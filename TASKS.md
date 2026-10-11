@@ -463,7 +463,7 @@ DO-D: `rg -n "np\.|numpy" src/rag/turboquant.py` == 0 module-wide
 COMMIT: "W20.3.4 — the QJL chain torch-native (numpy-free module)"
 
 #### W20.3.5 — API surface glue + module contract docstring
-- [ ] done
+- [x] done
 ROLE task-writer · READ `src/rag/turboquant.py` (full skim ≤400 lines —
 the last full read of this file in W20), `src/rag/tq_cache.py:399-430`
 (the consumer interface) · WRITE `src/rag/turboquant.py`
