@@ -424,3 +424,20 @@ short-run history; the TQ-share CUDA-event timing).
 Wave DoD: Tier-D 21/21 post-tag (incl. turboquant's numpy-zero still
 0 and the module-wide atomics-free check); attestation truthful.
 Next: W20.9 — the QJL kernel chain + tq_l2norm_rows (K4).
+
+## W20.9 — the QJL chain + tq_l2norm_rows (CLOSED 2026-10-11)
+
+The Alg.-2 kernel chain, flag-off and complete: tq_qjl_quant (the
+residual rides the fused decode verbatim → the 7.1 norm pass for γ →
+fht_forward_large → the trichotomy sign kernel; the scale-invariance
+identity, QJL_C = √(π/2) pinned as the hex-float constant, .rn
+intrinsics against --use_fast_math) and tq_qjl_compensate (widen →
+fht_backward_large → the exact twin scaling chain). tq_l2norm_rows
+(the serving frame's normalize: one CTA per row, the 7.1 association
+discipline, branchless zero). The CUDA-gated suite (5 tests: the qjl
+parity with the tie budget as the faithful codes threshold, l2norm ≤
+1 ulp, determinism, flag-off non-invasiveness).
+
+Tier-G: the QJL gates fold into G20.P3's scope (noted in §4). Wave
+DoD: Tier-D 15/15 post-tag; attestation truthful. Next: W20.10 — the
+serving-side batched passes (K4 end, G20.5).

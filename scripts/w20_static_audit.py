@@ -710,7 +710,36 @@ CHECKS = {
         {"kind": "git_log", "target": "W20.8.4 —"},
         {"kind": "git_tag", "target": "w20-wave-8"},
     ],
-    # W20.9 … W20.12 — appended by each wave's close-out task.
+    # W20.9 — the QJL chain + tq_l2norm_rows (appended at W20.9.4)
+    "W20.9": [
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "tq_qjl"},
+        {"kind": "grep", "target": "src/flute_extended/src/bindings.cpp",
+         "pattern": "tq_qjl"},
+        {"kind": "grep", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "tq_l2norm_rows"},
+        {"kind": "grep", "target": "src/flute_extended/src/bindings.cpp",
+         "pattern": "tq_l2norm_rows"},
+        {"kind": "exists", "target":
+         "src/rag/tests/w20/test_w20_qjl_l2norm.py"},
+        {"kind": "grep", "target":
+         "src/rag/tests/w20/test_w20_qjl_l2norm.py",
+         "pattern": "def test_"},
+        {"kind": "grep", "target":
+         "src/rag/tests/w20/test_w20_qjl_l2norm.py",
+         "pattern": "_gpu_guard"},
+        {"kind": "py_compile", "target":
+         "src/rag/tests/w20/test_w20_qjl_l2norm.py"},
+        {"kind": "absent", "target": "src/flute_extended/src/kernel_tq.cu",
+         "pattern": "atomic"},
+        {"kind": "ledger", "target": "W20.9"},
+        {"kind": "git_log", "target": "W20.9.1 —"},
+        {"kind": "git_log", "target": "W20.9.2 —"},
+        {"kind": "git_log", "target": "W20.9.3 —"},
+        {"kind": "git_log", "target": "W20.9.4 —"},
+        {"kind": "git_tag", "target": "w20-wave-9"},
+    ],
+    # W20.10 … W20.12 — appended by each wave's close-out task.
 }
 
 
