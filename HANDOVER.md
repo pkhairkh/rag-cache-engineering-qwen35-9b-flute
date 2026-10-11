@@ -491,3 +491,138 @@ kernel path: the loss leaving ln(8) at step 0, gk/gv_absmax > 0, the
 held-out spread — the exact history keys pinned in the registry).
 Wave DoD: Tier-D 12/12 post-tag; attestation truthful. Next: W20.12
 — closure (the handover + the final all-DoD audit + the tag).
+
+---
+
+## W20 — the complete wave summary (K1-K5, 2026-10-11)
+
+13 waves, 58 tasks, one commit each, 12 tags pushed so far — the whole
+of W20 authored on the CPU dev box under THE LAW (PROMPT.md §1: no
+test runs, no CPU test authoring, no repo-module imports) and closed
+wave-by-wave on static evidence alone. What the tree holds now: the
+numpy-era TurboQuant runtime is torch-native end-to-end (K1), the
+multi-block butterfly and the fused encode/decode kernels are authored
+(K2–K3), the QJL chain and the serving-side batched passes land (K4),
+the trainer levers close it (K5) — and 9/9 acceptance gates are
+AUTHORED, all PENDING the A10G box. Nothing in this summary claims a
+GREEN; the box's reports are the only verdicts there are.
+
+### The wave table (one line per wave; TASKS.md §0 is the live ledger)
+
+| wave | what landed | the key artifacts |
+|---|---|---|
+| W20.0 | both boxes' environment + the audit infrastructure | `env/W20_ENV.md`, `scripts/gpu/w20_provision.sh`, `scripts/w20_static_audit.py`, `src/rag/tests/w20/_gpu_guard.py` |
+| W20.1 | the baseline tag + the frozen probe fixtures (capture AUTHORED) | tag `w20-baseline` → e9ea357, `scripts/gpu/w20_capture_fixtures.py` (14 seeded probes), `env/W20_GPU_PROTOCOL.md` |
+| W20.2 | TQCodes torch-native + the codebook device mirror | `src/rag/tq_codes.py` (THE npz disk edge), `src/rag/codebooks.py` (the offline island + `DeviceCodebook`) |
+| W20.3 | the turboquant.py torch rewrite — the six CPU syndromes dead | `src/rag/turboquant.py` (module-wide numpy == 0) |
+| W20.4 | K1 COMPLETE: the touchpoint elimination + G20.P1 | `env/w20_cpu_elimination_audit.md` (112 audited touchpoints → 0 outside the allowlist), `scripts/gpu/w20_gates.py`, `test_w20_torch_path.py` |
+| W20.5 | fht_forward_large / fht_backward_large (K2 begins; nvcc ABSENT — compile defers to the box) | `include/flute/fht_large.cuh`, `src/kernel_tq.cu` (born: 5 kernels, zero atomics), `src/rag/fht.py` (the three-band eligibility table) |
+| W20.6 | K2 COMPLETE: the debug twins + canary/trap variants + G20.P2/G20.6 | the scalar debug twins, `scripts/gpu/w20_build_variants.sh`, `test_w20_fht_large.py` |
+| W20.7 | tq_quant_batched — the fused encode (K3 begins, THE wave) | `src/kernel_tq.cu` ~2,800 lines: the shfl-xor norm, the boundary ladder, the word-shift pack, one host call / zero D2H |
+| W20.8 | K3 COMPLETE: tq_dequant_batched + the kernel-first dispatcher; 7/9 gates authored | the REV-3 dispatcher (`turboquant.py`), `test_w20_tq_kernels.py` (7 tests) |
+| W20.9 | the QJL kernel chain + tq_l2norm_rows (K4; qjl folds into G20.P3) | `tq_qjl_quant` / `tq_qjl_compensate` / `tq_l2norm_rows`, `test_w20_qjl_l2norm.py` |
+| W20.10 | K4 COMPLETE: the serving-side batched passes + G20.5 | `install.py` (the requant folds), `index.py` (the frame-vector groups), `evals.py` (the sweep blocks) |
+| W20.11 | K5 COMPLETE: refresh 8 first-class + loader pinning; 9/9 gates authored | `scripts/gpu/finetune_m1m2.py` (`--refresh-every 8`), the pinned capture loader (`m1m2_finetune.py`) |
+| W20.12 | closure — this summary + the final all-DoD audit + the tag | this section, the SPECIFICATION addendum, `w20_static_audit.py --all`, tag `w20-complete` |
+
+### The GPU-box confirmation sequence
+
+`env/W20_GPU_PROTOCOL.md` is the operator's whole job, five steps in
+order: (1) `bash scripts/gpu/w20_provision.sh` — the sm_86 assert, the
+UNPINNED latest-stable installs, the `flute_extended` build
+(FLUTE_CUDA_ARCHES=86), the 237-suite baseline banner, the env lock;
+(2) capture the frozen fixtures from the `w20-baseline` checkout (the
+numpy-era tree BY DESIGN; the script refuses any other checkout and
+refuses CPU); (3) commit the fixtures FROM the box — a dev-box fixture
+is forbidden evidence; (4) run the per-wave gates as their waves land
+(`--gates G20.P1` after W20.4; `G20.P2,G20.6` after W20.6 — build the
+variants first; `G20.P3,G20.1,G20.2,G20.4` after W20.8; `G20.5` after
+W20.10; the `G20.2,G20.3` full runs after W20.11); (5) after the
+`w20-complete` tag, the final `--gates all` + `sha256sum
+env/w20_gate_reports/*.json`. Each run writes
+`env/w20_gate_reports/<gate_id>.json` — gitignored BY DESIGN — and the
+box transcribes the statuses + headline numbers into TASKS.md §4: the
+transcription, not the json, is the ledger.
+
+The registry state at close: **9/9 gates AUTHORED — ALL PENDING**.
+PENDING is the honest state (a gate is GREEN or RED ONLY from a report
+produced on the A10G, PROMPT.md §5; arithmetic, analogy, or "it should
+pass" is not evidence — §1.1, §9). Two box-side notes carried from the
+ledger: G20.6's prerequisite — the canary/trap variants must be BUILT
+on the box first (`bash scripts/gpu/w20_build_variants.sh canary` then
+`trap`) or the gate fails honestly by design; and G20.2's full leg —
+two 300-step runs at refresh 4/8 with the loop clock end-to-end, an
+honest box cost of ≈ 25+ min green.
+
+### The expected phase-timer arithmetic (PROPOSAL §6 — EXPECTATIONS, not measurements)
+
+Everything in this subsection is PROPOSAL §6's arithmetic, cited as
+design intent. The box's gate reports are the only measured truth, and
+the thresholds — not this prose — are the contract.
+
+- **The per-unit ladder** (one d=2^19 unit, quant + dequant round
+  trip): ~80–160 ms on CPU numpy (the measured numpy era) → ~4–8 ms
+  torch-CUDA (K1) → **~15–25 µs on the kernels** (K2+K3).
+- **The capture ladder** (16 prefills per cycle): 263 s measured →
+  **~5–8 s expected, model-FLOPs bound** — TurboQuant drops out of the
+  profile entirely; the LUT-GEMM prefills (~0.3–0.5 s each) become the
+  cycle's own bound.
+- **The step-time ladder**: ~1.3–2 s/step at refresh 4, ~0.7–1 s at
+  refresh 8; 300 steps ≈ 4–5 minutes at the kernel rung (vs half a day
+  in the numpy era).
+
+The gates that adjudicate: G20.1 (capture ≤ 10 s/cycle; TQ ≤ 5
+ms/prefill, the phase timers) and G20.2 (step ≤ 2 s after K3, ≤ 1 s at
+refresh 8, 300 steps ≤ 10 min end-to-end). If a report lands above the
+expectation but inside the threshold, the gate is GREEN and the ladder
+was optimistic — report it exactly that way.
+
+### Open items (the honest plate)
+
+- **The bits∈{3,4} pack-domain decision** — the rewrite's pack/unpack
+  domain vs the legacy 1..8; evals' `bits_list` + the pre-W20
+  uniform-bits tests are constrained mechanically. **G20.P1's call** on
+  the box.
+- **The sibling pre-W20 tests' `np.array_equal` sites** — mechanical
+  adaptation at gate time (torch tensors, not numpy views); they
+  surface inside G20.P1's 237-suite subprocess.
+- **The qjl fp32-prefactor ulp class** — the term's scalar prefactor is
+  fp32-torch vs the legacy host float64: last-ulp drift possible on the
+  qjl=True path ONLY. G20.P1's parity business; the W20.9 honest-RED
+  note stands (2–3 ulps of tree-association drift on small-N rungs is
+  the gate owner's call — reported, never masked).
+- **The W15 outlier split stays twin-side** — the dispatcher's
+  kernel-eligible routing table: CUDA + the pow2 large band + the
+  standard kinds → the KERNEL path, always; the lo/hi 3.5-bit split,
+  the 24,576 conv window, and CPU/absent/ineligible → the torch twin —
+  the performance fallback, never a correctness path.
+- **Cross-box portability rules** — the manifests are the contract:
+  `fixtures_manifest.json` (per-file sha256 + seeds + the capture's
+  torch_version) is the frozen parity reference; `env/w20_gpu_env.lock`
+  records the box's versions (evidence, not constraint). The
+  torch-major drift rule: installs are UNPINNED latest-stable BY LAW,
+  so a torch MAJOR-version drift between the capture and a gate run is
+  a finding to report verbatim — the dev box decides a recapture via
+  task + commit, never a mask. PROPOSAL §5 level 3 stands: TRAIN →
+  RE-INGEST → INDEX → EVAL → QUERY on ONE box; cross-box is
+  allclose-level portable; the W16 verbatim install is bit-exact
+  WITHIN a backend.
+- **The read-gate training question** (carried from W19, untouched by
+  W20): the aux next-token objective through the live read path — the
+  candidate designs live in W19's open items; the kernel family is
+  orthogonal to it.
+
+### The no-CPU-test attestation (the one line, restated)
+
+Every wave close writes the same sentence into TASKS.md §5 — the
+attestation ledger's one line, restated here for the whole of W20:
+**no test executed, no CPU test authored, no repo module imported on
+this box.** 12/13 lines are written at this section's authoring (each
+re-verified post-tag by the auditor, `scripts/w20_static_audit.py
+--wave W20.<n>` exit 0); W20.12's own line lands with W20.12.2's final
+audit, riding the `w20-complete` tag — the same sentence, the same
+truth. The auditor IS the dev box's evidence vehicle: it parses (rg /
+ast / py_compile / git facts) and never imports; its CHECKS mirror the
+TASKS.md DoD 1:1. The only behavioral evidence in the whole of W20
+comes from the A10G box — the 237 suite, the capture, and the nine
+gate reports.

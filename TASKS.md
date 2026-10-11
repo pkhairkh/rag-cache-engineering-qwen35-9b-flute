@@ -1397,7 +1397,7 @@ Goal: the human-facing close-out: HANDOVER's W20 section, the
 SPECIFICATION status addendum, the final audit, the tag.
 
 #### W20.12.1 — HANDOVER.md W20 + the SPECIFICATION addendum
-- [ ] done
+- [x] done
 ROLE task-writer (or orchestrator) · READ `HANDOVER.md` (the W19
 shape), `SPECIFICATION.md` (§13 + the status line), TASKS.md §0/§4 ·
 WRITE `HANDOVER.md`, `SPECIFICATION.md`

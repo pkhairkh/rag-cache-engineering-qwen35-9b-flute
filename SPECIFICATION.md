@@ -173,3 +173,49 @@ disk/
 | `transformers` | `DynamicCache(config=model.config)` | the cache object (TQ-intercepted) |
 | `src/rag/` | `turboquant`, `codebooks`, `tq_cache`, `m1m2`, `hooks`, `ingest`, `snapshot`, `install`, `query`, `finetune`, `m1m2_finetune`, `lut_export`, `index`, `evals` (+ `codebooks/`, `tests/`) | the §1–§8 implementation; per-section clauses above name each entry point; 237 tests under `src/rag/tests/` |
 | `src/flute_extended/src/` | `kernel_gemv*.cu`, `kernel_streaming.cu`, `kernel_fht.cu`, `kernel_debug_simple.cu`, `kernel_cutlass_dense.cu` + `include/flute/` headers | the idxN inference CUDA kernels |
+
+## 14. W20 implementation status (addendum — doc-only, authority-preserving)
+
+Appended 2026-10-11 at the W20 close (the TQ kernel family wave,
+PROPOSAL.md rev 2). Doc-only: every clause above (N1–N34) stands as
+written; nothing here amends a contract — this section records what
+the W20 waves placed under them. TASKS.md remains the live execution
+ledger (§0 the wave ledger, §4 the gate registry, §5 the attestation
+ledger); PROPOSAL.md remains the kernel design layer.
+
+- **The kernel-first runtime is implemented** (§3.2's online
+  semantics, N14–N16, unchanged): `src/rag/turboquant.py`'s
+  dispatcher routes CUDA + kernel-eligible geometries to the CUDA
+  kernels, ALWAYS; CPU, absent-extension, or ineligible geometries
+  take the torch twin — the differential reference AND the CPU path
+  (the performance fallback, never a correctness path; mixed-device
+  inputs raise by name). The W15 outlier split and the 24,576 conv
+  window (N16.1) ride the twin.
+- **The TQ kernel family is authored**
+  (`src/flute_extended/src/kernel_tq.cu` +
+  `include/flute/fht_large.cuh`, built with FLUTE_CUDA_ARCHES=86):
+  `fht_forward_large` / `fht_backward_large` (the multi-block
+  butterfly for K = 2^19…2^22, zero atomics), `tq_quant_batched` (the
+  fused encode — norm, butterfly, boundary ladder, pack: one host
+  call, zero device→host round trips), `tq_dequant_batched` (the
+  fused decode), `tq_qjl_quant` / `tq_qjl_compensate` (the Alg.-2
+  chain, flag-off) and `tq_l2norm_rows` (the serving-side row
+  normalize). Deterministic by construction: fixed tile/warp/lane
+  ownership, fixed-order folds.
+- **The two foreign edges hold, restated**: numpy in the runtime
+  exists at exactly the npz disk edge (`TQCodes.to_arrays` /
+  `from_arrays`, the snapshot save/load) and the faiss boundary (the
+  final `.numpy()` at index add/search); the codebooks solve island
+  (`src/rag/codebooks.py`) is offline, cached to disk, never runtime.
+  Evidence: `env/w20_cpu_elimination_audit.md` — 112 audited
+  touchpoints, 0 outside that allowlist.
+- **The gates are AUTHORED, all PENDING the box**: 9/9 acceptance
+  gates (G20.P1–P3, G20.1–G20.6) live in `scripts/gpu/w20_gates.py`
+  with thresholds mirrored 1:1 from TASKS.md §4; a gate is GREEN or
+  RED ONLY from `env/w20_gate_reports/<id>.json` produced on the A10G
+  box (the five-step execution sequence: `env/W20_GPU_PROTOCOL.md`).
+  Parity + determinism are PROPOSAL §5's three levels: run-to-run
+  `torch.equal` (hard, by construction); cross-backend codes equal
+  except ties ≤ 0.01%, norm ≤ 1 ulp, reconstruction allclose ≤ 1e-5;
+  npz snapshots decode cross-backend allclose ≤ 1e-5, the W16
+  verbatim install bit-exact WITHIN a backend.
