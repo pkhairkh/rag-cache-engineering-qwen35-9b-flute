@@ -145,7 +145,7 @@ COMMIT: "W20.0.3 — the static auditor (rg/ast/py_compile/git check
 kinds; parses, never imports)"
 
 #### W20.0.4 — the GPU test guard module (CUDA-only test authoring surface)
-- [ ] done
+- [x] done
 ROLE task-writer · READ `pytest.ini`; `src/rag/tests/conftest.py`;
 `PROMPT.md §1.3` · WRITE `src/rag/tests/w20/__init__.py` (new, empty),
 `src/rag/tests/w20/_gpu_guard.py` (new)
