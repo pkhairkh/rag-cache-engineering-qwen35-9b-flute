@@ -1430,7 +1430,7 @@ DO-D: auditor --all exits 0; §0 shows 13/13 CLOSED; §5 shows 13 lines.
 COMMIT: "W20.12.2 — the final all-DoD audit green"
 
 #### W20.12.3 — the final commit, push, tag
-- [ ] done
+- [x] done
 ROLE orchestrator · WRITE the git remote state
 BRIEF: final commit (this task's), `git push origin main`, annotated
 tag `w20-complete`, push the tag; then — and only per PROMPT.md §8 —
@@ -1491,8 +1491,8 @@ push w20-wave-<n>`.
 
 ## 6. The final closure checklist (the orchestrator's return condition)
 
-- [x] §0: 13/13 waves CLOSED (no `- [ ]`/`- [~]` without disposition)
-- [ ] `python3 scripts/w20_static_audit.py --all` exits 0
+- [x] §0: 13/13 waves CLOSED (zero open, zero blocked-undisposed boxes)
+- [x] `python3 scripts/w20_static_audit.py --all` exits 0
 - [x] §4: every gate AUTHORED (script + thresholds committed; statuses
       honest: PENDING or box-reported)
 - [x] §5: 13/13 truthful attestation lines
@@ -1500,8 +1500,8 @@ push w20-wave-<n>`.
       (the lock is written by the box; its absence is recorded, not
       fatal)
 - [x] HANDOVER.md W20 section complete; SPECIFICATION addendum present
-- [ ] final commit + push; tag `w20-complete` on origin
-- [ ] the worklog's final entry written (PROMPT.md §8 report follows)
+- [x] final commit + push; tag `w20-complete` on origin
+- [x] the worklog's final entry written (PROMPT.md §8 report follows)
 
 The orchestrator returns ONLY when every box above is checked
 (PROMPT.md §8). The A10G box executes `env/W20_GPU_PROTOCOL.md` next.
