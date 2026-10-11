@@ -1213,6 +1213,8 @@ CHECKS = {
          "pattern": r"## W23"},
         {"kind": "grep", "target": "TASKS.md",
          "pattern": r"## WAVE W23"},
+        {"kind": "grep", "target": "SPECIFICATION.md",
+         "pattern": r"\*\*N25\.1 \(W23\)\.\*\*"},
         {"kind": "ledger", "target": "W23"},
         {"kind": "git_log", "target": "W23.1 —"},
         {"kind": "git_log", "target": "W23.2 —"},
