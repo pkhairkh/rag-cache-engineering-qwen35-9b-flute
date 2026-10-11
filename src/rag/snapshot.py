@@ -82,11 +82,16 @@ overhead is format-inherent and does not scale with corpus semantics —
 note the spec's OWN §11 line "50,000 x 6 MiB = ~300 GiB" implies
 ~6.44 MB/chunk, which the measured 6.45 MB matches).
 
-This module is the CODEC only: stdlib + numpy in the codec logic (importing
-TQCodes from turboquant pulls torch transitively — the existing
-serialization API, used as-is; no torch calls of our own). Dequantization
-and retrieval math live in turboquant/tq_cache/hooks; the delta computation
-and the 24-layer capture live in W5.2's ingest driver.
+This module is the CODEC AND THE DISK EDGE: numpy exists here by design
+(npz read/write, the to_arrays/from_arrays hops, the integrity digest's
+host bytes — PROPOSAL rev 2's foreign boundary); torch appears only at
+the edge hops (the W16 retrieval-frame vectors, TQCodes' own edge
+methods). Dequantization and retrieval math live in turboquant/
+tq_cache/hooks; the delta computation and the 24-layer capture live in
+W5.2's ingest driver. W20.4.3: the digest's byte fields are derived from
+to_arrays() output — key-for-key the host-array-era encoding — so W16
+snapshot digests are byte-preserved, and device-resident codes now
+digest through the same sanctioned host hop the npz write rides.
 """
 from __future__ import annotations
 
@@ -99,10 +104,11 @@ import warnings
 import zipfile
 from dataclasses import dataclass, field, fields as _dc_fields
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import numpy.lib.format as _npformat
+import torch
 
 import _paths  # noqa: F401  (house convention: anchors src/rag, src/scripts, src/flute_extended)
 from turboquant import TQCodes
@@ -110,6 +116,7 @@ from turboquant import TQCodes
 __all__ = [
     "SNAPSHOT_VERSION", "DEFAULT_PROTOCOL", "PROTOCOLS", "ChunkSnapshot",
     "snapshot_path", "save_chunk", "load_chunk", "verify_chunk", "chunk_nbytes",
+    "save_frame_npz", "load_frame_npz",
 ]
 
 # ------------------------------------------------------------- constants ---
@@ -174,9 +181,9 @@ class ChunkSnapshot:
                   str keys and JSON scalars/lists/dicts as values (tuples
                   come back as lists through the round-trip).
 
-    Comparison: TQCodes fields contain numpy arrays, so compare snapshots
-    field-wise (idx streams with np.array_equal, norms bit-exactly) —
-    never with == (array ambiguity).
+    Comparison: TQCodes fields are torch tensors (W20.2.1), so compare
+    snapshots field-wise (idx streams with torch.equal, norms
+    bit-exactly) — never with == (tensor ambiguity).
     """
 
     chunk_id: int
@@ -260,27 +267,35 @@ def _unit_digest_bytes(tag: str, codes: TQCodes) -> bytes:
     the d int8 sign bytes + the 4 fp32 gamma bytes are appended — a
     qjl-free unit digests BYTE-IDENTICALLY to the pre-W9.2 formula, so
     v1 files stay verifiable and the digest stays call-invariant.
+
+    W20.4.3 (DISK-EDGE): the byte fields are taken from codes.to_arrays()
+    — the SAME host hop the npz write rides, so device-resident codes
+    digest identically and the byte encoding is key-for-key the
+    host-array-era formula (W16 digests byte-preserved).
     """
+    a = codes.to_arrays()   # DISK-EDGE: the digest rides the npz hop
     head = "|".join((
         tag, str(codes.kind), str(int(codes.d)),
         str(int(codes.bits_lo)), str(int(codes.bits_hi)),
         str(int(codes.n_lo)), str(int(codes.n_hi)),
         str(int(codes.seed)), str(codes.partition),
     )).encode("utf-8")
-    norm = np.asarray(codes.norm, dtype=np.float32).tobytes()
-    lo = np.ascontiguousarray(codes.idx_lo, dtype=np.uint8).tobytes()
-    hi = np.ascontiguousarray(codes.idx_hi, dtype=np.uint8).tobytes()
+    norm = np.asarray(a["norm"], dtype=np.float32).tobytes()
+    lo = np.ascontiguousarray(a["idx_lo"], dtype=np.uint8).tobytes()
+    hi = np.ascontiguousarray(a["idx_hi"], dtype=np.uint8).tobytes()
     out = head + b"\x00" + norm + lo + hi
-    if codes.qjl_signs is not None and codes.gamma is not None:
-        out += np.ascontiguousarray(codes.qjl_signs, dtype=np.int8).tobytes()
-        out += np.asarray(codes.gamma, dtype=np.float32).tobytes()
+    if "qjl_signs" in a and "gamma" in a:
+        out += np.ascontiguousarray(a["qjl_signs"], dtype=np.int8).tobytes()
+        out += np.asarray(a["gamma"], dtype=np.float32).tobytes()
     # W15: the outlier split's channel mask + second norm + group — a
     # tampered mask must change the digest. "half" units (mask is None)
-    # digest BYTE-IDENTICALLY to the pre-W15 formula.
-    if codes.mask is not None:
-        out += np.ascontiguousarray(codes.mask, dtype=np.uint8).tobytes()
-        out += np.asarray(codes.norm_hi, dtype=np.float32).tobytes()
-        out += np.asarray(int(codes.group or 1), dtype=np.int64).tobytes()
+    # digest BYTE-IDENTICALLY to the pre-W15 formula (to_arrays emits the
+    # split triple IFF partition == "outlier" — the same presence rule).
+    if "mask" in a:
+        out += np.ascontiguousarray(a["mask"], dtype=np.uint8).tobytes()
+        out += np.asarray(a["norm_hi"], dtype=np.float32).tobytes()
+        out += np.asarray(int(a.get("group") or 1),
+                          dtype=np.int64).tobytes()
     return out
 
 
@@ -330,6 +345,15 @@ def chunk_nbytes(path: PathLike) -> int:
 
 
 # ------------------------------------------------------------------ save ---
+def _edge_f32(v) -> np.ndarray:
+    """DISK-EDGE helper: one vector -> a contiguous host fp32 array (a
+torch input takes the single sanctioned host hop HERE; host-array input
+coerces in place — W20.4.3)."""
+    if torch.is_tensor(v):
+        v = v.detach().to("cpu").contiguous().numpy()  # DISK-EDGE (hop)
+    return np.ascontiguousarray(v, dtype=np.float32)
+
+
 def save_chunk(path_or_disk_dir: PathLike, snap: ChunkSnapshot,
                include_vector: bool = False,
                vector: Optional[np.ndarray] = None) -> str:
@@ -384,7 +408,7 @@ def save_chunk(path_or_disk_dir: PathLike, snap: ChunkSnapshot,
                 "argument (the 1-D fp32 retrieval vector) — DEBUG ONLY, "
                 "violates the 6 MiB codes-only budget (D5)")
         try:
-            vec = np.asarray(vector, dtype=np.float32)
+            vec = _edge_f32(vector)   # DISK-EDGE: the debug member's hop
         except Exception as e:
             raise TypeError(
                 f"save_chunk: vector must be a 1-D numeric array: {e}") from e
@@ -429,21 +453,40 @@ def save_chunk(path_or_disk_dir: PathLike, snap: ChunkSnapshot,
             f"save_chunk: ChunkSnapshot.extra is not JSON-safe: {e}") from e
 
     # ---- flat code members (deterministic order) --------------------------
+    # DISK-EDGE: the members ride TQCodes.to_arrays() — the device->host
+    # hop NumPy is allowed to make (the npz write edge; PROPOSAL rev 2).
     arrays: Dict[str, np.ndarray] = {"meta": np.array(meta_json)}
     for layer_idx in sorted(snap.s_codes):
-        for key, val in snap.s_codes[layer_idx].to_arrays().items():
+        for key, val in snap.s_codes[layer_idx].to_arrays().items():  # DISK-EDGE
             arrays[f"s_{layer_idx}_{key}"] = val
     for layer_idx in sorted(snap.conv_codes):
-        for key, val in snap.conv_codes[layer_idx].to_arrays().items():
+        for key, val in snap.conv_codes[layer_idx].to_arrays().items():  # DISK-EDGE
             arrays[f"conv_{layer_idx}_{key}"] = val
     for name, codes in (("m1", snap.m1_codes), ("m2", snap.m2_codes)):
         if codes is not None:
-            for key, val in codes.to_arrays().items():
+            for key, val in codes.to_arrays().items():  # DISK-EDGE
                 arrays[f"{name}_{key}"] = val
     if vec is not None:
         arrays["vector"] = vec
 
-    np.savez(path, **arrays)
+    np.savez(path, **arrays)   # DISK-EDGE: the npz write (uncompressed, §5)
+    return path
+
+
+# ------------------------------------------------- W16 retrieval-frame edge ---
+def save_frame_npz(path: str, sys_vector, mean_vector, meta: dict) -> str:
+    """DISK-EDGE: the W16 retrieval frame's side file (index.py's
+    save_retrieval_frame rides this) — ONE npz holding the two fp32
+    vectors + a JSON meta member, written atomically (tmp + replace).
+    The key set is the W16 layout verbatim: {sys_vector, mean_vector,
+    meta}. Vectors may be torch tensors (the one host hop happens HERE)
+    or host arrays; the meta dict must be JSON-safe."""
+    tmp = path + ".tmp.npz"   # np.savez insists on the .npz suffix
+    np.savez(tmp,             # DISK-EDGE: the frame npz write (W16 keys)
+             sys_vector=_edge_f32(sys_vector),
+             mean_vector=_edge_f32(mean_vector),
+             meta=np.array(json.dumps(meta)))
+    os.replace(tmp, path)
     return path
 
 
@@ -461,7 +504,10 @@ def _read_meta_json(z: np.lib.npyio.NpzFile) -> Dict[str, Any]:
             f"load_chunk: 'meta' must be a single JSON string, got "
             f"dtype={raw.dtype}, size={raw.size}")
     try:
-        meta = json.loads(str(raw.item()))
+        # reshape(-1)[0] + str() of the validated single U element IS the
+        # JSON string (item()-free: the W20.4.3 sync-free discipline; the
+        # 0-d and the (1,)-shaped writer layouts both decode)
+        meta = json.loads(str(raw.reshape(-1)[0]))
     except json.JSONDecodeError as e:
         raise ValueError(f"load_chunk: 'meta' is not valid JSON: {e}") from e
     if not isinstance(meta, dict):
@@ -822,7 +868,7 @@ def _open_npz(path: str, use_mmap: bool, ctx: str):
     use_mmap=True: the _MmapNpz reader (read-only per-member memmaps;
     see its docstring for the honest behavior contract)."""
     if not use_mmap:
-        z = np.load(path, allow_pickle=False)
+        z = np.load(path, allow_pickle=False)   # DISK-EDGE: the npz read
         if not hasattr(z, "files"):
             raise ValueError(
                 f"{ctx}: {path!r} is not an npz archive (got "
@@ -830,6 +876,28 @@ def _open_npz(path: str, use_mmap: bool, ctx: str):
                 f"snapshots/chunk_XXXXX.npz (spec §11)")
         return z
     return _MmapNpz(path)
+
+
+def load_frame_npz(path: str) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+    """DISK-EDGE: the W16 retrieval frame's load (index.py's
+    load_retrieval_frame rides this) — returns (sys_vector, mean_vector,
+    meta): the two vectors as contiguous fp32 CPU torch tensors (the
+    host->torch hop happens HERE, at the edge) + the parsed JSON meta.
+    Loud on a partial file (missing members); foreign-format validation
+    (kind/dims) belongs to the caller."""
+    with np.load(path, allow_pickle=False) as z:   # DISK-EDGE: the read
+        missing = [k for k in ("sys_vector", "mean_vector", "meta")
+                   if k not in z.files]
+        if missing:
+            raise ValueError(
+                f"load_frame_npz: {path} is missing {missing} — a partial "
+                f"frame file; re-run run_index.py")
+        meta = json.loads(str(z["meta"]))
+        sys_vector = torch.from_numpy(          # DISK-EDGE (the hop)
+            np.ascontiguousarray(z["sys_vector"], dtype=np.float32))
+        mean_vector = torch.from_numpy(         # DISK-EDGE (the hop)
+            np.ascontiguousarray(z["mean_vector"], dtype=np.float32))
+    return sys_vector, mean_vector, meta
 
 
 def load_chunk(path: PathLike, use_mmap: bool = False) -> ChunkSnapshot:

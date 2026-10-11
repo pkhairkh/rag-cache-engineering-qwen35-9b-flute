@@ -27,6 +27,11 @@ The driver is restartable: a JSON manifest (out_dir/ingest_manifest.json)
 records completed chunk ids; re-running skips them. Ingestion is
 embarrassingly parallel over chunks (spec §5); this driver is the
 sequential reference — the GPU box may shard it by chunk range.
+
+W20.4.3: the ingest plumbing is torch-native (dequant/quant/requant on
+the codes' device; ChunkRecord.cache_vector is an fp32 torch tensor,
+D5-transient — the snapshot npz edge owns all serialization hops). This
+module is host-array-free.
 """
 from __future__ import annotations
 
@@ -36,7 +41,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
-import numpy as np
 import torch
 
 import _paths  # noqa: F401
@@ -283,7 +287,8 @@ class ChunkRecord:
     conv_codes: Dict[int, TQCodes]           # ABSOLUTE (last-chunk-wins, §6)
     delta_m1: Optional[TQCodes]
     delta_m2: Optional[TQCodes]
-    cache_vector: np.ndarray                 # fp32, §4 order — transient (D5)
+    cache_vector: torch.Tensor               # fp32, §4 order — transient (D5;
+                                             # W20.4.3: torch, codes' device)
     abs_s: Dict[int, TQCodes] = field(default_factory=dict)
     abs_m1: Optional[TQCodes] = None
     abs_m2: Optional[TQCodes] = None
@@ -358,7 +363,7 @@ def ingest_chunk(model, chunk_token_ids: torch.Tensor, cache: TQCache,
         pieces.append(_dequant("M1", codes["m1"], bits))
     if codes["m2"] is not None:
         pieces.append(_dequant("M2", codes["m2"], bits))
-    cache_vector = torch.cat(pieces).to(torch.float32).numpy()
+    cache_vector = torch.cat(pieces).to(torch.float32)
 
     return ChunkRecord(
         chunk_idx=-1, n_tokens=int(chunk_token_ids.shape[-1]),

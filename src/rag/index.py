@@ -63,6 +63,15 @@ faiss index and builds the index over the CENTERED stream;
 answer_query/preselect/rerank pick it up automatically when the file
 exists (the absolute behavior stays bit-identical without it).
 
+W20.4.3: the vector builds, the centered-frame math and the preselect/
+rerank plumbing are TORCH-NATIVE fp32 (the device-parametric dequant;
+CPU-resident codes decode on CPU — the legacy reader behavior). The one
+host crossing per faiss hand-off is the FOREIGN BOUNDARY (PROPOSAL rev
+2) — each is marked `FAISS-EDGE` (the train block, the add flush, the
+outbound query, the inbound labels). The W16 frame side file rides
+snapshot.py's save/load edge (the npz hop lives THERE; this module
+stays host-array-free outside the faiss boundary).
+
 Provenance (turboquant.py: "seeds persist in the index side-metadata"):
 build_index(path=...) writes <path>.meta.json with the config fields, the
 four D3 rotation SEEDS, sha256 digests of the production-frame codebook
@@ -85,6 +94,7 @@ vs the manifest.
 from __future__ import annotations
 
 import json
+import numbers
 import os
 import warnings
 from dataclasses import dataclass
@@ -93,13 +103,12 @@ from hashlib import sha256
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import faiss
-import numpy as np
 import torch
 
 import _paths  # noqa: F401  (house rule: anchor BEFORE the sibling imports)
 from codebooks import get_codebook
 from ingest import MANIFEST_NAME, load_system_state
-from snapshot import load_chunk
+from snapshot import load_chunk, load_frame_npz, save_frame_npz
 from tq_cache import resolve_quantizer
 from turboquant import SEEDS
 
@@ -140,7 +149,7 @@ _CODEBOOK_SHA_CACHE: Dict[Tuple[int, int], str] = {}
 def _check_int(value, name: str, minimum: int = 1, ctx: str = "") -> int:
     """Loud int validation (bools are ints — refuse them explicitly)."""
     prefix = f"{ctx}: " if ctx else ""
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
         raise TypeError(
             f"{prefix}{name} must be an int, got {type(value).__name__}: "
             f"{value!r}")
@@ -201,6 +210,15 @@ class IndexConfig:
 # ---------------------------------------------------------------------------
 # Codebook provenance
 # ---------------------------------------------------------------------------
+def _fp32_bytes(t: torch.Tensor) -> bytes:
+    """sha256 feed: the little-endian fp32 byte image of a 1-D tensor —
+    bit-identical to the host-array-era tobytes() feed (the codebook
+    digests in existing .meta.json files stay stable; metadata only —
+    the tables are tiny, <= 31 values)."""
+    return bytes(t.detach().to("cpu", torch.float32)
+                .contiguous().view(torch.uint8).tolist())
+
+
 def codebook_sha256(bits: int, d: int) -> str:
     """sha256 of a Lloyd-Max codebook's arrays (codebooks.get_codebook).
 
@@ -216,11 +234,13 @@ def codebook_sha256(bits: int, d: int) -> str:
     if key in _CODEBOOK_SHA_CACHE:
         return _CODEBOOK_SHA_CACHE[key]
     cb = get_codebook(key[0], key[1])
+    tables = cb.device_tensors("cpu")   # the 2.2 mirror — same fp32 bytes
     h = sha256()
-    h.update(f"codebook|bits={cb.bits}|d={cb.d}|levels={cb.centroids.shape[0]}"
+    h.update(f"codebook|bits={cb.bits}|d={cb.d}|"
+             f"levels={int(tables.centroids.shape[0])}"
              .encode("utf-8"))
-    h.update(np.ascontiguousarray(cb.centroids, dtype=np.float32).tobytes())
-    h.update(np.ascontiguousarray(cb.boundaries, dtype=np.float32).tobytes())
+    h.update(_fp32_bytes(tables.centroids))
+    h.update(_fp32_bytes(tables.boundaries))
     h.update(f"|mse_per_variance={float(cb.mse_per_variance)!r}".encode("utf-8"))
     digest = h.hexdigest()
     _CODEBOOK_SHA_CACHE[key] = digest
@@ -365,11 +385,13 @@ class ChunkVectorLoader:
                     name, int(sysc.d), self.bits).dequant(sysc))
         return pieces
 
-    def system_vector(self) -> np.ndarray:
+    def system_vector(self) -> torch.Tensor:
         """W16: the reset point's own §4 vector (dequantized system codes,
         fp32, (dims,)) — the common component every ABSOLUTE vector in the
-        corpus carries (the retrieval frame subtracts it)."""
-        vec = torch.cat(self._system_pieces()).to(torch.float32).numpy()
+        corpus carries (the retrieval frame subtracts it). W20.4.3: a
+        torch tensor on the codes' device — the faiss hand-offs own the
+        host hop."""
+        vec = torch.cat(self._system_pieces()).to(torch.float32)
         if vec.shape != (self._dims,):
             raise ValueError(
                 f"ChunkVectorLoader.system_vector: reconstructed "
@@ -441,8 +463,9 @@ class ChunkVectorLoader:
             pairs.append((name, name, sysc, delta))
         return pairs
 
-    def vector(self, chunk_id: int) -> np.ndarray:
-        """The chunk's absolute retrieval vector: fp32, shape (dims,).
+    def vector(self, chunk_id: int) -> torch.Tensor:
+        """The chunk's absolute retrieval vector: fp32 torch tensor,
+        shape (dims,), on the codes' device.
 
         protocol-aware (W16): 'delta-v1' snapshots reconstruct the
         DOUBLE-ROUND absolute (dequant(sys) + dequant(delta), the legacy
@@ -450,7 +473,7 @@ class ChunkVectorLoader:
         ONE round, strictly tighter than the double-round reconstruction.
         """
         if isinstance(chunk_id, bool) or not isinstance(
-                chunk_id, (int, np.integer)):
+                chunk_id, numbers.Integral):
             raise TypeError(
                 f"ChunkVectorLoader.vector: chunk_id must be an int, got "
                 f"{type(chunk_id).__name__}: {chunk_id!r}")
@@ -470,7 +493,7 @@ class ChunkVectorLoader:
                 pieces.append(q.dequant(chunk_codes))
             else:
                 pieces.append(q.dequant(sysc) + q.dequant(chunk_codes))
-        vec = torch.cat(pieces).to(torch.float32).numpy()
+        vec = torch.cat(pieces).to(torch.float32)
         if vec.shape != (self._dims,):
             raise ValueError(
                 f"ChunkVectorLoader.vector: chunk {cid} reconstructed "
@@ -478,9 +501,10 @@ class ChunkVectorLoader:
                 f"length drift (manifest {self.manifest.get('vector_dims')})")
         return vec
 
-    def delta_vector(self, chunk_id: int) -> np.ndarray:
+    def delta_vector(self, chunk_id: int) -> torch.Tensor:
         """W16: the chunk's DELTA vector (what the chunk's prefill ADDED on
-        top of the reset point), fp32, shape (dims,), §4 order.
+        top of the reset point), fp32 torch tensor, shape (dims,), §4
+        order, on the codes' device.
 
         protocol-aware: 'delta-v1' dequants the stored DELTA codes (the D4
         layout); 'absolute' computes dequant(end codes) - dequant(sys) —
@@ -489,7 +513,7 @@ class ChunkVectorLoader:
         measures content overlap" — the system reset point is not
         content)."""
         if isinstance(chunk_id, bool) or not isinstance(
-                chunk_id, (int, np.integer)):
+                chunk_id, numbers.Integral):
             raise TypeError(
                 f"ChunkVectorLoader.delta_vector: chunk_id must be an int, "
                 f"got {type(chunk_id).__name__}: {chunk_id!r}")
@@ -507,7 +531,7 @@ class ChunkVectorLoader:
                 pieces.append(q.dequant(chunk_codes) - q.dequant(sysc))
             else:
                 pieces.append(q.dequant(chunk_codes))
-        vec = torch.cat(pieces).to(torch.float32).numpy()
+        vec = torch.cat(pieces).to(torch.float32)
         if vec.shape != (self._dims,):
             raise ValueError(
                 f"ChunkVectorLoader.delta_vector: chunk {cid} reconstructed "
@@ -515,7 +539,7 @@ class ChunkVectorLoader:
         return vec
 
     def iter_vectors(self, chunk_ids: Optional[Iterable[int]] = None
-                     ) -> Iterator[np.ndarray]:
+                     ) -> Iterator[torch.Tensor]:
         """Yield retrieval vectors in chunk-id order (D5: one at a time)."""
         if chunk_ids is None:
             ids = self.chunk_ids()
@@ -531,7 +555,7 @@ class ChunkVectorLoader:
             yield self.vector(cid)
 
     def iter_delta_vectors(self, chunk_ids: Optional[Iterable[int]] = None
-                           ) -> Iterator[np.ndarray]:
+                           ) -> Iterator[torch.Tensor]:
         """W16: yield DELTA vectors in chunk-id order (the centered
         retrieval frame's corpus stream)."""
         if chunk_ids is None:
@@ -580,45 +604,50 @@ class RetrievalFrame:
     regime.
     """
 
-    sys_vector: np.ndarray
-    mean_vector: np.ndarray
+    sys_vector: torch.Tensor
+    mean_vector: torch.Tensor
     dims: int
     system_ref: str = ""
     n_mean_chunks: int = 0
     chunk_protocol: str = "delta-v1"
 
     def __post_init__(self) -> None:
-        self.sys_vector = np.ascontiguousarray(
-            self.sys_vector, dtype=np.float32)
-        self.mean_vector = np.ascontiguousarray(
-            self.mean_vector, dtype=np.float32)
+        self.sys_vector = torch.as_tensor(
+            self.sys_vector, dtype=torch.float32).contiguous()
+        self.mean_vector = torch.as_tensor(
+            self.mean_vector, dtype=torch.float32).contiguous()
         if self.sys_vector.shape != (self.dims,) \
                 or self.mean_vector.shape != (self.dims,):
             raise ValueError(
-                f"RetrievalFrame: sys_vector {self.sys_vector.shape} / "
-                f"mean_vector {self.mean_vector.shape} != ({self.dims},)")
-        if not (np.isfinite(self.sys_vector).all()
-                and np.isfinite(self.mean_vector).all()):
+                f"RetrievalFrame: sys_vector {tuple(self.sys_vector.shape)} / "
+                f"mean_vector {tuple(self.mean_vector.shape)} != "
+                f"({self.dims},)")
+        if not (torch.isfinite(self.sys_vector).all()
+                and torch.isfinite(self.mean_vector).all()):
             raise ValueError(
                 "RetrievalFrame: non-finite frame vectors — refusing to "
                 "center retrieval through a broken frame")
 
     # ------------------------------------------------------------ centering --
-    def center_query(self, qvec_abs: np.ndarray) -> np.ndarray:
-        """(q_abs - sys) - mean — the query's content vector."""
-        q = np.asarray(qvec_abs, dtype=np.float32)
+    def center_query(self, qvec_abs) -> torch.Tensor:
+        """(q_abs - sys) - mean — the query's content vector (fp32, on the
+        frame's device: the query hops there once, W20.4.3)."""
+        q = torch.as_tensor(qvec_abs, dtype=torch.float32).to(
+            self.sys_vector.device)
         if q.shape != (self.dims,):
             raise ValueError(
-                f"RetrievalFrame.center_query: query {q.shape} != "
+                f"RetrievalFrame.center_query: query {tuple(q.shape)} != "
                 f"({self.dims},) — the §4 vector and the frame disagree")
         return (q - self.sys_vector) - self.mean_vector
 
-    def center_delta(self, delta_vec: np.ndarray) -> np.ndarray:
-        """delta - mean — the chunk's content vector."""
-        d = np.asarray(delta_vec, dtype=np.float32)
+    def center_delta(self, delta_vec) -> torch.Tensor:
+        """delta - mean — the chunk's content vector (fp32, on the frame's
+        device: the candidate hops there once)."""
+        d = torch.as_tensor(delta_vec, dtype=torch.float32).to(
+            self.mean_vector.device)
         if d.shape != (self.dims,):
             raise ValueError(
-                f"RetrievalFrame.center_delta: delta {d.shape} != "
+                f"RetrievalFrame.center_delta: delta {tuple(d.shape)} != "
                 f"({self.dims},) — §4 order drift")
         return d - self.mean_vector
 
@@ -645,7 +674,10 @@ def build_retrieval_frame(loader: "ChunkVectorLoader",
     """One pass over the corpus deltas → the RetrievalFrame (sys vector +
     the mean of the chunk deltas). D5: one vector in memory at a time; the
     mean is an fp32 accumulator. max_chunks caps the mean's sample (None =
-    the whole corpus — the estimator's noise shrinks as 1/sqrt(n))."""
+    the whole corpus — the estimator's noise shrinks as 1/sqrt(n)).
+    W20.4.3: torch-native (fp64 accumulator on the sys vector's device,
+    widened to fp32 once at the end — the same arithmetic as the
+    host-array era)."""
     sys_vector = loader.system_vector()
     ids = loader.chunk_ids()
     if max_chunks is not None:
@@ -654,19 +686,20 @@ def build_retrieval_frame(loader: "ChunkVectorLoader",
         raise ValueError(
             "build_retrieval_frame: the corpus is empty — nothing to "
             "estimate the mean from")
-    acc = np.zeros(loader.dims, dtype=np.float64)
+    acc = torch.zeros(loader.dims, dtype=torch.float64,
+                      device=sys_vector.device)
     protocols = set()
     for cid in ids:
         # per-snapshot protocol (the loader validates everything else)
         path = os.path.join(loader.disk_dir, loader._chunks[cid])
         snap = load_chunk(path)
         protocols.add(snap.protocol)
-        acc += loader.delta_vector(cid)
+        acc = acc + loader.delta_vector(cid)
     if len(protocols) > 1:
         raise ValueError(
             f"build_retrieval_frame: mixed snapshot protocols "
             f"{sorted(protocols)} — a centered frame needs one layout")
-    mean = (acc / len(ids)).astype(np.float32)
+    mean = (acc / len(ids)).to(torch.float32)
     return RetrievalFrame(
         sys_vector=sys_vector, mean_vector=mean, dims=int(loader.dims),
         system_ref=loader.system.reference(), n_mean_chunks=len(ids),
@@ -679,7 +712,9 @@ FRAME_FILE = "retrieval_frame.npz"
 def save_retrieval_frame(loader: "ChunkVectorLoader", frame: RetrievalFrame,
                          path: Optional[str] = None) -> str:
     """Persist the frame beside the snapshots (atomic tmp+replace). The
-    npz carries the two fp32 vectors + a JSON meta (validated on load)."""
+    npz carries the two fp32 vectors + a JSON meta (validated on load).
+    W20.4.3: the npz write rides snapshot.save_frame_npz — the disk
+    edge lives THERE (this module's vectors stay torch-resident)."""
     if path is None:
         path = os.path.join(loader.disk_dir, FRAME_FILE)
     path = os.fspath(path)
@@ -692,13 +727,7 @@ def save_retrieval_frame(loader: "ChunkVectorLoader", frame: RetrievalFrame,
         "created_utc": datetime.now(timezone.utc).isoformat(
             timespec="seconds"),
     }
-    tmp = path + ".tmp.npz"   # np.savez insists on the .npz suffix
-    np.savez(tmp,
-             sys_vector=frame.sys_vector,
-             mean_vector=frame.mean_vector,
-             meta=np.array(json.dumps(meta)))
-    os.replace(tmp, path)
-    return path
+    return save_frame_npz(path, frame.sys_vector, frame.mean_vector, meta)
 
 
 def load_retrieval_frame(disk_dir: str,
@@ -712,16 +741,7 @@ def load_retrieval_frame(disk_dir: str,
         raise ValueError(
             f"load_retrieval_frame: {path} not found — run_index.py "
             f"writes it at index-build time")
-    with np.load(path, allow_pickle=False) as z:
-        missing = [k for k in ("sys_vector", "mean_vector", "meta")
-                   if k not in z.files]
-        if missing:
-            raise ValueError(
-                f"load_retrieval_frame: {path} is missing {missing} — a "
-                f"partial frame file; re-run run_index.py")
-        meta = json.loads(str(z["meta"]))
-        sys_vector = np.asarray(z["sys_vector"], dtype=np.float32)
-        mean_vector = np.asarray(z["mean_vector"], dtype=np.float32)
+    sys_vector, mean_vector, meta = load_frame_npz(path)
     if not isinstance(meta, dict) or meta.get("kind") != "retrieval-frame-v1":
         raise ValueError(
             f"load_retrieval_frame: {path} meta kind "
@@ -739,7 +759,7 @@ def load_retrieval_frame(disk_dir: str,
 
 
 def iter_centered_vectors(loader: "ChunkVectorLoader", frame: RetrievalFrame
-                           ) -> Iterator[np.ndarray]:
+                           ) -> Iterator[torch.Tensor]:
     """The build-side stream: centered content vectors in chunk-id order
     (feed build_index — it L2-normalizes and validates per stream row)."""
     frame.check_loader(loader)
@@ -750,13 +770,15 @@ def iter_centered_vectors(loader: "ChunkVectorLoader", frame: RetrievalFrame
 # ---------------------------------------------------------------------------
 # build / load
 # ---------------------------------------------------------------------------
-def _normalize_streamed(v, config: IndexConfig, pos: int) -> np.ndarray:
-    """Validate + L2-normalize one streamed corpus vector (fp32, (d,))."""
-    row = np.asarray(v)
-    if row.ndim != 1:
+def _normalize_streamed(v, config: IndexConfig, pos: int) -> torch.Tensor:
+    """Validate + L2-normalize one streamed corpus vector (fp32, (d,)).
+    W20.4.3: torch-native — host-array inputs coerce zero-copy at the
+    tensor boundary; the norm check and the divide stay tensor-space."""
+    row = torch.as_tensor(v)
+    if row.dim() != 1:
         raise ValueError(
             f"build_index: stream position {pos}: expected a 1-D (d,) "
-            f"vector, got shape {row.shape}")
+            f"vector, got shape {tuple(row.shape)}")
     if row.shape[0] != int(config.d):
         raise ValueError(
             f"build_index: stream position {pos}: vector dim "
@@ -764,12 +786,12 @@ def _normalize_streamed(v, config: IndexConfig, pos: int) -> np.ndarray:
             f"build an index over a mismatched frame (SPECIFICATION §8 "
             f"fixes d=13,631,488; the loader/stream and IndexConfig must "
             f"agree)")
-    row = np.ascontiguousarray(row, dtype=np.float32)
-    norm = float(np.linalg.norm(row))
-    if not np.isfinite(norm):
+    row = row.to(torch.float32)
+    norm = torch.linalg.vector_norm(row)
+    if not torch.isfinite(norm):
         raise ValueError(
             f"build_index: stream position {pos}: non-finite vector "
-            f"(norm {norm!r})")
+            f"(norm {float(norm)!r})")
     if norm == 0.0:
         raise ValueError(
             f"build_index: stream position {pos}: zero-norm vector — the "
@@ -834,6 +856,19 @@ def _write_index_and_meta(index: faiss.IndexIVFPQ, path: str,
     os.replace(tmp_meta, meta_path)
 
 
+def _faiss_add(index, rows: List[torch.Tensor]) -> None:
+    """One ADD flush (D5 batching): stack the normalized torch rows and
+    hand faiss ONE contiguous host fp32 block — the foreign boundary,
+    once per flush (W20.4.3; the call sequence itself is unchanged)."""
+    if not rows:
+        return
+    mat = torch.stack(rows)
+    # FAISS-EDGE: the one sanctioned host crossing — faiss consumes host
+    # float32 (PROPOSAL rev 2, the foreign boundary).
+    index.add(mat.detach().to("cpu", torch.float32)
+              .contiguous().numpy())  # FAISS-EDGE (the host hop)
+
+
 def build_index(vectors_iter, config: IndexConfig = IndexConfig(),
                 train_sample: int = 4096, path: str | None = None,
                 extra_metadata: dict | None = None,
@@ -886,7 +921,7 @@ def build_index(vectors_iter, config: IndexConfig = IndexConfig(),
             RuntimeWarning, stacklevel=2)
 
     # ---- train: materialize ONLY the first train_sample vectors --------
-    train_rows: List[np.ndarray] = []
+    train_rows: List[torch.Tensor] = []
     for v in stream:
         train_rows.append(_normalize_streamed(v, config, len(train_rows) + 1))
         if len(train_rows) >= train_sample:
@@ -906,7 +941,12 @@ def build_index(vectors_iter, config: IndexConfig = IndexConfig(),
             f" — the coarse/PQ stages will be under-trained. Expected at "
             f"small test scale; NOT a failure (the gate kwargs exist for "
             f"this).", RuntimeWarning, stacklevel=2)
-    train_mat = np.ascontiguousarray(np.stack(train_rows), dtype=np.float32)
+    train_mat = torch.stack(train_rows)   # the ONE dense block (D5)
+    # FAISS-EDGE: the one sanctioned host crossing — faiss consumes host
+    # float32 (PROPOSAL rev 2, the foreign boundary). The train block
+    # crosses ONCE here; the add loop below reuses the same host block.
+    train_host = (train_mat.detach().to("cpu", torch.float32)
+                  .contiguous().numpy())  # FAISS-EDGE (the host hop)
 
     quantizer = faiss.IndexFlatIP(int(config.d))
     index = faiss.IndexIVFPQ(quantizer, int(config.d), int(config.nlist),
@@ -917,21 +957,21 @@ def build_index(vectors_iter, config: IndexConfig = IndexConfig(),
             f"build_index: faiss built metric_type={index.metric_type}, "
             f"expected INNER_PRODUCT — the cosine frame (module docstring) "
             f"is broken; refusing to continue")
-    index.train(train_mat)
+    index.train(train_host)
 
     # ---- add: the train rows (batched), then the rest of the stream -----
     for i in range(0, n_train, ADD_BATCH):
-        index.add(train_mat[i:i + ADD_BATCH])
-    batch: List[np.ndarray] = []
+        index.add(train_host[i:i + ADD_BATCH])
+    batch: List[torch.Tensor] = []
     pos = n_train
     for v in stream:
         pos += 1
         batch.append(_normalize_streamed(v, config, pos))
         if len(batch) >= ADD_BATCH:
-            index.add(np.ascontiguousarray(np.stack(batch), dtype=np.float32))
+            _faiss_add(index, batch)
             batch.clear()
     if batch:
-        index.add(np.ascontiguousarray(np.stack(batch), dtype=np.float32))
+        _faiss_add(index, batch)
 
     index.nprobe = int(config.nprobe)
 
@@ -985,22 +1025,26 @@ def load_index(path: str) -> Tuple[faiss.IndexIVFPQ, dict]:
 # ---------------------------------------------------------------------------
 # §6 steps 3–4
 # ---------------------------------------------------------------------------
-def _query_vector(query_vector, d: Optional[int], ctx: str) -> np.ndarray:
-    q = np.asarray(query_vector)
-    if q.ndim != 1:
+def _query_vector(query_vector, d: Optional[int], ctx: str) -> torch.Tensor:
+    """Validate one raw query vector → a contiguous fp32 torch tensor
+    (host-array inputs coerce zero-copy; W20.4.3 — the norm checks stay
+    tensor-space, no host reads)."""
+    q = torch.as_tensor(query_vector)
+    if q.dim() != 1:
         raise ValueError(
             f"{ctx}: the query must be a 1-D (d,) vector, got shape "
-            f"{q.shape}")
+            f"{tuple(q.shape)}")
     if d is not None and q.shape[0] != int(d):
         raise ValueError(
             f"{ctx}: query dim {q.shape[0]} != {int(d)} — the query's §4 "
             f"vector and the index must share the frame (SPECIFICATION §4: "
             f"'the query's cache vector and the chunk's cache vector are in "
             f"the SAME space')")
-    q = np.ascontiguousarray(q, dtype=np.float32)
-    norm = float(np.linalg.norm(q))
-    if not np.isfinite(norm):
-        raise ValueError(f"{ctx}: non-finite query vector (norm {norm!r})")
+    q = q.to(torch.float32)
+    norm = torch.linalg.vector_norm(q)
+    if not torch.isfinite(norm):
+        raise ValueError(
+            f"{ctx}: non-finite query vector (norm {float(norm)!r})")
     if norm == 0.0:
         raise ValueError(
             f"{ctx}: zero-norm query — cosine is undefined; a §4 query "
@@ -1008,13 +1052,15 @@ def _query_vector(query_vector, d: Optional[int], ctx: str) -> np.ndarray:
     return q
 
 
-def preselect(index, query_vector: np.ndarray, k: int = 100,
-             frame: Optional[RetrievalFrame] = None) -> np.ndarray:
+def preselect(index, query_vector, k: int = 100,
+              frame: Optional[RetrievalFrame] = None) -> torch.Tensor:
     """§6 step 3: IVFADC preselect → candidate chunk ids.
 
     The query is L2-normalized (the index's cosine frame) and searched
-    with index.search; returns an int64 id array with faiss's -1 padding
-    filtered. k defaults to spec §6's 100 (IndexConfig.preselect_k).
+    with index.search; returns a 1-D int64 id TENSOR with faiss's -1
+    padding filtered (W20.4.3: torch-native; the ONE host crossing per
+    direction is the faiss boundary, marked FAISS-EDGE). k defaults to
+    spec §6's 100 (IndexConfig.preselect_k).
 
     W16 `frame`: when given (and the index was BUILT on centered vectors —
     run_index.py writes both together), the ABSOLUTE §4 query vector is
@@ -1028,21 +1074,26 @@ def preselect(index, query_vector: np.ndarray, k: int = 100,
             f"got {type(index).__name__}")
     q = _query_vector(query_vector, d, ctx="preselect")
     if frame is not None:
-        q = np.ascontiguousarray(frame.center_query(q), dtype=np.float32)
+        q = frame.center_query(q)
         if q.shape != (int(d),):
             raise ValueError(
-                f"preselect: the centered query {q.shape} != index d={d} — "
-                f"the frame and the index disagree (rebuild together)")
-    q_hat = (q / float(np.linalg.norm(q))).reshape(1, -1)
-    _, labels = index.search(q_hat, k)
-    ids = np.asarray(labels).reshape(-1)
-    ids = ids[ids >= 0]
-    return ids.astype(np.int64)
+                f"preselect: the centered query {tuple(q.shape)} != "
+                f"index d={d} — the frame and the index disagree "
+                f"(rebuild together)")
+    q_hat = (q / torch.linalg.vector_norm(q)).reshape(1, -1)
+    # FAISS-EDGE: the one sanctioned host crossing — faiss consumes host
+    # float32 (PROPOSAL rev 2, the foreign boundary).
+    q_host = (q_hat.detach().to("cpu", torch.float32)
+              .contiguous().numpy())  # FAISS-EDGE (the host hop)
+    _, labels = index.search(q_host, k)
+    ids = torch.from_numpy(labels.reshape(-1))  # FAISS-EDGE (inbound hop)
+    ids = ids[ids >= 0].to(torch.int64)
+    return ids
 
 
-def rerank(loader, query_vector: np.ndarray, candidate_ids,
+def rerank(loader, query_vector, candidate_ids,
            k: int = 3, frame: Optional[RetrievalFrame] = None
-           ) -> Tuple[np.ndarray, np.ndarray]:
+           ) -> Tuple[torch.Tensor, torch.Tensor]:
     """§6 step 4: exact cos-sim rerank → (top ids, scores desc).
 
     D5 LAZY: dequantizes the candidates' full vectors ONE AT A TIME via
@@ -1054,6 +1105,12 @@ def rerank(loader, query_vector: np.ndarray, candidate_ids,
     Ties keep candidate order (deterministic). A zero-norm candidate
     scores 0.0 (a legitimate stored zero state — cosine against it is 0
     by convention, documented). Returns min(k, #candidates) results.
+
+    W20.4.3: torch-native end-to-end (shapes unchanged, N30–N32): the
+    ids return as a 1-D int64 tensor, the scores as a 1-D fp32 tensor;
+    candidate ids accept python ints, Integral host scalars (legacy
+    host-array callers) and single-element torch tensors (preselect's
+    output). No faiss here — hence no host crossing at all.
     """
     k = _check_int(k, "k", ctx="rerank")
     if not hasattr(loader, "vector"):
@@ -1066,7 +1123,7 @@ def rerank(loader, query_vector: np.ndarray, candidate_ids,
     if frame is not None:
         frame.check_loader(loader)
         q = frame.center_query(q)
-    qn = float(np.linalg.norm(q))
+    qn = torch.linalg.vector_norm(q)
     if qn == 0.0 and frame is not None:
         raise ValueError(
             "rerank: the CENTERED query is zero-norm (the query's state "
@@ -1075,7 +1132,17 @@ def rerank(loader, query_vector: np.ndarray, candidate_ids,
     uniq: List[int] = []
     seen = set()
     for c in candidate_ids:
-        if isinstance(c, bool) or not isinstance(c, (int, np.integer)):
+        if isinstance(c, bool):
+            raise TypeError(
+                f"rerank: candidate ids must be ints, got "
+                f"{type(c).__name__}: {c!r}")
+        if torch.is_tensor(c):
+            if c.numel() != 1:
+                raise TypeError(
+                    f"rerank: candidate ids must be ints, got a "
+                    f"{tuple(c.shape)} tensor")
+            c = int(c)
+        elif not isinstance(c, numbers.Integral):
             raise TypeError(
                 f"rerank: candidate ids must be ints, got "
                 f"{type(c).__name__}: {c!r}")
@@ -1087,26 +1154,35 @@ def rerank(loader, query_vector: np.ndarray, candidate_ids,
         raise ValueError(
             "rerank: no candidates — pass preselect(...)'s ids (spec §6 "
             "step 3 feeds step 4)")
-    scores = np.empty(len(uniq), dtype=np.float64)
+    # the cos-sim is computed in tensor space; the divide happens in fp64
+    # (dot in fp32, widened exactly) — the host-array-era arithmetic.
+    scores = torch.zeros(len(uniq), dtype=torch.float64, device=q.device)
     for i, cid in enumerate(uniq):
         if frame is not None:
-            v = np.asarray(loader.delta_vector(cid))
-            v = frame.center_delta(v)
+            v = frame.center_delta(loader.delta_vector(cid))
         else:
-            v = np.asarray(loader.vector(cid))
-        if v.ndim != 1 or v.shape[0] != q.shape[0]:
+            v = loader.vector(cid)
+        if not torch.is_tensor(v):
+            raise TypeError(
+                f"rerank: loader.vector({cid}) must return a torch tensor "
+                f"(W20.4.3), got {type(v).__name__}")
+        if v.dim() != 1 or v.shape[0] != q.shape[0]:
             raise ValueError(
-                f"rerank: candidate {cid} vector shape {v.shape} != the "
-                f"query's ({q.shape[0]},) — frame drift between the loader "
-                f"and the query")
-        v = np.ascontiguousarray(v, dtype=np.float32)
-        vn = float(np.linalg.norm(v))
-        if not np.isfinite(vn):
+                f"rerank: candidate {cid} vector shape {tuple(v.shape)} != "
+                f"the query's ({q.shape[0]},) — frame drift between the "
+                f"loader and the query")
+        v = v.to(torch.float32)
+        vn = torch.linalg.vector_norm(v)
+        if not torch.isfinite(vn):
             raise ValueError(
-                f"rerank: candidate {cid} has non-finite norm {vn!r}")
-        scores[i] = 0.0 if vn == 0.0 else float(np.dot(q, v) / (qn * vn))
+                f"rerank: candidate {cid} has non-finite norm "
+                f"{float(vn)!r}")
+        if vn == 0.0:
+            continue   # scores[i] stays 0.0 (the documented convention)
+        scores[i] = torch.dot(q, v).double() / (qn.double() * vn.double())
     # stable descending order: score desc, then candidate arrival order
-    order = sorted(range(len(uniq)), key=lambda i: (-scores[i], i))
+    order = torch.argsort(-scores, stable=True)
     top = order[: min(k, len(order))]
-    ids = np.asarray([uniq[i] for i in top], dtype=np.int64)
-    return ids, scores[top].astype(np.float32)
+    ids = torch.as_tensor(uniq, dtype=torch.int64,
+                          device=scores.device)[top]
+    return ids, scores[top].to(torch.float32)

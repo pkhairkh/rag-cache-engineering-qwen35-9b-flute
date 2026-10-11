@@ -550,7 +550,14 @@ COMMIT: "W20.4.2 — install requant torch-native (W16 verbatim
 preserved)"
 
 #### W20.4.3 — index/query/ingest/snapshot sweep (the faiss edge stays)
-- [ ] done
+- [x] done
+FAISS-EDGE inventory: 9 markers, 4 actual host hops (index.py :869
+add, :949 train, :1087 preselect outbound, :1089 inbound labels).
+snapshot.py: numpy confined to the DISK-EDGE save/load codec regions
+(digests ride to_arrays — key-for-key identical output, W16 sha256s
+byte-preserved; frame npz side-files preserved). Open item for the
+box: pre-W20 retrieval tests' strict array-type assertions get
+mechanical adaptation at G20.P1 time.
 ROLE task-writer · READ `src/rag/index.py:360-520` (the :372/473/510
 vector builds), `src/rag/query.py` (the §6 flow), `src/rag/ingest.py`,
 `src/rag/snapshot.py:320-460` (save_chunk npz) · WRITE those four

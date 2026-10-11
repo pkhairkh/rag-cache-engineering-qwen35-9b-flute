@@ -22,6 +22,11 @@ runs — the install needs the codes.
 
 Timing: every step is instrumented (the §9 ledger); QueryResult.timings
 carries seconds per step.
+
+W20.4.3: the query vector is a torch fp32 tensor end-to-end (the §4
+build dequantizes and concatenates on the codes' device; retrieval
+consumes it torch-natively — the faiss hand-off inside index.preselect
+owns the one host crossing). This module is host-array-free.
 """
 from __future__ import annotations
 
@@ -30,7 +35,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
 
-import numpy as np
 import torch
 
 import _paths  # noqa: F401
@@ -64,9 +68,11 @@ class QueryResult:
     install_report: Optional[dict] = None
 
 
-def query_cache_vector(cache: TQCache, system: SystemState) -> np.ndarray:
+def query_cache_vector(cache: TQCache, system: SystemState) -> torch.Tensor:
     """The §4 query vector: dequantized ABSOLUTE-from-system codes of the
-    query prefill, concatenated in §4 order (S ascending, M1, M2), fp32."""
+    query prefill, concatenated in §4 order (S ascending, M1, M2), fp32 —
+    a torch tensor on the codes' device (W20.4.3; the faiss hand-off in
+    index.preselect owns the host hop)."""
     codes = cache.snapshot_codes()
     pieces = []
     for L in sorted(system.s_codes):
@@ -81,7 +87,7 @@ def query_cache_vector(cache: TQCache, system: SystemState) -> np.ndarray:
         if c is not None:
             pieces.append(resolve_quantizer(
                 kind.upper(), c.d, system.bits).dequant(c))
-    return torch.cat(pieces).to(torch.float32).numpy()
+    return torch.cat(pieces).to(torch.float32)
 
 
 def _reset_full_attention(cache) -> None:
