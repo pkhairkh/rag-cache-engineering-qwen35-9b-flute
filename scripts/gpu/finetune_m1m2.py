@@ -31,6 +31,10 @@ Examples:
 
     # mechanics smoke test on synthetic pairs (NOT training data)
     python3 scripts/gpu/finetune_m1m2.py --self-test --max-steps 5
+
+    # single-layer isolation (the W20.14 H6 investigation knob)
+    python3 scripts/gpu/finetune_m1m2.py --pairs-file mrpc_pairs.jsonl \
+        --gates-out disk/m1m2_gates.npz --train-layers 5
 """
 from __future__ import annotations
 
@@ -87,6 +91,29 @@ def synthetic_pairs(n: int, vocab: int, length: int = 96, seed: int = 5):
             pert[j] = int(torch.randint(0, vocab, (1,), generator=g))
         out.append((base, pert))
     return out
+
+
+def _parse_layer_spec(spec: str):
+    """'all' -> None (every layer's write gates train — the default);
+    otherwise a sorted unique index list from comma ints / 'lo-hi'
+    ranges (the driver side of GatesTrainConfig.train_layers, the W20.14
+    H6 knob; train_gates validates the range against the module)."""
+    if spec is None or spec.strip().lower() in ("", "all"):
+        return None
+    out = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            out.update(range(int(lo), int(hi) + 1))
+        else:
+            out.add(int(part))
+    if not out:
+        raise SystemExit(f"--train-layers {spec!r} parses to no layers — "
+                          f"use 'all' or e.g. '5' / '0-11,16'")
+    return sorted(out)
 
 
 def _host_pinned(ids) -> torch.Tensor:
@@ -167,6 +194,13 @@ def main() -> int:
                          "itself never sees it — the read affects "
                          "generation, not the state; pair this with a "
                          "next-token objective in a later wave)")
+    ap.add_argument("--train-layers", default="all",
+                    help="W20.14 (the H6 investigation): write-gate layer "
+                         "subset to train — 'all' (default), a comma list "
+                         "('5,17'), or ranges ('0-11,16'); every other "
+                         "layer's gates freeze at their gate-init value "
+                         "(zero grads + weight_decay 0) — the "
+                         "isolate-single-layer experiment")
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--limit-pairs", type=int, default=0)
     args = ap.parse_args()
@@ -251,6 +285,7 @@ def main() -> int:
         gate_init=args.gate_init if args.gate_init != 0 else None,
         refresh_every=args.refresh_every,
         delta_loss=not args.absolute_loss,
+        train_layers=_parse_layer_spec(args.train_layers),
         memopt=False if args.no_memopt else None)
     if args.no_memopt:
         print("    [A/B] plain autograd replay (the W17 OOM path) — "
@@ -292,9 +327,12 @@ def main() -> int:
         m1_b = torch.stack([s[1][0] for s in states])
         m2_b = torch.stack([s[1][1] for s in states])
         pos, neg = cosine_spread(m1_a, m2_a, m1_b, m2_b)
-        print(f"    cos(true pairs) {pos:+.4f} vs cos(shifted) {neg:+.4f} "
-              f"— gap {pos - neg:+.4f} (the discrimination signal; "
-              f"the §4 vector's M1/M2 units carry this)")
+        print(f"    cos(true pairs) {pos:+.4f} vs cos(in-batch neg) "
+              f"{neg:+.4f} — gap {pos - neg:+.4f} over {len(states)} "
+              f"held-out pairs (the discrimination signal; the §4 "
+              f"vector's M1/M2 units carry this; W20.14: v1's "
+              f"\"shifted\" mean was a permutation of the true-pair "
+              f"mean — identically equal, spread structurally 0)")
 
     out = save_gates(inner.m1m2, args.gates_out, extra_meta={
         "pairs_file": args.pairs_file or "self-test",

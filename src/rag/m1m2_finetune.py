@@ -595,6 +595,15 @@ class GatesTrainConfig:
     # steps; the prefill count halves again vs 4). The operator's call
     # on the box — A/B it and watch the loss/cos separation.
     refresh_every: int = 4
+    # W20.14 — the H6 investigation knob: train the write gates for ONLY
+    # these layer indices (None = all, the default). Layers outside the
+    # set get their gate gradients ZEROED after backward — with the
+    # default weight_decay=0.0 they stay bit-anchored at their fill
+    # value (the "isolate single layer / layer subset" experiment the
+    # box handover asks for, no code changes needed there). The box's
+    # per-layer question ("do per-layer gates help, or does the shared
+    # signal average out?") is now one CLI flag per run.
+    train_layers: Optional[Sequence[int]] = None
     history: List[Dict[str, float]] = field(default_factory=list)
 
 
@@ -714,6 +723,29 @@ over the captured k/v) is untouched.
               "saddle: the loss will sit at ln(B) and the gates will "
               "NOT move; set gate_init/--gate-init != 0 to escape",
               flush=True)
+    # W20.14 — the layer mask (the H6 knob): validate once, zero the
+    # masked gate grads after every backward (weight_decay=0 keeps the
+    # masked gates bit-anchored — they never move)
+    keep_mask = None
+    if cfg.train_layers is not None:
+        idx = sorted({int(i) for i in cfg.train_layers})
+        if not idx:
+            raise ValueError(
+                "train_gates: train_layers=[] would train nothing — "
+                "pass None for all layers")
+        outside = [i for i in idx
+                   if not 0 <= i < module.num_linear_layers]
+        if outside:
+            raise ValueError(
+                f"train_gates: train_layers indices {outside} outside "
+                f"[0, {module.num_linear_layers}) — the write gates are "
+                f"per-linear-layer")
+        keep_mask = torch.zeros(module.num_linear_layers, dtype=torch.bool,
+                                device=cap_dev)
+        keep_mask[idx] = True
+        print(f"    [gates] W20.14 layer mask: training write gates for "
+              f"layers {idx} only ({module.num_linear_layers - len(idx)} "
+              f"frozen at their current value)", flush=True)
     torch.manual_seed(cfg.seed)
     opt = torch.optim.AdamW(
         [p for n, p in module.named_parameters()
@@ -817,6 +849,16 @@ over the captured k/v) is untouched.
         opt.zero_grad(set_to_none=True)
         tb = time.perf_counter()
         loss.backward()
+        # W20.14 — the layer mask (the H6 knob): masked gates get zero
+        # grad BEFORE the |g| read, so the instrumentation reports the
+        # gradient that will actually be applied
+        if keep_mask is not None:
+            for p in (module.write_gate_k, module.write_gate_v):
+                if p.grad is not None:
+                    p.grad[~keep_mask] = 0
+            if (not cfg.freeze_read_gate
+                    and module.read_gate.grad is not None):
+                module.read_gate.grad[~keep_mask] = 0
         # W20.14 — the discrimination the loss optimizes, finally
         # measurable: the same B x B sim matrix, read as stats (the v1
         # metric reported the negatives as the ROLLED true-pair mean —
