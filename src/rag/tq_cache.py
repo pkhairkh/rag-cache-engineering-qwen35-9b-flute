@@ -69,6 +69,20 @@ docstrings). torch._dynamo.mark_static_address is NEVER called by this
 module (zero dynamo references — the only call sites in the process are
 the PARENT class's offline lazy_initialization, which the online path
 replaces entirely; see TQLinearAttentionLayer.lazy_initialization).
+
+W20.4.1 (the wiring audit): this module was authored as the TORCH SURFACE
+of the NumPy-era core — torch tensors in (quant), TQCodes out, W18's
+dequant `device` parameter doing the one-move-at-the-source placement —
+so the W20.2/W20.3 landings beneath it (TQCodes the torch-native
+container; turboquant's quant/dequant device-native) complete the
+interception with zero further code motion here: every read dequantizes
+through the device parameter onto the tracked/writer device, every write
+stores the torch TQCodes as-is (the npz edge lives in snapshot.py's
+to_arrays/from_arrays — never here). The zero audit (the brief's
+host-array / `.item` residue grep) reads 0 module-wide; no DISK-EDGE
+lines exist — this module has no disk edge. The 120-192 per-prefill
+round trips ride device tensors end-to-end statically; the behavioral
+proof is G20.P1's on the A10G box.
 """
 from __future__ import annotations
 

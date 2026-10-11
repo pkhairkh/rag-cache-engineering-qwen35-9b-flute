@@ -502,7 +502,16 @@ elimination — plus the CUDA-gated K1 test file + the gate harness with
 G20.P1. The two foreign edges survive BY DESIGN (npz, faiss).
 
 #### W20.4.1 — tq_cache.py conversion
-- [ ] done
+- [x] done
+Finding: the module was already the torch surface of the old core
+(W15–W18 authored it that way; W18 moved dequant's device param to the
+source) — W20.2/3's torch-native TQCodes/quant/dequant landed BENEATH
+it, completing the device-native round trip with zero code motion.
+The landing = a W20.4.1 attestation paragraph in the docstring (+14
+lines, zero code changes); the zero-audit and the hook signatures were
+verified, not assumed. `update_recurrent_state` is the layer-level
+hook (transformers Cache dispatch), not a TQCache method — true of all
+prior waves.
 ROLE task-writer · READ `src/rag/tq_cache.py:399-727` (the TQCache
 read/write interception region), `src/rag/turboquant.py` (the new
 TQCodes contract) · WRITE `src/rag/tq_cache.py`
