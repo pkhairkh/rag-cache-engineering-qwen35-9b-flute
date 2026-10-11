@@ -284,8 +284,8 @@ def test_frame_roundtrip_and_guards(corpus, tmp_path):
     g.check_loader(corpus.loader)      # the good frame accepts the corpus
 
     # dims drift refuses
-    bad = RetrievalFrame(sys_vector=f.sys_vector[:-1].copy(),
-                         mean_vector=f.mean_vector[:-1].copy(),
+    bad = RetrievalFrame(sys_vector=f.sys_vector[:-1].clone(),   # W20.13.3
+                         mean_vector=f.mean_vector[:-1].clone(),
                          dims=f.dims - 1, system_ref=f.system_ref)
     with pytest.raises(ValueError, match="dims"):
         bad.check_loader(corpus.loader)
@@ -295,7 +295,7 @@ def test_frame_roundtrip_and_guards(corpus, tmp_path):
     with pytest.raises(ValueError, match="system_ref"):
         bad.check_loader(corpus.loader)
     # non-finite refuses at construction
-    nan_vec = f.mean_vector.copy()
+    nan_vec = f.mean_vector.clone()   # W20.13.3: torch idiom
     nan_vec[0] = np.nan
     with pytest.raises(ValueError, match="non-finite"):
         RetrievalFrame(sys_vector=f.sys_vector, mean_vector=nan_vec,

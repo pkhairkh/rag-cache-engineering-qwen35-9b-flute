@@ -135,9 +135,11 @@ def _make_cache() -> TQCache:
 
 
 def _codes_equal(a, b) -> bool:
-    """Bit-exact TQCodes comparison (idx streams + norm — house style)."""
-    return (np.array_equal(a.idx_lo, b.idx_lo)
-            and np.array_equal(a.idx_hi, b.idx_hi)
+    """Bit-exact TQCodes comparison (idx streams + norm — house style).
+    W20.13.3: torch.equal + the .cpu() belt — np.array_equal cannot
+    cross the device boundary the torch-native codes live on."""
+    return (torch.equal(a.idx_lo.cpu(), b.idx_lo.cpu())
+            and torch.equal(a.idx_hi.cpu(), b.idx_hi.cpu())
             and float(a.norm) == float(b.norm))
 
 
@@ -278,7 +280,7 @@ def test_install_one_requant_bit_exact():
             device=DEVICE
         )
         + q.dequant(d_codes[1], device=DEVICE))
-    assert not np.array_equal(two_round.idx_lo, summed.idx_lo)
+    assert not torch.equal(two_round.idx_lo.cpu(), summed.idx_lo.cpu())
     assert not _codes_equal(two_round, summed)
 
     # edge: no deltas -> exactly ONE requant round of the system codes
@@ -433,30 +435,37 @@ def test_query_cache_vector_layout(corpus):
 
     v = query_cache_vector(cache, corpus.system)
     assert v.shape == (corpus.dims,)                 # 2*128 + 128 + 128
-    assert v.dtype == np.float32
+    assert v.dtype == torch.float32
     assert corpus.dims == 2 * S_D + M_D + M_D        # conv excluded
 
     q_s = resolve_quantizer("S", S_D, BITS)
     q_m1 = resolve_quantizer("M1", M_D, BITS)
     q_m2 = resolve_quantizer("M2", M_D, BITS)
-    assert np.array_equal(v[0:S_D],
-                          q_s.dequant(cache.layers[0].s_codes, device=DEVICE).cpu().numpy())
-    assert np.array_equal(v[S_D:2 * S_D],
-                          q_s.dequant(cache.layers[2].s_codes, device=DEVICE).cpu().numpy())
-    assert np.array_equal(v[2 * S_D:2 * S_D + M_D],
-                          q_m1.dequant(cache.m1_codes, device=DEVICE).cpu().numpy())
-    assert np.array_equal(v[2 * S_D + M_D:],
-                          q_m2.dequant(cache.m2_codes, device=DEVICE).cpu().numpy())
+    # W20.13.3: torch.equal on the device-resident streams (the .cpu()
+    # belt — v is the live cache vector, the dequants land on DEVICE)
+    assert torch.equal(v[0:S_D].cpu(),
+                       q_s.dequant(cache.layers[0].s_codes,
+                                   device=DEVICE).cpu())
+    assert torch.equal(v[S_D:2 * S_D].cpu(),
+                       q_s.dequant(cache.layers[2].s_codes,
+                                   device=DEVICE).cpu())
+    assert torch.equal(v[2 * S_D:2 * S_D + M_D].cpu(),
+                       q_m1.dequant(cache.m1_codes, device=DEVICE).cpu())
+    assert torch.equal(v[2 * S_D + M_D:].cpu(),
+                       q_m2.dequant(cache.m2_codes, device=DEVICE).cpu())
     # non-vacuous: the prefill moved the vector off the system reset point
-    assert not np.allclose(
-        v[:S_D], q_s.dequant(corpus.system.s_codes[0], device=DEVICE).cpu().numpy())
+    assert not torch.allclose(
+        v[:S_D].cpu(),
+        q_s.dequant(corpus.system.s_codes[0], device=DEVICE).cpu())
 
     # §4 same-space check: the topic-3 query vs topic-3 / topic-0 chunks
-    vq = v / np.linalg.norm(v)
-    c3 = corpus.loader.vector(13)                    # 13 % 5 == 3
-    c0 = corpus.loader.vector(10)                    # 10 % 5 == 0
-    cos3 = float(vq @ (c3 / np.linalg.norm(c3)))
-    cos0 = float(vq @ (c0 / np.linalg.norm(c0)))
+    # (W20.13.3: torch norms + one .to(v.device) hop per candidate — the
+    # loader's vectors are CPU-resident, v is the live DEVICE vector)
+    vq = v / torch.linalg.vector_norm(v)
+    c3 = corpus.loader.vector(13).to(v.device)          # 13 % 5 == 3
+    c0 = corpus.loader.vector(10).to(v.device)          # 10 % 5 == 0
+    cos3 = float(vq @ (c3 / torch.linalg.vector_norm(c3)))
+    cos0 = float(vq @ (c0 / torch.linalg.vector_norm(c0)))
     assert cos3 > 0.95 and cos0 < 0.2 and cos3 - cos0 > 0.7
 
 

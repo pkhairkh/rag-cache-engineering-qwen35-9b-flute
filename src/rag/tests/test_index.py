@@ -214,20 +214,23 @@ def test_recall_mechanics(tmp_path):
             self.mat = mat
 
         def vector(self, cid):
-            return self.mat[int(cid)]
+            # W20.13.3: the W20.4.3 torch-native contract — loader
+            # .vector() returns a torch tensor (torch.as_tensor wraps the
+            # numpy row zero-copy)
+            return torch.as_tensor(self.mat[int(cid)])
 
     hits, ranks = 0, []
     for _ in range(20):
         src = int(rng.integers(0, 800))
         query = X[src] + 0.03 * rng.standard_normal(d)
         ids = preselect(index, query, k=100)
-        assert ids.dtype == np.int64
+        assert ids.dtype == torch.int64
         assert len(ids) <= 100 and -1 not in ids
         assert len(set(ids.tolist())) == len(ids)   # IVF: one list each
         assert src in ids.tolist()                  # preselect holds it
         top, scores = rerank(ArrayLoader(X), query, ids, k=3)
         assert top.shape == (3,) and scores.shape == (3,)
-        assert np.all(scores[:-1] >= scores[1:])    # descending
+        assert (scores[:-1] >= scores[1:]).all()   # descending
         if src in top.tolist():
             hits += 1
             ranks.append(1 + top.tolist().index(src))
@@ -257,7 +260,7 @@ def test_loader_real_artifacts(stub6):
     assert loader.dims == manifest["vector_dims"] == VECTOR_DIMS == 640
 
     v0 = loader.vector(0)
-    assert v0.dtype == np.float32
+    assert v0.dtype == torch.float32
     assert v0.ndim == 1 and v0.shape == (VECTOR_DIMS,)
 
     # the double-round gate: disk (dequant(sys)+dequant(delta)) vs the
@@ -269,14 +272,15 @@ def test_loader_real_artifacts(stub6):
     assert worst < DOUBLE_ROUND_GATE, f"worst rel-MSE {worst:.4f}"
 
     # iter_vectors: chunk-id order, values identical to vector()
+    # (W20.13.3: torch.equal — both sides are torch tensors now)
     yielded = [v for v in loader.iter_vectors()]
     assert len(yielded) == 6
     for cid, v in zip(loader.chunk_ids(), yielded):
-        assert np.array_equal(v, loader.vector(cid))
+        assert torch.equal(v, loader.vector(cid))
     # explicit id list: the given order
     sel = [v for v in loader.iter_vectors([3, 1])]
-    assert np.array_equal(sel[0], loader.vector(3))
-    assert np.array_equal(sel[1], loader.vector(1))
+    assert torch.equal(sel[0], loader.vector(3))
+    assert torch.equal(sel[1], loader.vector(1))
 
 
 # ===================================== 4. side-metadata round-trip ========
@@ -329,7 +333,9 @@ class CountingLoader:
 
     def vector(self, cid):
         self.calls.append(int(cid))
-        return self.vectors[int(cid)]
+        # W20.13.3: torch-typed (the W20.4.3 loader contract; the call
+        # COUNT is what this mock measures — the wrap adds no calls)
+        return torch.as_tensor(self.vectors[int(cid)])
 
 
 def test_lazy_rerank():
@@ -449,7 +455,7 @@ def test_end_to_end_mini(tmp_path):
         ids = preselect(index, query, k=100)
         assert src in ids.tolist()
         top, scores = rerank(loader, query, ids, k=3)
-        assert np.all(scores[:-1] >= scores[1:])
+        assert (scores[:-1] >= scores[1:]).all()
         if src in top.tolist():
             hits += 1
     assert hits >= 9, f"end-to-end recall {hits}/10"

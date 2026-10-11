@@ -208,9 +208,12 @@ def test_qjl_flag_parity_and_backward_compat():
     q_off = TurboQuant(kind="custom", bits=3.5, d=256, seed=1, qjl=False)
     assert q_plain.qjl is False and q_off.qjl is False
     c_plain, c_off = q_plain.quant(x), q_off.quant(x)
-    assert np.array_equal(c_plain.idx_lo, c_off.idx_lo)
-    assert np.array_equal(c_plain.idx_hi, c_off.idx_hi)
-    assert c_plain.norm.tobytes() == c_off.norm.tobytes()
+    # W20.13.3: torch.equal + the .cpu() belt — np.array_equal cannot
+    # cross the device boundary the W20.3 device-parametric codes live
+    # on (the house idiom from test_tq_cache/test_turboquant)
+    assert torch.equal(c_plain.idx_lo.cpu(), c_off.idx_lo.cpu())
+    assert torch.equal(c_plain.idx_hi.cpu(), c_off.idx_hi.cpu())
+    assert torch.equal(c_plain.norm, c_off.norm)
     assert c_plain.qjl_signs is None and c_plain.gamma is None
     assert c_off.qjl_signs is None and c_off.gamma is None
     assert torch.equal(q_plain.dequant(c_plain, device=DEVICE), q_off.dequant(c_off, device=DEVICE))
@@ -220,13 +223,15 @@ def test_qjl_flag_parity_and_backward_compat():
     assert q_on.qjl is True
     c_on = q_on.quant(x)
     assert c_on.qjl_signs is not None and c_on.gamma is not None
-    assert c_on.qjl_signs.dtype == np.int8
+    assert c_on.qjl_signs.dtype == torch.int8
     assert c_on.qjl_signs.shape == (256,)
-    assert set(np.unique(c_on.qjl_signs).tolist()) <= {-1, 1}
-    assert isinstance(c_on.gamma, np.float32) and float(c_on.gamma) > 0.0
-    assert np.array_equal(c_on.idx_lo, c_plain.idx_lo)
-    assert np.array_equal(c_on.idx_hi, c_plain.idx_hi)
-    assert c_on.norm.tobytes() == c_plain.norm.tobytes()
+    assert set(torch.unique(c_on.qjl_signs).tolist()) <= {-1, 1}
+    assert (isinstance(c_on.gamma, torch.Tensor)
+            and c_on.gamma.dtype == torch.float32
+            and float(c_on.gamma) > 0.0)
+    assert torch.equal(c_on.idx_lo.cpu(), c_plain.idx_lo.cpu())
+    assert torch.equal(c_on.idx_hi.cpu(), c_plain.idx_hi.cpu())
+    assert torch.equal(c_on.norm, c_plain.norm)
     # the QJL sign vector is a SECOND draw: seed+7777 != the rotation seed
     assert not torch.equal(fht.rotation_signs(256, 1 + QJL_SEED_OFFSET),
                            fht.rotation_signs(256, 1))
@@ -263,9 +268,9 @@ def test_qjl_flag_parity_and_backward_compat():
     arr = c_on.to_arrays()
     assert "qjl_signs" in arr and "gamma" in arr
     c_rt = TQCodes.from_arrays(dict(arr))
-    assert np.array_equal(c_rt.qjl_signs, c_on.qjl_signs)
-    assert np.float32(c_rt.gamma).tobytes() == c_on.gamma.tobytes()
-    assert np.array_equal(c_rt.idx_lo, c_on.idx_lo)
+    assert torch.equal(c_rt.qjl_signs.cpu(), c_on.qjl_signs.cpu())
+    assert torch.equal(c_rt.gamma, c_on.gamma)
+    assert torch.equal(c_rt.idx_lo.cpu(), c_on.idx_lo.cpu())
     assert torch.equal(q_on.dequant(c_rt, device=DEVICE), d_on)
     arr_off = c_off.to_arrays()
     assert "qjl_signs" not in arr_off and "gamma" not in arr_off
@@ -315,16 +320,15 @@ def test_snapshot_use_mmap_parity_and_qjl_codes(tmp_path):
              (eager.conv_codes[0], mm.conv_codes[0], "conv_0"),
              (eager.m1_codes, mm.m1_codes, "m1 (qjl)")]
     for a, b, name in units:
-        assert np.array_equal(a.idx_lo, b.idx_lo), name
-        assert np.array_equal(a.idx_hi, b.idx_hi), name
-        assert b.idx_lo.dtype == np.uint8, name
-        assert np.float32(a.norm).tobytes() == np.float32(b.norm).tobytes(), \
-            name
+        assert torch.equal(a.idx_lo.cpu(), b.idx_lo.cpu()), name
+        assert torch.equal(a.idx_hi.cpu(), b.idx_hi.cpu()), name
+        assert b.idx_lo.dtype == torch.uint8, name
+        assert torch.equal(a.norm, b.norm), name
         assert (a.qjl_signs is None) == (b.qjl_signs is None), name
         if a.qjl_signs is not None:
-            assert np.array_equal(a.qjl_signs, b.qjl_signs), name
-            assert np.float32(a.gamma).tobytes() == \
-                np.float32(b.gamma).tobytes(), name
+            assert torch.equal(a.qjl_signs.cpu(), b.qjl_signs.cpu()), \
+                name
+            assert torch.equal(a.gamma, b.gamma), name
     assert eager.s_codes[0].qjl_signs is not None   # the qjl unit rides
     assert eager.s_codes[1].qjl_signs is None       # the plain unit rides
     for field in ("chunk_id", "protocol", "system_ref", "extra"):
@@ -335,7 +339,13 @@ def test_snapshot_use_mmap_parity_and_qjl_codes(tmp_path):
     # WHAT use_mmap ACTUALLY DOES (asserted so the flag cannot lie): the
     # array members are zero-copy views onto np.memmap roots into the
     # snapshot FILE; the eager reader holds plain heap ndarrays.
+    # W20.13.3: the codes fields are torch tensors now (W20.2) — the
+    # ROOT lives through the tensor's zero-copy numpy view (from_arrays'
+    # ascontiguousarray + torch.as_tensor KEEP the memmap's memory), so
+    # the walk starts with one .numpy() hop.
     def mm_root(arr):
+        if torch.is_tensor(arr):
+            arr = arr.numpy()
         while arr.base is not None and not isinstance(arr.base, np.memmap):
             arr = arr.base
         return arr.base
@@ -412,14 +422,16 @@ def test_tq_cache_graph_safe_parity():
     for a, b in zip(o_off, o_on):
         assert torch.equal(a, b), "graph_safe changed a dequantized read"
     for layer in (0, 2):
-        assert np.array_equal(c_off.layers[layer].s_codes.idx_lo,
-                              c_on.layers[layer].s_codes.idx_lo)
-        assert np.array_equal(c_off.layers[layer].s_codes.idx_hi,
-                              c_on.layers[layer].s_codes.idx_hi)
-        assert np.array_equal(c_off.layers[layer].conv_codes.idx_lo,
-                              c_on.layers[layer].conv_codes.idx_lo)
-    assert np.array_equal(c_off.m1_codes.idx_lo, c_on.m1_codes.idx_lo)
-    assert np.array_equal(c_off.m2_codes.idx_hi, c_on.m2_codes.idx_hi)
+        assert torch.equal(c_off.layers[layer].s_codes.idx_lo.cpu(),
+                           c_on.layers[layer].s_codes.idx_lo.cpu())
+        assert torch.equal(c_off.layers[layer].s_codes.idx_hi.cpu(),
+                           c_on.layers[layer].s_codes.idx_hi.cpu())
+        assert torch.equal(c_off.layers[layer].conv_codes.idx_lo.cpu(),
+                           c_on.layers[layer].conv_codes.idx_lo.cpu())
+    assert torch.equal(c_off.m1_codes.idx_lo.cpu(),
+                       c_on.m1_codes.idx_lo.cpu())
+    assert torch.equal(c_off.m2_codes.idx_hi.cpu(),
+                       c_on.m2_codes.idx_hi.cpu())
 
     # the hooks: present, callable, and PROVABLE no-ops
     lay = c_on.layers[0]

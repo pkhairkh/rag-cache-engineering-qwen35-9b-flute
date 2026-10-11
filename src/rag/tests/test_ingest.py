@@ -312,18 +312,23 @@ def test_full_scale_size_gate(tmp_path):
         assert "vector" not in z.files      # D5: codes-only by default
 
     back = load_chunk(path)
-    # bit-identical round-trip: 3 S layers, 2 conv layers, M1, M2
+    # W20.13.3: torch.equal + the .cpu() belt (np.array_equal cannot
+    # cross the device boundary the torch-native codes live on)
     for L in (0, 12, 30):
-        assert np.array_equal(back.s_codes[L].idx_lo, s_codes[L].idx_lo)
-        assert np.array_equal(back.s_codes[L].idx_hi, s_codes[L].idx_hi)
+        assert torch.equal(back.s_codes[L].idx_lo.cpu(),
+                           s_codes[L].idx_lo.cpu())
+        assert torch.equal(back.s_codes[L].idx_hi.cpu(),
+                           s_codes[L].idx_hi.cpu())
         assert float(back.s_codes[L].norm) == float(s_codes[L].norm)
         assert back.s_codes[L].seed == s_codes[L].seed == 101  # D3
     for L in (2, 17):
-        assert np.array_equal(back.conv_codes[L].idx_lo, conv_codes[L].idx_lo)
-        assert np.array_equal(back.conv_codes[L].idx_hi, conv_codes[L].idx_hi)
+        assert torch.equal(back.conv_codes[L].idx_lo.cpu(),
+                           conv_codes[L].idx_lo.cpu())
+        assert torch.equal(back.conv_codes[L].idx_hi.cpu(),
+                           conv_codes[L].idx_hi.cpu())
         assert float(back.conv_codes[L].norm) == float(conv_codes[L].norm)
-    assert np.array_equal(back.m1_codes.idx_lo, m1.idx_lo)
-    assert np.array_equal(back.m2_codes.idx_hi, m2.idx_hi)
+    assert torch.equal(back.m1_codes.idx_lo.cpu(), m1.idx_lo.cpu())
+    assert torch.equal(back.m2_codes.idx_hi.cpu(), m2.idx_hi.cpu())
     assert float(back.m1_codes.norm) == float(m1.norm)
     assert back.protocol == "delta-v1" and back.chunk_id == 0
     assert back.system_ref == "w5.3-full-scale"
@@ -429,7 +434,7 @@ def test_retrieval_vector_order_and_delta_consistency(tmp_path):
 
     rec = drv.records[0]
     v = rec.cache_vector
-    assert v.dtype == np.float32 and v.ndim == 1
+    assert v.dtype == torch.float32 and v.ndim == 1
     # length = Σ S dims + M1 dim + M2 dim (conv is NOT part of §4)
     assert v.shape[0] == len(LINEARS) * S_D + M_D + M_D == 640
 
@@ -462,7 +467,7 @@ def test_retrieval_vector_order_and_delta_consistency(tmp_path):
     # the ordering check is non-vacuous: all 5 segments are distinct
     segs = [v[i * S_D:(i + 1) * S_D] for i in range(len(LINEARS) + 2)]
     for a, b in combinations(range(len(segs)), 2):
-        assert not np.array_equal(segs[a], segs[b]), (a, b)
+        assert not torch.equal(segs[a], segs[b]), (a, b)
 
 
 # ========================= 5. M1 zero-gate through the delta path ==========
@@ -480,7 +485,7 @@ def test_retrieval_vector_m1_zero_gate(tmp_path):
     # the M1 segment is PRESENT (codes exist, norm 0) and exactly zero
     assert v.shape[0] == len(LINEARS) * S_D + M_D + M_D
     m1_seg = v[len(LINEARS) * S_D: len(LINEARS) * S_D + M_D]
-    assert np.all(m1_seg == 0.0)
+    assert (m1_seg == 0.0).all()
     assert float(rec.delta_m1.norm) == 0.0
 
     system = prefill_system(model, sys_tok, _make_cache())
@@ -492,7 +497,7 @@ def test_retrieval_vector_m1_zero_gate(tmp_path):
     assert not snap.m1_codes.idx_lo.any() and not snap.m1_codes.idx_hi.any()
     # M2 is unaffected by the M1 gate (the zero-gate is M1-specific)
     assert float(snap.m2_codes.norm) > 0.0
-    assert not np.all(v[-M_D:] == 0.0)
+    assert not (v[-M_D:] == 0.0).all()
 
 
 # ================================================ 6. driver resume ==========
@@ -620,8 +625,10 @@ def test_codes_only_disk_and_absolute_conv(tmp_path):
         # — the record's abs codes, bit-identical)
         rec = drv.records[cid]
         for L in LINEARS:
-            assert np.array_equal(snap.s_codes[L].idx_lo, rec.abs_s[L].idx_lo)
-            assert np.array_equal(snap.s_codes[L].idx_hi, rec.abs_s[L].idx_hi)
+            assert torch.equal(snap.s_codes[L].idx_lo.cpu(),
+                               rec.abs_s[L].idx_lo.cpu())
+            assert torch.equal(snap.s_codes[L].idx_hi.cpu(),
+                               rec.abs_s[L].idx_hi.cpu())
             assert float(snap.s_codes[L].norm) == float(rec.abs_s[L].norm)
 
         # conv codes are ABSOLUTE: bit-equal the cache's post-prefill conv
@@ -632,22 +639,22 @@ def test_codes_only_disk_and_absolute_conv(tmp_path):
             model(input_ids=chunks[cid], past_key_values=ind, use_cache=True)
         ind_codes = ind.snapshot_codes()
         for L in LINEARS:
-            assert np.array_equal(snap.conv_codes[L].idx_lo,
-                                  ind_codes["conv"][L].idx_lo)
-            assert np.array_equal(snap.conv_codes[L].idx_hi,
-                                  ind_codes["conv"][L].idx_hi)
+            assert torch.equal(snap.conv_codes[L].idx_lo.cpu(),
+                               ind_codes["conv"][L].idx_lo.cpu())
+            assert torch.equal(snap.conv_codes[L].idx_hi.cpu(),
+                               ind_codes["conv"][L].idx_hi.cpu())
             assert float(snap.conv_codes[L].norm) \
                 == float(ind_codes["conv"][L].norm)
             # chunk-specific absolutes, NOT the system's window (if conv
             # were stored as a window-delta, these streams would differ)
-            assert not np.array_equal(snap.conv_codes[L].idx_lo,
-                                      system.conv_codes[L].idx_lo)
+            assert not torch.equal(snap.conv_codes[L].idx_lo.cpu(),
+                                   system.conv_codes[L].idx_lo.cpu())
 
     # the two chunks' conv codes differ from each other (per-chunk windows)
     snap0, snap1 = (load_chunk(snapshot_path(str(tmp_path), c)) for c in (0, 1))
     for L in LINEARS:
-        assert not np.array_equal(snap0.conv_codes[L].idx_lo,
-                                  snap1.conv_codes[L].idx_lo)
+        assert not torch.equal(snap0.conv_codes[L].idx_lo.cpu(),
+                               snap1.conv_codes[L].idx_lo.cpu())
 
     # ---- the LEGACY layout still round-trips (chunk_protocol=delta-v1) ----
     legacy = tmp_path / "legacy"
@@ -659,10 +666,10 @@ def test_codes_only_disk_and_absolute_conv(tmp_path):
         assert snap.protocol == "delta-v1"
         rec = drv1.records[cid]
         for L in LINEARS:
-            assert np.array_equal(snap.s_codes[L].idx_lo,
-                                  rec.delta_s[L].idx_lo)
-            assert np.array_equal(snap.s_codes[L].idx_hi,
-                                  rec.delta_s[L].idx_hi)
+            assert torch.equal(snap.s_codes[L].idx_lo.cpu(),
+                               rec.delta_s[L].idx_lo.cpu())
+            assert torch.equal(snap.s_codes[L].idx_hi.cpu(),
+                               rec.delta_s[L].idx_hi.cpu())
             assert float(snap.s_codes[L].norm) == float(rec.delta_s[L].norm)
 
 
@@ -717,19 +724,20 @@ def test_reseed_one_reused_cache_identical_records(tmp_path):
         rec_reused = ingest_chunk(model, ct, shared, system)
         assert rec_reused.chunk_idx == -1   # set by the driver afterwards
         for L in LINEARS:
-            assert np.array_equal(rec_fresh.delta_s[L].idx_lo,
-                                  rec_reused.delta_s[L].idx_lo)
-            assert np.array_equal(rec_fresh.delta_s[L].idx_hi,
-                                  rec_reused.delta_s[L].idx_hi)
+            assert torch.equal(rec_fresh.delta_s[L].idx_lo.cpu(),
+                               rec_reused.delta_s[L].idx_lo.cpu())
+            assert torch.equal(rec_fresh.delta_s[L].idx_hi.cpu(),
+                               rec_reused.delta_s[L].idx_hi.cpu())
             assert float(rec_fresh.delta_s[L].norm) \
                 == float(rec_reused.delta_s[L].norm)
-            assert np.array_equal(rec_fresh.conv_codes[L].idx_lo,
-                                  rec_reused.conv_codes[L].idx_lo)
+            assert torch.equal(rec_fresh.conv_codes[L].idx_lo.cpu(),
+                               rec_reused.conv_codes[L].idx_lo.cpu())
         for m in ("delta_m1", "delta_m2"):
             a, b = getattr(rec_fresh, m), getattr(rec_reused, m)
-            assert np.array_equal(a.idx_lo, b.idx_lo)
+            assert torch.equal(a.idx_lo.cpu(), b.idx_lo.cpu())
             assert float(a.norm) == float(b.norm)
-        assert np.array_equal(rec_fresh.cache_vector, rec_reused.cache_vector)
+        assert torch.equal(rec_fresh.cache_vector,
+                           rec_reused.cache_vector)
         assert rec_fresh.n_tokens == rec_reused.n_tokens
 
 

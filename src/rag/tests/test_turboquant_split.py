@@ -123,8 +123,10 @@ def test_group1_is_bit_identical_legacy(quantizers, window):
     assert c_new.partition == "half"
     assert c_new.group is None and c_new.mask is None \
         and c_new.norm_hi is None
-    assert np.array_equal(c_new.idx_lo, c_old.idx_lo)
-    assert np.array_equal(c_new.idx_hi, c_old.idx_hi)
+    # W20.13.3: torch.equal + the .cpu() belt — np.array_equal cannot
+    # cross the device boundary the torch-native codes live on
+    assert torch.equal(c_new.idx_lo.cpu(), c_old.idx_lo.cpu())
+    assert torch.equal(c_new.idx_hi.cpu(), c_old.idx_hi.cpu())
     assert float(c_new.norm) == float(c_old.norm)
     # the S kind resolves through the SAME canonical instance as before
     assert resolve_quantizer("S", 524288) is resolve_quantizer("S", 524288)
@@ -137,10 +139,10 @@ def test_codes_arrays_roundtrip(quantizers, window):
     c2 = TQCodes.from_arrays(c.to_arrays())
     assert c2.partition == "outlier"
     assert c2.group == TAPS
-    assert np.array_equal(c2.mask, c.mask)
+    assert torch.equal(c2.mask.cpu(), c.mask.cpu())
     assert float(c2.norm_hi) == float(c.norm_hi)
-    assert np.array_equal(c2.idx_lo, c.idx_lo)
-    assert np.array_equal(c2.idx_hi, c.idx_hi)
+    assert torch.equal(c2.idx_lo.cpu(), c.idx_lo.cpu())
+    assert torch.equal(c2.idx_hi.cpu(), c.idx_hi.cpu())
     assert _rel_mse(q_split.dequant(c2, device=DEVICE), window) < FIDELITY_GATE
 
 
@@ -157,14 +159,14 @@ def test_snapshot_roundtrip_and_digest(quantizers, window, tmp_path):
     loaded = load_chunk(path)
     c2 = loaded.conv_codes[0]
     assert c2.partition == "outlier" and c2.group == TAPS
-    assert np.array_equal(c2.idx_lo, c.idx_lo)
-    assert np.array_equal(c2.idx_hi, c.idx_hi)
-    assert np.array_equal(c2.mask, c.mask)
+    assert torch.equal(c2.idx_lo.cpu(), c.idx_lo.cpu())
+    assert torch.equal(c2.idx_hi.cpu(), c.idx_hi.cpu())
+    assert torch.equal(c2.mask.cpu(), c.mask.cpu())
     assert float(c2.norm_hi) == float(c.norm_hi)
     assert _rel_mse(q_split.dequant(c2, device=DEVICE), window) < FIDELITY_GATE
     # digest: a tampered mask must change it (the load-time verify path)
     c_tampered = TQCodes.from_arrays(c.to_arrays())
-    c_tampered.mask = c_tampered.mask.copy()
+    c_tampered.mask = c_tampered.mask.clone()   # W20.13.3: torch idiom
     c_tampered.mask[0] ^= 0x01  # flip one channel's membership
     d1 = snap_mod._digest_codes({}, {0: c}, None, None)
     d2 = snap_mod._digest_codes({}, {0: c_tampered}, None, None)
@@ -273,9 +275,9 @@ def test_install_carries_split_conv_verbatim(tmp_path):
     installed = cache.layers[0].conv_codes
     assert installed is not None
     assert installed.partition == "outlier" and installed.group == TAPS
-    assert np.array_equal(installed.idx_lo, chunk_conv.idx_lo)
-    assert np.array_equal(installed.idx_hi, chunk_conv.idx_hi)
-    assert np.array_equal(installed.mask, chunk_conv.mask)
+    assert torch.equal(installed.idx_lo.cpu(), chunk_conv.idx_lo.cpu())
+    assert torch.equal(installed.idx_hi.cpu(), chunk_conv.idx_hi.cpu())
+    assert torch.equal(installed.mask.cpu(), chunk_conv.mask.cpu())
     assert report[0]["conv_partition"] == "outlier"
     # and the installed window reads back inside the house budget
     w = cache.layers[0].conv_states[0]
