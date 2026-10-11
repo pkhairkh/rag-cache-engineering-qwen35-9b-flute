@@ -8,7 +8,7 @@ Authority: SPECIFICATION.md > PROPOSAL.md > PROMPT.md > **TASKS.md** >
 HANDOVER.md. Line references are **w20-baseline coordinates** (the tree
 at tag `w20-baseline`); before editing, re-locate by symbol (`rg`) —
 earlier waves move lines.
-Status: COMPLETE — 13/13 waves closed (W20.0–W20.12); the post-close box-feedback wave W20.13 (5 tasks, 2026-10-12) closed on top; all Tier-D DoD green; all 9 gates AUTHORED (PENDING box reports by design; §4.1 records the W20.13.4 threshold re-derivation).
+Status: COMPLETE — 13/13 waves closed (W20.0–W20.12); the post-close box-feedback waves W20.13 (5 tasks) and W20.14 (5 tasks, 2026-10-12) closed on top, and the post-finetune-regime wave W20.15 (5 tasks, 2026-10-12) on top of those; all Tier-D DoD green; gates AUTHORED (PENDING box reports by design; §4.1 records the W20.13.4 threshold re-derivation).
 
 ---
 
@@ -1783,11 +1783,130 @@ COMMIT: "W20.14.5 — wave W20.14 closed: the discrimination was always
 there; the metric can finally see it"
 
 Box open items carried (NOT this wave's scope, recorded for the next):
-the label-0 rows as an eval cohort (a held-out pos/neg discrimination
-report is now one small driver change, post-verification); the 3.2%
-val↔train exact-text overlap (a dedup pass, if the box wants a cleaner
-held-out number); the read_gate contrastive path (needs the aux-NLL
-term, the driver's --aux-nll-weight was specced in W17 and deferred).
+the 3.2% val↔train exact-text overlap (a dedup pass, if the box wants a
+cleaner held-out number); the read_gate contrastive path (needs the
+aux-NLL term, the driver's --aux-nll-weight was specced in W17 and
+deferred); the label-0 rows as TRAINING hard negatives (their eval
+use landed in W20.15 — the curated control line — the training use
+needs a masked-InfoNCE loss change, its own wave).
+
+## WAVE W20.15 — the fine-tune regime: batch reconstitution + the honest ceiling instruments (post-fix handover)
+
+Goal: the box re-ran the 300-step gate fine-tune at W20.14.5 — the
+metric now sees, and what it saw was a SAWTOOTH: loss block means
+0.40..2.98 (chance ln 8 = 2.079; 53/75 blocks below, 22 above), the
+BETWEEN-capture-block loss variance 7,595x the within-block variance
+(the learning slope -0.003 nats/step drowned 199x by the batch jumps),
+pre-clip |gv| swinging 160x with the batch (0.016..2.578 block means),
+600 of 14,469 train pairs consumed (4.1% — one epoch never completed),
+held-out gap +0.1297 (init +0.080), and the training spread PLATEAUED
+at ~0.12 with cos_neg stable (~0.35 background) while cos_pos swings
+per batch (0.35..0.74) — the block difficulty IS the batch's own
+pairs' cross-side alignment. Root cause decomposition: (R1) the v1
+`_cycle_batches` iterator fixed every pair's in-batch negatives to
+its file-layout neighbors for the whole run and starved coverage;
+(R2) the observability gap — 300 |g| values, zero gate VALUE
+locations; (R3) the missing instrument — the write is
+position-addressed (slot = p mod mem_size, ONE token per slot at
+T < mem_size, so the state delta IS the key sequence and state-cos =
+position-ALIGNED key correlation), predicting the discrimination
+lives in the surface-aligned pairs; nothing measured that. The wave
+lands the regime fix + the instruments; the box's next run decides
+between "regime" (fixable by training) and "ceiling" (architectural —
+the §2.2 conversation, NOT more gate steps).
+
+#### W20.15.1 — the trainer observability + the regime/instrument library
+- [x] done
+ROLE finetune owner · WRITE `src/rag/m1m2_finetune.py`
+BRIEF: (a) `_gate_value_stats` (gk/gv min/max/absmean, post-update) +
+the capture-batch ORDINAL ("batch" — the block id the loss sawtooths
+on) into every history entry, the done line printing the final gate
+ranges — the box's run logged 300 gradient magnitudes and zero
+parameter locations; (b) the library the driver wires next:
+`epoch_batches` (per-epoch re-batching — Random(seed*100003+epoch),
+the wrap tail full-size and DISJOINT, n <= batch one batch, batch<2 /
+bool / single pair loud refusals), `lexical_overlap` (word-multiset
+containment — the surface-alignment proxy), `bucketed_spread` (the
+per-bucket diagonal against the overall off-diagonal background).
+INVARIANTS: the capture/replay/backward cadence, the W18 exactness
+contract, the W19 pool contract, the W20.14 field set all untouched
+(only additive fields); cosine_spread/infonce_pairs_loss
+byte-untouched.
+DO-D: py_compile green; `rg '"batch": batch_idx'` +
+`rg 'def epoch_batches'` + `rg 'def lexical_overlap'` +
+`rg 'def bucketed_spread'` hit.
+COMMIT: "W20.15.1 — the trainer observability (the gate VALUE stats +
+the batch ordinal) + the regime/instrument library (epoch_batches /
+lexical_overlap / bucketed_spread)"
+
+#### W20.15.2 — the driver wiring: the regime, the ladder, the coverage
+- [x] done
+ROLE finetune owner · WRITE `scripts/gpu/finetune_m1m2.py`
+BRIEF: the seeded val split (a random sample, was the file's head
+block) + epoch_batches as the train iterator + the consumed-batch
+tally (the coverage number the v1 run never printed: 4.1%) +
+`--fixed-batches` (the v1 regime A/B) + `--shuffle-seed`; the [5]
+report becomes the LADDER — cos(true pairs) vs cos(label-0 curated
+pairs) (the 17,519 rows the v1 loader skipped: the datasets' own
+non-pairs, a cleaner floor than in-batch randoms; they never enter
+training) vs cos(in-batch neg), bucketed by lexical-overlap thirds
+(`--val-pairs` 64 default, was a hard 32).
+INVARIANTS: the trainer consumes ANY iterator unchanged (the
+prefetch contract intact — the generator is endless); `--fixed-batches`
+is behavior-identical to v1's batch order; the self-test path
+touched only by the empty-text guards.
+DO-D: py_compile green; `rg -- '--fixed-batches'` +
+`rg 'curated negatives'` (the driver) hit.
+COMMIT: "W20.15.2 — the driver wiring: per-epoch re-batching, the
+seeded split, the coverage tally, the held-out ladder (true /
+label-0 / in-batch) + the overlap buckets"
+
+#### W20.15.3 — the box-run regression gates (AUTHORED, PENDING)
+- [x] done
+ROLE test author · WRITE `src/rag/tests/test_w20_15_regime.py`
+BRIEF: five gates — (a) epoch_batches re-batches per epoch,
+deterministic per seed, seed-sensitive, full coverage; (b) the
+contracts: full-size batches, the wrap's in-batch distinctness, the
+loud refusals (batch<2 / bool / single pair); (c) the
+lexical-overlap math (containment, case-blind, multiset); (d)
+bucketed_spread on a rigged rig (aligned half vs independent half
+must split; gap == bucket diagonal - overall off-diagonal; label
+mismatch refuses); (e) the history fields (batch ordinals 1,1,2,2,3
+at refresh 2 over 5 steps; gk/gv min/max/absmean present and equal to
+the module's actual gates in the final entry). Statuses: AUTHORED on
+this box, PENDING on the A10G box (the only place they run).
+DO-D: py_compile green; the five test names grep-hit.
+COMMIT: "W20.15.3 — the box-run regression gates (AUTHORED, PENDING)"
+
+#### W20.15.4 — the auditor registration
+- [x] done
+ROLE orchestrator · WRITE `scripts/w20_static_audit.py`
+BRIEF: the W20.15 CHECKS block — the function/flag greps + py_compile
+on the three files + the five commit prefixes + the ledger row +
+the tag (modeled on the W20.14 block; the --all roll-up becomes the
+16-wave pass).
+DO-D: py_compile green on the auditor; the block's greps verified
+against the real targets before commit.
+COMMIT: "W20.15.4 — the auditor registration (the W20.15 checks: the
+library/flag greps + py_compile + the commit prefixes + the tag)"
+
+#### W20.15.5 — the wave close
+- [x] done
+ROLE orchestrator · WRITE `TASKS.md` (this section + the §5 line + the
+header status), `HANDOVER.md` (the W20.15 box section: the analysis,
+the re-run command, the decision tree)
+DO-D: `python3 scripts/w20_static_audit.py --wave W20.15` exit 0 AND
+`--all` exit 0; tag `w20-wave-15` pushed.
+COMMIT: "W20.15.5 — wave W20.15 closed: the sawtooth decomposed; the
+regime fixed; the ceiling made measurable"
+
+Box open items carried (NOT this wave's scope, recorded for the next):
+the label-0 rows as TRAINING hard negatives (the eval control line
+landed; the training use needs a masked-InfoNCE loss change); the
+read_gate aux-NLL path (specced W17, deferred); if the box's bucketed
+report shows the high-overlap-only signature, the NEXT wave is the
+§2.2 slot-addressing conversation (position-locked states — an
+architecture question, not a gate-training run).
 
 ## 5. The attestation ledger (the no-CPU-test law, per wave)
 
@@ -1811,6 +1930,7 @@ truthful (PROMPT.md §1.4):
 | W20.12 | CLOSED 2026-10-11 — no test executed, no CPU test authored, no repo module imported on this box; auditor --wave W20.12 exit 0 (8/8, re-verified post-tag) AND --all exit 0 (the full 13-wave re-check in one pass); push w20-wave-12 implicit in the w20-complete tag sequence |
 | W20.13 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (the g++/py_compile/static-audit vehicles only); auditor --wave W20.13 exit 0 (26/26, re-verified post-tag) AND --all exit 0 (the full 14-wave re-check in one pass); push w20-wave-13 |
 | W20.14 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile/static-audit vehicles + a pure-stdlib jsonl read of the training DATA, no repo code); auditor --wave W20.14 exit 0 (22/22, re-verified post-tag) AND --all exit 0 (the full 15-wave re-check in one pass); push w20-wave-14 |
+| W20.15 | CLOSED 2026-10-12 — no test executed, no CPU test authored, no repo module imported on this box (py_compile/static-audit vehicles + a pure-stdlib json/history read of the box-run artifacts, no repo code); auditor --wave W20.15 exit 0 (re-verified post-tag) AND --all exit 0 (the full 16-wave re-check in one pass); push w20-wave-15 |
 
 Line format: `CLOSED <date> — no test executed, no CPU test authored,
 no repo module imported on this box; auditor --wave W20.<n> exit 0;

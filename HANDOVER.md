@@ -354,3 +354,117 @@ File the numbers verbatim (history json + the [5] held-out line);
 if the held-out gap is still ~0 with the fixed metric, THEN it is a
 real learning question and the next wave starts from the deltas
 (hypotheses H1/H2 — the state construction itself), not the metric.
+
+## W20.15 — the sawtooth decomposed: the regime fixed, the ceiling made measurable (CLOSED 2026-10-12)
+
+The W20.14.5 re-run did what it was asked: cos(neg) finally differs
+from cos(pos), the spread is real (+0.1297 held-out, 0.080 at init),
+and the loss shows genuine below-chance ranking (53/75 capture blocks
+below ln 8). "Doesn't look good" is also correct — here is exactly
+why, decomposed from your own history json (every number below is
+measured, not argued):
+
+1. **The sawtooth is BATCH IDENTITY, not divergence.** The loss block
+   means range 0.40..2.98 and jump ±2.1 nats at every capture refresh
+   (every 4 steps); the within-block learning slope is -0.003
+   nats/step — **the between-block variance is 7,595x the
+   within-block variance**. Each block trains on ONE captured batch
+   of 8 pairs; its difficulty is that batch's own pairs' cross-side
+   alignment (cos_pos swings 0.35..0.74 across blocks while cos_neg
+   sits stable at ~0.35). Nothing is diverging; the loss is measuring
+   the batch, not the model.
+2. **The regime starved the signal.** 300 steps at B=8/refresh 4
+   consumed **600 of 14,469 train pairs (4.1%)** — one epoch never
+   completed — and the v1 iterator (`_cycle_batches`) walks ONE fixed
+   file order forever, so every pair's in-batch negatives (the
+   InfoNCE's entire negative signal) were its file-layout neighbors
+   for the whole run. The pre-clip |gv| swung 160x with the batch
+   (0.016..2.578) — each batch yanked the 48 gate scalars its own
+   way.
+3. **The plateau ~0.12 is the gate-reweighting share.** The gates'
+   real, generalizable effect was suppressing the common background
+   (cos_neg 0.535 -> 0.343); the spread grew 0.08 -> 0.13 and then
+   sat. The likely ceiling: the write is **position-addressed**
+   (slot = p mod mem_size — and at T < 1024 every slot holds exactly
+   ONE token, so a side's state delta IS its key sequence, and the
+   state cosine is the position-ALIGNED key correlation). Paraphrase
+   pairs with aligned surfaces (MRPC/STS-B style) can separate;
+   question~answer-sentence pairs and word-order-adversarial PAWS
+   pairs cannot, no matter the gate weights — 48 scalars reweight
+   layers, they cannot realign positions.
+
+What landed (W20.15.1–.5, tag `w20-wave-15`):
+
+1. **The regime** (`epoch_batches`): per-epoch re-batching — every
+   epoch redraws every pair's in-batch negatives (deterministic per
+   seed); the driver's val split is a seeded random sample (was the
+   file's head block); the coverage tally prints the number the v1
+   run never showed; `--fixed-batches` restores the v1 order for the
+   A/B.
+2. **The observability**: every history entry carries the gate VALUES
+   (gk/gv min/max/absmean — where the gates ARE; your run logged 300
+   |g| values and zero locations) + the capture-batch ordinal (the
+   block id — group the sawtooth by it).
+3. **The instruments** (`lexical_overlap` + `bucketed_spread` + the
+   label-0 control line): the [5] report is now a LADDER —
+   cos(true pairs) vs **cos(label-0 curated pairs)** (the 17,519
+   non-pair rows your loader skipped: the datasets' own curated
+   negatives, a cleaner floor than in-batch randoms) vs cos(in-batch
+   neg) — and the gap bucketed by the pair's lexical overlap
+   (high/med/low).
+
+**The data verdict (your standing question, unchanged from W20.14's
+audit, now with its value realized): GOOD — clean, balanced,
+deduplicated, 7 sources. The label-0 half was free capacity sitting
+unused; it is now the control line of every [5] report, and is the
+natural hard-negative pool for a future training wave.**
+
+The box re-run sequence (no rebuild — the wave touches no CUDA):
+
+```
+cd /home/ubuntu/RAGGA
+git pull --ff-only origin main          # >= W20.15.5
+source /home/ubuntu/venv/bin/activate
+python3 -m pytest src/rag/tests -q      # 260 + the 5 new W20.15 gates
+
+# THE REGIME RUN (B=16 halves the block-difficulty variance and doubles
+# the negatives; 600 steps doubles coverage to ~2,400 pairs; ~35-40 min):
+python3 scripts/gpu/finetune_m1m2.py \
+    --pairs-file data/pairs.jsonl \
+    --gates-out m1m2_gates_trained.npz \
+    --m1m2-mem-size 1024 \
+    --batch-pairs 16 \
+    --max-steps 600 \
+    --refresh-every 4 \
+    --gate-init 0.1
+```
+
+What to expect, and how to read it:
+
+* **The sawtooth shrinks ~30%** (the block-mean variance halves at
+  B=16) and every epoch re-draws the negatives — the loss trend, if
+  there is one, becomes visible above the block noise. The coverage
+  line should read ~2,400 pair-uses (~17%).
+* **The [5] ladder is the decision instrument.** File all four
+  numbers. Then read them:
+  - **`true` >> `label-0`** (gap > ~0.2) and the gap LIVES IN THE
+    HIGH-OVERLAP BUCKET ONLY → the position-lock ceiling is
+    CONFIRMED: the states separate surface-aligned pairs and cannot
+    separate semantics. The next wave is the §2.2 slot-addressing
+    conversation (an architecture change — e.g. content-keyed slots
+    or sub-T slot wrapping), NOT more gate steps.
+  - **Flat buckets** (low-overlap gap ~= high-overlap gap ~= overall)
+    → the signal is NOT surface-locked; then it is
+    capacity/optimization: `--batch-pairs 32`, more steps, and the
+    label-0 hard-negative pool (a masked-InfoNCE loss change, next
+    wave).
+  - **`true` ~= `label-0`** (both well above in-batch) → the pairs
+    barely beat curated negatives — weak but real graded signal;
+    same direction as the flat-bucket case.
+* A/B rows, if wanted: `--fixed-batches` (the v1 order — the
+  sawtooth's cause, isolated); `--tau 0.1` (softens the
+  hardest-negative domination that the 0.40..2.98 blocks show);
+  `--lr 5e-3` if |gv| still spikes >1 at B=16.
+
+File the numbers verbatim (history json + the [5] ladder); the next
+wave starts from the bucket profile, not from the loss curve.
