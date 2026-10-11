@@ -3509,3 +3509,788 @@ torch::Tensor tq_dequant_batched(
     // later launch on this stream cannot observe the freed blocks.
     return out;
 }
+
+// ===========================================================================
+// W20.9.1 -- the tq_qjl chain pair: tq_qjl_quant / tq_qjl_compensate.
+// TASKS.md:1192-1207; PROPOSAL.md:179-185 (§3.5, "The QJL kernels (Alg.
+// 2, flag-off but kernel-complete)") and :96 (the kernel table's
+// tq_qjl row: "sign sketch via fht_forward_large on the residual;
+// compensation via fht_backward_large"). The torch contract is
+// turboquant.py:67-111 (the W9.2 qjl flag docstring): _attach_qjl
+// (turboquant.py:860-901) on the encode side, _qjl_compensation_term
+// (turboquant.py:1155-1193) on the decode side -- this section is
+// those two bodies as kernel chains, composed from the committed
+// family entries (the 7.3/8.1 composition law: nothing re-implemented,
+// every launch the fixture-pinned copy, the additions-only rule).
+//
+// THE CONTRACT (the paper's Alg.-2 residual sketch, turboquant.py:71-80
+// and :82-96's EXACT FORMULATION note): with the MSE layer decoded,
+//   r     = x - x_mse                  (the ORIGINAL-frame residual; the
+//                                       rotated form is identical by
+//                                       linearity)
+//   gamma = ||r||_2                     (one fp32 per unit, never
+//                                       quantized)
+//   qjl   = sign(FHT(r, seed+7777))    (the SECOND deterministic sign
+//                                       draw's rotation, same d)
+//   decode: x~ = x~_mse + (QJL_C * gamma / sqrt(d)) * FHT_adjoint(qjl)
+// with QJL_C = sqrt(pi/2) (turboquant.py:268) and the structured
+// projection S = sqrt(d)*FHT(d, seed+7777) folded into the scale
+// (turboquant.py:92: "(sqrt(pi/2)/d)*gamma*S^T*qjl == (sqrt(pi/2)/
+// sqrt(d))*gamma*FHT_adjoint(qjl)" -- with S the ±1 raw Hadamard, the
+// adjoint's own rsqrtf(K) fold is one of the two sqrt(d) factors).
+//
+// THE SCALE INVARIANCE (the identity the quant leg rides, pinned in
+// both bodies): sign(FHT(r/gamma)) == sign(FHT(r)) -- sign() commutes
+// with the positive per-row scaling, so the twin's division by gamma
+// NEVER materializes (turboquant.py:892-893, PROPOSAL.md:154-155 --
+// §3.3's identity, "the normalized vector is never materialized"). The
+// kernel sketch therefore takes fht_forward_large's output VERBATIM
+// (signs after the butterfly, rsqrtf(K) at the final store -- the
+// committed 5.2 epilogue) and signs it elementwise: the rsqrtf(K) fold
+// and the would-be 1/gamma are both positive scalings, invisible to
+// sign().
+//
+// THE COMPOSITION (each leg, what reuses what):
+//   tq_qjl_quant (encode): (a) x_mse = tq_dequant_batched(..., kFloat)
+//     -- 8.1's committed decode entry, launched verbatim (the residual
+//     rides the SAME adjoint/LUT decode the compensation will correct:
+//     the twin's _dequant_mse(codes, fp32), turboquant.py:881); (b)
+//     r = x - x_mse -- ONE new flat elementwise kernel (__fsub_rn, one
+//     owner per element); (c) gamma = tq_quant_norm_rows(r) -- 7.1's
+//     committed chain, launched verbatim (the residual's (M,) norms --
+//     7.1's fixed shfl tree, not torch.norm's association); (d) proj =
+//     fht_forward_large(r, qjl_rotation) -- 5.2's committed butterfly,
+//     launched verbatim with the SECOND draw in the signs slot; (e) the
+//     sketch = sign(proj) -- ONE new flat elementwise kernel (torch.
+//     sign's trichotomy, exact int8 store). Returns (qjl_signs (M, K)
+//     int8, gamma (M,) fp32) -- TQCodes' two qjl fields, batched.
+//   tq_qjl_compensate (decode): (a) the int8 sketch widens to fp32 --
+//     ONE new flat elementwise kernel (the twin's s.to(torch.float32),
+//     turboquant.py:1189: exact, one owner per element); (b) z =
+//     fht_backward_large(s32, qjl_rotation) -- 5.3's committed adjoint,
+//     launched verbatim (signs at the first load, rsqrtf(K) at the
+//     final store; the QJL draw in the signs slot -- exactly the twin's
+//     fht_adjoint(s_t, self._qjl_signs_vec) routing to the SAME kernel
+//     at eligible K, turboquant.py:1192 + fht.py:446-467); (c) out = g
+//     + (QJL_C * gamma[m] / sqrt(K)) * z -- ONE new flat elementwise
+//     kernel with the per-row gamma broadcast (row = j >> row_shift: K
+//     a power of two, a shift, never a divide; K a multiple of 1024, so
+//     a warp's 32 consecutive elements never straddle a row -- the
+//     gamma[row] load is warp-uniform, served once, the decode chain's
+//     scale-pass discipline, kernel_tq.cu:3222-3255).
+//
+// THE SCALAR CHAIN, reproduced exactly as the twin computes it
+// (turboquant.py:1193, `out + (QJL_C * codes.gamma / math.sqrt(self.d))
+// * z`): per row m, c_m = (QJL_C_f32 * gamma[m]) / sqrt(K)_f32 -- one
+// mul.rn then one div.rn, the wrapped-scalar semantics that cast
+// Python's QJL_C and math.sqrt(d) to the fp32 tensor's dtype before
+// each op; per element j, out_j = add.rn(g_j, mul.rn(c_m, z_j)). The
+// kernel performs the SAME .rn instructions in the same order
+// (__fmul_rn / __fdiv_rn / __fmul_rn / __fadd_rn -- the .rn forms are
+// load-bearing: the build's --use_fast_math, setup.py:171, would lower
+// a plain '/' to div.approx; the intrinsics pin the IEEE roundings, so
+// the chain is bit-identical to the twin's ATen ops given the same
+// gamma and z bits). Both constants are pinned as hexfloat literals
+// (below) -- no library sqrt anywhere in this section: no host math
+// call for nvcc to lower, and the device gets pure constants.
+//
+// THE GAMMA == 0 DEGENERACY (both twin branches, gone without a trace):
+// the decode side's c_m is exactly 0 and 0 x finite = 0, so out_j = g_j
+// -- EXACTLY the zero the twin's guard adds (turboquant.py:1166-1168,
+// "a degenerate gamma == 0 multiplies the finite adjoint to the exact
+// zero term"); the quant side's twin branch (turboquant.py:885-890) is
+// equally branchless here -- gamma == 0 means r is the exact zero
+// vector (the zero-norm unit's zero codes and 0 x finite x_mse, or an
+// exact reconstruction), FHT(0) = 0 exactly (every butterfly pair adds
+// and subtracts zeros; the +-1 sign multiply and the rsqrtf fold leave
+// zeros at zero), and sign(0) = 0 -- the twin's torch.zeros(d, int8),
+// bit-identical, with NO host read of gamma (the family's no-D2H
+// discipline: no .item(), no .cpu(), no branch, no sync).
+//
+// FLAG-OFF COMPLETENESS (TASKS.md:1201-1203): the entries exist and
+// are bound; the runtime keeps the qjl flag DEFAULT OFF (turboquant.
+// py:599-606 -- the A/B is additive; the dispatcher's qjl routing is
+// later work, and _quant_kernel_eligible still refuses the flag,
+// turboquant.py:817-818). Nothing here is on any production dispatch
+// path yet: the W20.9.3 CUDA-gated parity suite and G20.P3's qjl leg
+// (TASKS.md:1431 -- "the qjl leg completes W20.9") are the callers.
+//
+// DETERMINISM CONTRACT: run-to-run torch.equal assertable. Every new
+// kernel is flat grid-stride elementwise with exactly one writer per
+// element (the poison kernel's map, kernel_tq.cu:391-403); every grid
+// is a pure function of (M, K) -- no device query feeds any launch;
+// the composed entries are the committed deterministic units launched
+// verbatim on the current stream (launch order is the chain's only
+// ordering); the scalar chain is three pinned .rn instructions. No
+// reduction or synchronization primitive of any kind appears in this
+// section (the module grep stays at zero, the 7.1 invariant,
+// kernel_tq.cu:1447-1455). FLUTE_TQ_CANARY/TRAP ride the composed
+// butterflies for free; the four new kernels are pure elementwise
+// functions whose fresh outputs are written exactly once -- the
+// ownership map plus G20.P3's qjl leg own them (the 8.1 banner's
+// stage-(a)/(c) note, kernel_tq.cu:2913-2918).
+//
+// THE PARITY CLAIM (G20.P3's qjl leg, W20.9.3's allclose): the
+// butterflies are the SAME kernels the twin's fht_apply / fht_adjoint
+// route to at eligible K on CUDA (fht.py:446-467) -- identical bits by
+// construction; gamma is 7.1's fixed-order chain against the twin's
+// torch.norm association, and x_mse is the kernel decode against the
+// twin's torch decode -- the 5.2 class, association-level differences
+// the gate's tolerance owns (never a parity question). Where the twin
+// falls to its reference butterfly (extension absent, non-CUDA), the
+// same association-level tolerance owns the whole diff.
+//
+// THE BUDGET: x_mse, r, proj (encode) and s32, z (decode) are (M, K)
+// fp32 transients (2 MiB per unit at 2^19), freed at scope exit on the
+// same stream (the caching allocator's stream-ordered discipline,
+// kernel_tq.cu:1652-1657); the outputs are (M, K) int8 + (M,) fp32
+// (encode) and (M, K) fp32 (decode). The four new kernels are
+// 1024-thread no-smem streaming launches, ceil(M*K/1024) CTAs (the
+// scale pass's arithmetic, kernel_tq.cu:3278-3283).
+//
+// THE M == 0 BRANCH: both entries' (the launchers refuse M == 0
+// loudly) -- correctly-shaped empty outputs, no launch (a zero-size
+// grid is not a legal launch, kernel_tq.cu:577-580).
+//
+// COMPILE RECORD: nvcc is ABSENT on this authoring box (env/W20_ENV.md)
+// -- compile and behavioral verification defer to the A10G box (the
+// W20.5.4 TU registration carries this file; W20.9.3's suite and the
+// G20.P3 qjl leg run there). Authored statically, re-read for review;
+// every defect found here is a box-side discovery.
+// ===========================================================================
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// The two pinned fp32 constants. Both are hand-derived hexfloat literals
+// (exact by construction -- a hexfloat IS the bits); each derivation is
+// written out to be re-checked, and a static_assert brackets the value
+// against its decimal form.
+// ---------------------------------------------------------------------------
+// kTqQjlC = fl32(sqrt(pi/2)) = fl32(turboquant.py:268's QJL_C =
+// math.sqrt(math.pi / 2.0) = 1.253314137315500...): the fp64 root's
+// fraction 0.2533141373155 x 2^23 = 2124952.998..., so the fp32
+// mantissa rounds to 2124953 = 0x206C99. This is the value a wrapped
+// Python scalar takes when torch casts it to the fp32 tensor's dtype
+// before QJL_C * gamma (turboquant.py:1193's first op).
+constexpr float kTqQjlC = 0x1.206C99p+0f;
+
+// kTqQjlSqrt2 = fl32(sqrt(2)) (the odd-exponent powers of two's root
+// factor): 0x1.3504F3p+0f == fl32(sqrt(2)) == fl32(fl64(sqrt(2))) --
+// the fp64 root 1.4142135623730951 sits 2.4e-8 above this fp32 and
+// 9.5e-8 below the next, so the double-rounding gap is EMPTY and the
+// narrowed value is unique (the derivation in tq_qjl_sqrt_pow2).
+constexpr float kTqQjlSqrt2 = 0x1.3504F3p+0f;
+
+static_assert(kTqQjlC > 1.2533f && kTqQjlC < 1.2534f,
+              "fl32(sqrt(pi/2)) is 1.2533141... (turboquant.py:268)");
+static_assert(kTqQjlSqrt2 > 1.4142f && kTqQjlSqrt2 < 1.4143f,
+              "fl32(sqrt(2)) is 1.4142135...");
+
+// ---------------------------------------------------------------------------
+// tq_qjl_sqrt_pow2 -- sqrt(K) as fl32 for the chain's power-of-two K,
+// WITHOUT any library call: K = 2^(2m) -> 2^m, EXACT; K = 2^(2m+1) ->
+// 2^m * kTqQjlSqrt2, the ONE rounded constant. This IS fl32(sqrt(K))
+// for every power of two -- what torch's wrapped-scalar cast produces
+// from the twin's math.sqrt(self.d) divisor (turboquant.py:1193): the
+// fp64 root of 2^(2m) is exact, and the fp64 root of 2^(2m+1) is
+// 2^m * fl64(sqrt(2)) (exact scaling) which narrows to 2^m *
+// kTqQjlSqrt2 (power-of-two scaling commutes with rounding -- and the
+// sqrt(2) double-rounding gap is empty, above). m <= 15 over the
+// checked envelope (K a power of two <= 2^30), so 1 << m is an exact
+// int and the int->float cast is exact. Pure exponent arithmetic: the
+// build's --use_fast_math never reaches this C++, and the value is a
+// pure function of K's exponent -- deterministic by construction.
+// ---------------------------------------------------------------------------
+float tq_qjl_sqrt_pow2(int K) {
+    const int e = flute::fht_large_log2_floor(K);  // K == 2^e (entry-checked)
+    const int m = e >> 1;
+    const float base = static_cast<float>(1 << m);  // exact (m <= 15)
+    return (e & 1) ? base * kTqQjlSqrt2 : base;
+}
+
+// ---------------------------------------------------------------------------
+// tq_qjl_residual_kernel -- the residual r = x - x_mse, ONE element per
+// grid-stride iteration (the family's flat streaming shape: pass 2's
+// 1024 threads, no shared memory; the poison kernel's map,
+// kernel_tq.cu:391-403). __fsub_rn is the single rounding -- the same
+// IEEE subtract torch's elementwise `x32 - x_mse` performs
+// (turboquant.py:882), so the element is bit-identical given the same
+// x and x_mse bits.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(flute::FHT_LARGE_THREADS)
+tq_qjl_residual_kernel(
+    const float* __restrict__ x,    // (M, K) fp32: the input unit rows
+    const float* __restrict__ mse,  // (M, K) fp32: the chain's x_mse
+    float* __restrict__ r,          // (M, K) fp32 OUT: the residual
+    int64_t n) {                    // M * K elements
+    const int64_t stride =
+        static_cast<int64_t>(gridDim.x) * flute::FHT_LARGE_THREADS;
+    const int64_t tid =
+        static_cast<int64_t>(blockIdx.x) * flute::FHT_LARGE_THREADS
+        + threadIdx.x;
+    for (int64_t j = tid; j < n; j += stride) {
+        r[j] = __fsub_rn(x[j], mse[j]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tq_qjl_sign_kernel -- the sketch: sign(proj) as int8, ONE element per
+// grid-stride iteration. torch.sign's exact trichotomy (turboquant.py:
+// 899): +1 / -1 / 0 -- the 0 only on an exact-zero projection
+// (measure-zero for generic residuals, degrades that coordinate by
+// 1/sqrt(d) of its weight; a gamma == 0 row is ALL zeros -- the
+// branchless degenerate in the banner). The int8 store is exact. NaN
+// is outside the contract (a NaN input means a NaN x_mse/gamma -- the
+// family's finite-tensor precondition); the comparison chain maps it
+// to 0 rather than propagating.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(flute::FHT_LARGE_THREADS)
+tq_qjl_sign_kernel(
+    const float* __restrict__ proj,  // (M, K) fp32: FHT(r) -- 5.2's output
+    int8_t* __restrict__ out,        // (M, K) int8 OUT: the ±1/0 sketch
+    int64_t n) {                     // M * K elements
+    const int64_t stride =
+        static_cast<int64_t>(gridDim.x) * flute::FHT_LARGE_THREADS;
+    const int64_t tid =
+        static_cast<int64_t>(blockIdx.x) * flute::FHT_LARGE_THREADS
+        + threadIdx.x;
+    for (int64_t j = tid; j < n; j += stride) {
+        const float v = proj[j];
+        out[j] = (v > 0.0f) ? int8_t(1)
+               : ((v < 0.0f) ? int8_t(-1) : int8_t(0));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tq_qjl_widen_kernel -- the sketch's fp32 widening, ONE element per
+// grid-stride iteration: the twin's s.to(torch.float32)
+// (turboquant.py:1189) as a kernel. EXACT (every int8 value is
+// fp32-representable -- a pure widening, nothing to round), one owner
+// per element, no barrier.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(flute::FHT_LARGE_THREADS)
+tq_qjl_widen_kernel(
+    const int8_t* __restrict__ s,  // (M, K) int8: the stored sketch
+    float* __restrict__ out,       // (M, K) fp32 OUT: ±1/0 widened
+    int64_t n) {                   // M * K elements
+    const int64_t stride =
+        static_cast<int64_t>(gridDim.x) * flute::FHT_LARGE_THREADS;
+    const int64_t tid =
+        static_cast<int64_t>(blockIdx.x) * flute::FHT_LARGE_THREADS
+        + threadIdx.x;
+    for (int64_t j = tid; j < n; j += stride) {
+        out[j] = static_cast<float>(s[j]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tq_qjl_compensate_kernel -- the decode-side term: out = g + (QJL_C *
+// gamma[m] / sqrt(K)) * z, ONE element per grid-stride iteration, the
+// per-row gamma broadcast by row = j >> row_shift (the scale pass's
+// discipline, kernel_tq.cu:3222-3255: K a power of two -> a shift, and
+// a warp's 32 consecutive elements never straddle a row, so the
+// gamma[row] load is warp-uniform, served once). The scalar chain is
+// the banner's pinned instruction sequence, the twin's
+// turboquant.py:1193 op-for-op; gamma == 0 makes c exactly 0 and
+// 0 x finite = 0, so out = g exactly (the degenerate branch, gone).
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(flute::FHT_LARGE_THREADS)
+tq_qjl_compensate_kernel(
+    const float* __restrict__ g,      // (M, K) fp32: the MSE reconstruction
+    const float* __restrict__ z,      // (M, K) fp32: the sketch's adjoint
+    const float* __restrict__ gamma,  // (M,) fp32: the residual norms
+    float* __restrict__ out,          // (M, K) fp32 OUT: g + the term
+    int64_t n,                        // M * K elements
+    int row_shift,                    // log2(K)
+    float sqrt_k) {                   // fl32(sqrt(K)) -- tq_qjl_sqrt_pow2
+    const int64_t stride =
+        static_cast<int64_t>(gridDim.x) * flute::FHT_LARGE_THREADS;
+    const int64_t tid =
+        static_cast<int64_t>(blockIdx.x) * flute::FHT_LARGE_THREADS
+        + threadIdx.x;
+    for (int64_t j = tid; j < n; j += stride) {
+        const int row = static_cast<int>(j >> row_shift);
+        // c_m = (QJL_C * gamma[m]) / sqrt(K): mul.rn then div.rn, the
+        // twin's wrapped-scalar chain (turboquant.py:1193).
+        const float c = __fdiv_rn(__fmul_rn(kTqQjlC, gamma[row]), sqrt_k);
+        // out = g + (c * z): mul.rn then add.rn, same op order.
+        out[j] = __fadd_rn(g[j], __fmul_rn(c, z[j]));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The raw-pointer launchers (the family's pattern: integer geometry +
+// pointer hygiene checked loudly; the host never touches device memory
+// content -- no readback, no D2H sync anywhere). The block count is
+// the scale pass's idiom (ceil over 1024-thread CTAs, kernel_tq.cu:
+// 3278-3283) computed in int64, with the INT32_MAX belt; the kernels'
+// grid-stride loops are the R20.6 guard.
+// ---------------------------------------------------------------------------
+void tq_qjl_residual_run(
+    const float* x, const float* mse, float* r,
+    int M, int K, cudaStream_t stream) {
+    TORCH_CHECK(M > 0,
+                "tq_qjl_residual: M must be > 0 (a zero-size grid is not "
+                "a legal launch -- the M == 0 branch is the entry's)");
+    TORCH_CHECK(x != nullptr && mse != nullptr && r != nullptr,
+                "tq_qjl_residual: x, mse and r must be live device "
+                "pointers");
+    const int64_t n = static_cast<int64_t>(M) * K;
+    const int64_t blocks64 =
+        (n + flute::FHT_LARGE_THREADS - 1) / flute::FHT_LARGE_THREADS;
+    TORCH_CHECK(blocks64 <= static_cast<int64_t>(INT32_MAX),
+                "tq_qjl_residual: M*K = ", n, " needs ", blocks64,
+                " CTAs -- over the grid.x launch bound");
+    tq_qjl_residual_kernel
+        <<<static_cast<int>(blocks64), flute::FHT_LARGE_THREADS, 0, stream>>>(
+            x, mse, r, n);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void tq_qjl_sign_run(
+    const float* proj, int8_t* out,
+    int M, int K, cudaStream_t stream) {
+    TORCH_CHECK(M > 0,
+                "tq_qjl_sign: M must be > 0 (a zero-size grid is not a "
+                "legal launch -- the M == 0 branch is the entry's)");
+    TORCH_CHECK(proj != nullptr && out != nullptr,
+                "tq_qjl_sign: proj and out must be live device pointers");
+    const int64_t n = static_cast<int64_t>(M) * K;
+    const int64_t blocks64 =
+        (n + flute::FHT_LARGE_THREADS - 1) / flute::FHT_LARGE_THREADS;
+    TORCH_CHECK(blocks64 <= static_cast<int64_t>(INT32_MAX),
+                "tq_qjl_sign: M*K = ", n, " needs ", blocks64,
+                " CTAs -- over the grid.x launch bound");
+    tq_qjl_sign_kernel
+        <<<static_cast<int>(blocks64), flute::FHT_LARGE_THREADS, 0, stream>>>(
+            proj, out, n);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void tq_qjl_widen_run(
+    const int8_t* s, float* out,
+    int M, int K, cudaStream_t stream) {
+    TORCH_CHECK(M > 0,
+                "tq_qjl_widen: M must be > 0 (a zero-size grid is not a "
+                "legal launch -- the M == 0 branch is the entry's)");
+    TORCH_CHECK(s != nullptr && out != nullptr,
+                "tq_qjl_widen: s and out must be live device pointers");
+    const int64_t n = static_cast<int64_t>(M) * K;
+    const int64_t blocks64 =
+        (n + flute::FHT_LARGE_THREADS - 1) / flute::FHT_LARGE_THREADS;
+    TORCH_CHECK(blocks64 <= static_cast<int64_t>(INT32_MAX),
+                "tq_qjl_widen: M*K = ", n, " needs ", blocks64,
+                " CTAs -- over the grid.x launch bound");
+    tq_qjl_widen_kernel
+        <<<static_cast<int>(blocks64), flute::FHT_LARGE_THREADS, 0, stream>>>(
+            s, out, n);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void tq_qjl_compensate_run(
+    const float* g, const float* z, const float* gamma, float* out,
+    int M, int K, float sqrt_k, cudaStream_t stream) {
+    TORCH_CHECK(M > 0,
+                "tq_qjl_scale: M must be > 0 (a zero-size grid is not a "
+                "legal launch -- the M == 0 branch is the entry's)");
+    TORCH_CHECK(g != nullptr && z != nullptr && gamma != nullptr &&
+                out != nullptr,
+                "tq_qjl_scale: g, z, gamma and out must be live device "
+                "pointers");
+    const int row_shift = flute::fht_large_log2_floor(K);
+    TORCH_CHECK((1 << row_shift) == K,
+                "tq_qjl_scale: K must be a power of two (the entry's "
+                "envelope check), got K=", K);
+    TORCH_CHECK(sqrt_k > 0.0f,
+                "tq_qjl_scale: sqrt_k must be positive (the divisor of "
+                "the twin's / math.sqrt(d) chain, turboquant.py:1193), "
+                "got ", sqrt_k);
+    const int64_t n = static_cast<int64_t>(M) << row_shift;  // M * K
+    const int64_t blocks64 =
+        (n + flute::FHT_LARGE_THREADS - 1) / flute::FHT_LARGE_THREADS;
+    TORCH_CHECK(blocks64 <= static_cast<int64_t>(INT32_MAX),
+                "tq_qjl_scale: M*K = ", n, " needs ", blocks64,
+                " CTAs -- over the grid.x launch bound");
+    tq_qjl_compensate_kernel
+        <<<static_cast<int>(blocks64), flute::FHT_LARGE_THREADS, 0, stream>>>(
+            g, z, gamma, out, n, row_shift, sqrt_k);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------
+// Argument validation -- the entries' loud TORCH_CHECK families (the
+// batched entries' mirror: metadata only, never content -- the
+// launchers and the composed entries re-check their own geometry as
+// the belt, so a failure surfaces with the entry's prefix first).
+// ---------------------------------------------------------------------------
+void tq_qjl_quant_check_args(
+    const torch::Tensor& x, const torch::Tensor& signs,
+    const torch::Tensor& codes_lo, const torch::Tensor& codes_hi,
+    const torch::Tensor& norms,
+    const torch::Tensor& centroids_lo, const torch::Tensor& centroids_hi,
+    int64_t n_lo, int64_t bits_lo, int64_t n_hi, int64_t bits_hi,
+    const torch::Tensor& qjl_rotation) {
+    // x: the input unit matrix -- the 7.4 entry's `units` contract.
+    TORCH_CHECK(x.is_cuda(), "tq_qjl_quant: x must be a CUDA tensor");
+    TORCH_CHECK(x.dim() == 2,
+                "tq_qjl_quant: x must be 2-D (M, d) - the prefill's unit "
+                "matrix (the caller flattens (..., d) to rows)");
+    TORCH_CHECK(x.is_contiguous(), "tq_qjl_quant: x must be contiguous");
+    TORCH_CHECK(x.scalar_type() == at::kFloat,
+                "tq_qjl_quant: x dtype must be float32 (the residual rides "
+                "the fp32 unit rows; other dtypes stay on the torch twin, "
+                "which casts first, turboquant.py:505), got ",
+                x.scalar_type());
+    // the split's cardinals (the 7.4/8.1 mirror).
+    TORCH_CHECK(bits_lo == 3 || bits_lo == 4,
+                "tq_qjl_quant: bits_lo must be 3 or 4 (the TQ index "
+                "stream widths, codebooks.py:219-228), got ", bits_lo);
+    TORCH_CHECK(bits_hi == 3 || bits_hi == 4,
+                "tq_qjl_quant: bits_hi must be 3 or 4 (the TQ index "
+                "stream widths, codebooks.py:219-228), got ", bits_hi);
+    TORCH_CHECK(n_lo >= 0 && n_hi >= 0,
+                "tq_qjl_quant: the split halves must be non-negative "
+                "(n_lo=", n_lo, ", n_hi=", n_hi, ")");
+    const int64_t d = n_lo + n_hi;
+    TORCH_CHECK(d > 0 && d <= static_cast<int64_t>(INT32_MAX),
+                "tq_qjl_quant: d = n_lo + n_hi must be a positive "
+                "int-sized count (got d=", d, ")");
+    const int K = static_cast<int>(d);
+    TORCH_CHECK(d == x.size(1),
+                "tq_qjl_quant: d must match x's last dim (got d=", d,
+                ", x.size(1)=", x.size(1), ") - frame drift? (PROPOSAL "
+                "D3)");
+    // the butterfly's envelope, mirrored (fht_large_check_args's
+    // family, kernel_tq.cu:490-531 -- BOTH butterflies of this chain
+    // ride it).
+    TORCH_CHECK(K > flute::FHT_LARGE_TILE,
+                "tq_qjl_quant: d=", K, " <= 16384 - one 64 KiB tile or "
+                "less; the small-K paths own it");
+    TORCH_CHECK((K & (K - 1)) == 0,
+                "tq_qjl_quant: d must be a power of two (the FHT rotation "
+                "the residual chain rides), got d=", K);
+    TORCH_CHECK(K % 32 == 0,
+                "tq_qjl_quant: d must be divisible by 32 (the "
+                "kernel_fht.cu:21 discipline), got d=", K);
+    // THE ALIGNMENT CONTRACT (the 7.4/8.1 mirror): refuse loudly, route
+    // to the torch twin.
+    TORCH_CHECK(n_lo % kTqPackSlice == 0,
+                "tq_qjl_quant: n_lo must be a multiple of ", kTqPackSlice,
+                " (the 16-coordinate slice ownership; got n_lo=", n_lo,
+                ") - misaligned fractions stay on the torch twin");
+    // M's launch bounds + the butterfly's launch arithmetic (the 7.4
+    // mirror, kernel_tq.cu:2641-2647).
+    TORCH_CHECK(x.size(0) <= static_cast<int64_t>(INT32_MAX),
+                "tq_qjl_quant: M must fit a grid.x launch (got M=",
+                x.size(0), ")");
+    TORCH_CHECK(x.size(0) * d <= (int64_t{1} << 41),
+                "tq_qjl_quant: M*d = ", x.size(0) * d,
+                " exceeds the butterfly launch grid's addressable pairs");
+    // the codes' contracts (the 8.1 mirror): the two packed streams +
+    // the (M,) norms -- tq_quant_batched's outputs, batched.
+    const int64_t L_lo = (n_lo * bits_lo + 7) / 8;
+    const int64_t L_hi = (n_hi * bits_hi + 7) / 8;
+    TORCH_CHECK(codes_lo.is_cuda() && codes_lo.dim() == 2 &&
+                codes_lo.is_contiguous() &&
+                codes_lo.scalar_type() == at::kByte,
+                "tq_qjl_quant: codes_lo must be a contiguous 2-D (M, ",
+                L_lo, ") uint8 CUDA tensor (tq_quant_batched's first "
+                "output, batched), got dim=", codes_lo.dim(),
+                ", dtype=", codes_lo.scalar_type());
+    TORCH_CHECK(codes_lo.size(1) == L_lo,
+                "tq_qjl_quant: codes_lo's row length must equal "
+                "tq_packed_len(n_lo, bits_lo) = ", L_lo,
+                " (the _packed_len parity, turboquant.py:998), got ",
+                codes_lo.size(1));
+    TORCH_CHECK(codes_hi.is_cuda() && codes_hi.dim() == 2 &&
+                codes_hi.is_contiguous() &&
+                codes_hi.scalar_type() == at::kByte,
+                "tq_qjl_quant: codes_hi must be a contiguous 2-D (M, ",
+                L_hi, ") uint8 CUDA tensor (tq_quant_batched's second "
+                "output, batched), got dim=", codes_hi.dim(),
+                ", dtype=", codes_hi.scalar_type());
+    TORCH_CHECK(codes_hi.size(1) == L_hi,
+                "tq_qjl_quant: codes_hi's row length must equal "
+                "tq_packed_len(n_hi, bits_hi) = ", L_hi,
+                " (the _packed_len parity, turboquant.py:998), got ",
+                codes_hi.size(1));
+    TORCH_CHECK(codes_lo.size(0) == x.size(0) &&
+                codes_hi.size(0) == x.size(0),
+                "tq_qjl_quant: the codes must carry x's batch (x M=",
+                x.size(0), ", codes_lo M=", codes_lo.size(0),
+                ", codes_hi M=", codes_hi.size(0), ")");
+    TORCH_CHECK(norms.is_cuda() && norms.dim() == 1 &&
+                norms.scalar_type() == at::kFloat &&
+                norms.is_contiguous() && norms.numel() == x.size(0),
+                "tq_qjl_quant: norms must be a contiguous (M,) float32 "
+                "CUDA tensor (tq_quant_batched's third output, batched), "
+                "got numel=", norms.numel(), ", M=", x.size(0));
+    // signs: the quantizer's FIRST-draw (d,) fp32 rotation vector (the
+    // residual's decode un-rotates through it), passed IN by the caller
+    // (the family's no-RNG contract, kernel_tq.cu:2900-2902).
+    TORCH_CHECK(signs.is_cuda() && signs.dim() == 1 &&
+                signs.scalar_type() == at::kFloat && signs.is_contiguous() &&
+                signs.numel() == d,
+                "tq_qjl_quant: signs must be a contiguous (d,) float32 "
+                "CUDA tensor - the quantizer's rotation vector "
+                "(fht.rotation_signs, supplied by the caller), got "
+                "numel=", signs.numel(), ", d=", d);
+    // the centroid mirrors (the 8.1 mirror): 1-D fp32 CUDA, length
+    // 2^bits -- unconditionally (bits validated above; an empty half's
+    // table is never dereferenced).
+    const int64_t want_lo = tq_centroid_count(static_cast<int>(bits_lo));
+    const int64_t want_hi = tq_centroid_count(static_cast<int>(bits_hi));
+    TORCH_CHECK(centroids_lo.is_cuda() && centroids_lo.dim() == 1 &&
+                centroids_lo.scalar_type() == at::kFloat &&
+                centroids_lo.is_contiguous() &&
+                centroids_lo.numel() == want_lo,
+                "tq_qjl_quant: centroids_lo must be a contiguous (",
+                want_lo, ",) float32 CUDA tensor (the 2^bits_lo codebook "
+                "mirror), got numel=", centroids_lo.numel());
+    TORCH_CHECK(centroids_hi.is_cuda() && centroids_hi.dim() == 1 &&
+                centroids_hi.scalar_type() == at::kFloat &&
+                centroids_hi.is_contiguous() &&
+                centroids_hi.numel() == want_hi,
+                "tq_qjl_quant: centroids_hi must be a contiguous (",
+                want_hi, ",) float32 CUDA tensor (the 2^bits_hi codebook "
+                "mirror), got numel=", centroids_hi.numel());
+    // qjl_rotation: the SECOND draw (fht.rotation_signs(d, seed+7777) --
+    // turboquant.py:605-606, QJL_SEED_OFFSET = 7777 at :260), passed IN
+    // by the caller; this C++ owns no RNG and no seed.
+    TORCH_CHECK(qjl_rotation.is_cuda() && qjl_rotation.dim() == 1 &&
+                qjl_rotation.scalar_type() == at::kFloat &&
+                qjl_rotation.is_contiguous() && qjl_rotation.numel() == d,
+                "tq_qjl_quant: qjl_rotation must be a contiguous (d,) "
+                "float32 CUDA tensor - the QJL SECOND sign draw "
+                "(fht.rotation_signs(d, seed+7777), supplied by the "
+                "caller), got numel=", qjl_rotation.numel(), ", d=", d);
+}
+
+void tq_qjl_compensate_check_args(
+    const torch::Tensor& g, const torch::Tensor& qjl_signs,
+    const torch::Tensor& gamma, const torch::Tensor& qjl_rotation) {
+    // g: the fp32 MSE reconstruction (tq_dequant_batched's kFloat width;
+    // the twin's _dequant_mse(codes, torch.float32), turboquant.py:1146).
+    TORCH_CHECK(g.is_cuda(), "tq_qjl_compensate: g must be a CUDA tensor");
+    TORCH_CHECK(g.dim() == 2,
+                "tq_qjl_compensate: g must be 2-D (M, K) - the batched "
+                "MSE reconstruction");
+    TORCH_CHECK(g.is_contiguous(),
+                "tq_qjl_compensate: g must be contiguous");
+    TORCH_CHECK(g.scalar_type() == at::kFloat,
+                "tq_qjl_compensate: g dtype must be float32 (the "
+                "compensation rides the fp32 reconstruction; the "
+                "requested output dtype converts at the very end - the "
+                "twin's dtype-last contract, turboquant.py:1146-1147), "
+                "got ", g.scalar_type());
+    // the sketch: (M, K) int8 ±1/0 (tq_qjl_quant's first output).
+    TORCH_CHECK(qjl_signs.is_cuda(),
+                "tq_qjl_compensate: qjl_signs must be a CUDA tensor");
+    TORCH_CHECK(qjl_signs.dim() == 2,
+                "tq_qjl_compensate: qjl_signs must be 2-D (M, K) - the "
+                "batched QJL sketch (tq_qjl_quant's first output)");
+    TORCH_CHECK(qjl_signs.is_contiguous(),
+                "tq_qjl_compensate: qjl_signs must be contiguous");
+    TORCH_CHECK(qjl_signs.scalar_type() == at::kChar,
+                "tq_qjl_compensate: qjl_signs dtype must be int8 (the "
+                "±1/0 sketch), got ", qjl_signs.scalar_type());
+    TORCH_CHECK(qjl_signs.size(0) == g.size(0),
+                "tq_qjl_compensate: the sketch must carry g's batch (g "
+                "M=", g.size(0), ", qjl_signs M=", qjl_signs.size(0), ")");
+    TORCH_CHECK(qjl_signs.size(1) == g.size(1),
+                "tq_qjl_compensate: the sketch's width must match g's (g "
+                "K=", g.size(1), ", qjl_signs K=", qjl_signs.size(1), ")");
+    // gamma: the (M,) fp32 residual norms (tq_qjl_quant's second
+    // output).
+    TORCH_CHECK(gamma.is_cuda() && gamma.dim() == 1 &&
+                gamma.scalar_type() == at::kFloat &&
+                gamma.is_contiguous() && gamma.numel() == g.size(0),
+                "tq_qjl_compensate: gamma must be a contiguous (M,) "
+                "float32 CUDA tensor (the residual norms, tq_qjl_quant's "
+                "second output), got numel=", gamma.numel(),
+                ", M=", g.size(0));
+    // the derived width + the adjoint's envelope (fht_large_check_args's
+    // family, kernel_tq.cu:490-531 -- the adjoint downstream owns
+    // exactly this K; a power of two above 16384 is necessarily
+    // 32-aligned, the 8.1 mirror's clause order).
+    TORCH_CHECK(g.size(1) > 0 && g.size(1) <= static_cast<int64_t>(INT32_MAX),
+                "tq_qjl_compensate: K must be a positive int-sized count "
+                "(got K=", g.size(1), ")");
+    const int K = static_cast<int>(g.size(1));
+    TORCH_CHECK(K > flute::FHT_LARGE_TILE,
+                "tq_qjl_compensate: K=", K, " <= 16384 - one 64 KiB tile "
+                "or less; the small-K paths own it");
+    TORCH_CHECK((K & (K - 1)) == 0,
+                "tq_qjl_compensate: K must be a power of two (the FHT "
+                "adjoint the compensation rides), got K=", K);
+    TORCH_CHECK(K % 32 == 0,
+                "tq_qjl_compensate: K must be divisible by 32 (the "
+                "kernel_fht.cu:21 discipline), got K=", K);
+    // M's launch bounds + the adjoint's launch arithmetic (the 8.1
+    // mirror).
+    TORCH_CHECK(g.size(0) <= static_cast<int64_t>(INT32_MAX),
+                "tq_qjl_compensate: M must fit a grid.x launch (got M=",
+                g.size(0), ")");
+    TORCH_CHECK(g.size(0) * K <= (int64_t{1} << 41),
+                "tq_qjl_compensate: M*K = ", g.size(0) * K,
+                " exceeds the butterfly launch grid's addressable pairs");
+    // qjl_rotation: the SECOND draw -- the adjoint's rotation (the twin
+    // passes self._qjl_signs_vec, turboquant.py:1192).
+    TORCH_CHECK(qjl_rotation.is_cuda() && qjl_rotation.dim() == 1 &&
+                qjl_rotation.scalar_type() == at::kFloat &&
+                qjl_rotation.is_contiguous() && qjl_rotation.numel() == K,
+                "tq_qjl_compensate: qjl_rotation must be a contiguous "
+                "(K,) float32 CUDA tensor - the QJL SECOND sign draw "
+                "(fht.rotation_signs(K, seed+7777), the adjoint's "
+                "rotation), got numel=", qjl_rotation.numel(),
+                ", K=", K);
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// tq_qjl_quant -- the public encode entry (bound by src/bindings.cpp in
+// W20.9.1): the QJL residual sketch over a prefill's whole unit batch,
+// ONE host call. The chain: 8.1's decode entry (x_mse) -> the residual
+// kernel -> 7.1's norm chain (gamma) -> 5.2's butterfly with the SECOND
+// draw (proj) -> the sign kernel (the sketch). Returns (qjl_signs (M,
+// K) int8, gamma (M,) fp32) -- TQCodes' two qjl fields, batched (the
+// dispatcher stacks per-unit rows). The wrapper never reads device
+// memory content (no .item(), no .cpu(), no D2H sync anywhere; the
+// twin's gamma == 0 branch is the branchless degenerate, the banner's).
+// ---------------------------------------------------------------------------
+std::tuple<torch::Tensor, torch::Tensor> tq_qjl_quant(
+    torch::Tensor x, torch::Tensor signs,
+    torch::Tensor codes_lo, torch::Tensor codes_hi,
+    torch::Tensor norms,
+    torch::Tensor centroids_lo, torch::Tensor centroids_hi,
+    int64_t n_lo, int64_t bits_lo, int64_t n_hi, int64_t bits_hi,
+    torch::Tensor qjl_rotation) {
+    tq_qjl_quant_check_args(x, signs, codes_lo, codes_hi, norms,
+                            centroids_lo, centroids_hi,
+                            n_lo, bits_lo, n_hi, bits_hi, qjl_rotation);
+
+    const int M = static_cast<int>(x.size(0));
+    const int K = static_cast<int>(n_lo + n_hi);  // the derived unit width
+
+    // The M == 0 branch (the launchers' TORCH_CHECKs document it as
+    // this entry's): the two correctly-shaped empty outputs, no launch
+    // (the family discipline, kernel_tq.cu:577-580).
+    if (M == 0) {
+        torch::Tensor qjl =
+            torch::empty({int64_t{0}, static_cast<int64_t>(K)},
+                         x.options().dtype(at::kChar));
+        torch::Tensor gamma = torch::empty({int64_t{0}},
+                                           x.options().dtype(at::kFloat));
+        return {qjl, gamma};
+    }
+
+    // ---- (a) x_mse: the committed decode entry, launched verbatim ----
+    // (the 8.1 composition pattern, kernel_tq.cu:3436: its own
+    // check_args is the belt, its launches are the fixture-pinned
+    // chain -- the residual rides the SAME decode the compensation
+    // will correct; the twin's _dequant_mse(codes, fp32),
+    // turboquant.py:881). The fp32 width: the residual's subtraction
+    // and the norm are fp32 math end-to-end.
+    torch::Tensor x_mse = tq_dequant_batched(
+        codes_lo, codes_hi, norms, signs, centroids_lo, centroids_hi,
+        n_lo, bits_lo, n_hi, bits_hi, at::kFloat);
+
+    auto stream = at::cuda::getCurrentCUDAStream();  // the house kernels'
+                                                     // stream
+
+    // ---- (b) the residual: r = x - x_mse (the ORIGINAL-frame residual;
+    // the rotated form is identical by linearity, turboquant.py:71-74) -
+    // ---------------------------------------------------------------------
+    torch::Tensor r = torch::empty_like(x);
+    tq_qjl_residual_run(x.data_ptr<float>(), x_mse.data_ptr<float>(),
+                        r.data_ptr<float>(), M, K, stream);
+
+    // ---- (c) gamma: 7.1's norm chain on the residual (the (M,) fp32
+    // output, computed once, returned once, never read on the host) ----
+    torch::Tensor gamma = tq_quant_norm_rows(r);
+
+    // ---- (d) the sketch basis: 5.2's butterfly with the SECOND draw in
+    // the signs slot -- the scale invariance: sign(FHT(r/gamma)) ==
+    // sign(FHT(r)); the rsqrtf(K) fold and the would-be 1/gamma are
+    // both positive scalings, invisible to sign() (turboquant.py:892-
+    // 893). The entry's own check_args re-validates r (the belt). ------
+    torch::Tensor proj = fht_forward_large(r, qjl_rotation);
+
+    // ---- (e) the sketch: sign(proj) -> int8 (torch.sign's trichotomy,
+    // turboquant.py:899) ------------------------------------------------
+    torch::Tensor qjl = torch::empty(x.sizes(),
+                                     x.options().dtype(at::kChar));
+    tq_qjl_sign_run(proj.data_ptr<float>(), qjl.data_ptr<int8_t>(),
+                    M, K, stream);
+
+    // x_mse, r and proj free at scope exit on the same stream -- the
+    // caching allocator's stream-ordered discipline (kernel_tq.cu:1652-
+    // 1657): a later launch on this stream cannot observe the freed
+    // blocks.
+    return {qjl, gamma};
+}
+
+// ---------------------------------------------------------------------------
+// tq_qjl_compensate -- the public decode entry (bound by
+// src/bindings.cpp in W20.9.1): the Alg.-2 residual term over the
+// batch, ONE host call. The chain: the widening kernel (s32) -> 5.3's
+// adjoint with the SECOND draw (z) -> the scale+add kernel (out = g +
+// (QJL_C * gamma[m] / sqrt(K)) * z, the banner's pinned scalar chain,
+// turboquant.py:1193). out is fresh and out-of-place (g is never
+// written -- the family's adjoint discipline); fp32 in, fp32 out, the
+// requested output dtype converts at the caller's very end (the twin's
+// dtype-last contract, turboquant.py:1146-1147); the wrapper never
+// reads device memory content.
+// ---------------------------------------------------------------------------
+torch::Tensor tq_qjl_compensate(
+    torch::Tensor g, torch::Tensor qjl_signs, torch::Tensor gamma,
+    torch::Tensor qjl_rotation) {
+    tq_qjl_compensate_check_args(g, qjl_signs, gamma, qjl_rotation);
+
+    const int M = static_cast<int>(g.size(0));
+    const int K = static_cast<int>(g.size(1));
+
+    // out: fresh, out-of-place (g is never written). The M == 0 branch
+    // (the launchers' TORCH_CHECKs document it as this entry's): the
+    // correctly-shaped empty tensor, no launch (the family discipline,
+    // kernel_tq.cu:577-580).
+    torch::Tensor out = torch::empty_like(g);
+    if (M == 0) {
+        return out;
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream();  // the house kernels'
+                                                     // stream
+
+    // ---- (a) the widening: the int8 sketch -> (M, K) fp32 (the twin's
+    // s.to(torch.float32), turboquant.py:1189 -- exact; the adjoint's
+    // fp32 input contract) -----------------------------------------------
+    torch::Tensor s32 = torch::empty(g.sizes(), g.options());
+    tq_qjl_widen_run(qjl_signs.data_ptr<int8_t>(), s32.data_ptr<float>(),
+                     M, K, stream);
+
+    // ---- (b) the adjoint: 5.3's public entry, launched verbatim (the
+    // composition reuse): signs at the first load, the SAME butterfly,
+    // rsqrtf(K) at the final store; the QJL draw in the signs slot --
+    // exactly the twin's fht_adjoint(s_t, self._qjl_signs_vec) routing
+    // to the same kernel at eligible K (turboquant.py:1192, fht.py:446-
+    // 467). The entry's own check_args re-validates s32 (the belt) and
+    // allocates z, the chain's second transient. ------------------------
+    torch::Tensor z = fht_backward_large(s32, qjl_rotation);
+
+    // ---- (c) the term: out = g + (QJL_C * gamma[m] / sqrt(K)) * z ----
+    // sqrt_k = fl32(sqrt(K)) without any library call (the host helper
+    // above; the twin's math.sqrt(self.d) narrowed by torch's
+    // wrapped-scalar cast).
+    const float sqrt_k = tq_qjl_sqrt_pow2(K);
+    tq_qjl_compensate_run(g.data_ptr<float>(), z.data_ptr<float>(),
+                          gamma.data_ptr<float>(), out.data_ptr<float>(),
+                          M, K, sqrt_k, stream);
+
+    // s32 and z free at scope exit on the same stream -- the caching
+    // allocator's stream-ordered discipline (kernel_tq.cu:1652-1657):
+    // a later launch on this stream cannot observe the freed blocks.
+    return out;
+}

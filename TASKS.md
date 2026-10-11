@@ -1190,7 +1190,14 @@ Goal: the Alg.-2 kernel chain (flag-off, kernel-complete) and the
 serving normalize kernel.
 
 #### W20.9.1 — the tq_qjl chain kernels
-- [ ] done
+- [x] done
+The chains reuse the committed family verbatim (dequant_batched →
+residual → norm_rows → fht_forward_large → sign; compensate:
+widen → fht_backward_large → scale+add). QJL_C = √(π/2) pinned as
+the hex-float constant + static_assert; .rn intrinsics defeat
+--use_fast_math; √K via exponent arithmetic (no library sqrt). The
+second-draw param is named qjl_rotation (disambiguated from the
+first-draw signs).
 ROLE task-writer · READ `kernel_tq.cu` (the family),
 `turboquant.py` (3.4's torch qjl semantics — the contract to match) ·
 WRITE `kernel_tq.cu`, `bindings.cpp`

@@ -148,6 +148,37 @@ torch::Tensor tq_dequant_batched(
     int64_t n_lo, int64_t bits_lo, int64_t n_hi, int64_t bits_hi,
     at::ScalarType dtype);
 
+// W20.9.1 -- the QJL chain pair (also defined in src/kernel_tq.cu at
+// global scope, this declaration family's pattern): the W9.2 qjl flag's
+// kernel legs (turboquant.py:67-111's Alg.-2 contract), flag-off
+// complete. tq_qjl_quant computes the residual sketch over the prefill's
+// whole batch: r = x minus tq_dequant_batched's fp32 reconstruction of
+// the caller's codes (the committed decode entry, launched verbatim),
+// gamma = the residual's (M,) fp32 norms (7.1's norm chain), and the
+// sketch = sign(FHT(r)) -- the scale invariance
+// sign(FHT(r/gamma)) == sign(FHT(r)) means the division never
+// materializes (turboquant.py:892-893; PROPOSAL.md:154-155); returns
+// (qjl_signs (M, K) int8, gamma (M,) fp32) -- TQCodes' two qjl fields,
+// batched. tq_qjl_compensate adds the decode-side Alg.-2 term
+// out = g + (QJL_C * gamma[m] / sqrt(K)) * z with z = the sketch's
+// fht_backward_large adjoint and QJL_C = sqrt(pi/2) (turboquant.py:268
+// / :1193 -- the paper's estimator with the structured-projection
+// substitution). signs are the quantizer's FIRST-draw (d,) fp32 rotation
+// vector (the residual decode's un-rotation); qjl_rotation is the SECOND
+// draw (fht.rotation_signs(d, seed+7777), QJL_SEED_OFFSET at
+// turboquant.py:260) -- both passed IN by the caller, never generated
+// here. G20.P3's qjl leg (TASKS.md:1431) is the parity gate.
+std::tuple<torch::Tensor, torch::Tensor> tq_qjl_quant(
+    torch::Tensor x, torch::Tensor signs,
+    torch::Tensor codes_lo, torch::Tensor codes_hi, torch::Tensor norms,
+    torch::Tensor centroids_lo, torch::Tensor centroids_hi,
+    int64_t n_lo, int64_t bits_lo, int64_t n_hi, int64_t bits_hi,
+    torch::Tensor qjl_rotation);
+
+torch::Tensor tq_qjl_compensate(
+    torch::Tensor g, torch::Tensor qjl_signs, torch::Tensor gamma,
+    torch::Tensor qjl_rotation);
+
 // Unified dispatcher. Accepts either (indices, lut) for the quantized path
 // or (W_dense) for the dense CUTLASS baseline. Pass an empty Tensor for the
 // unused variants. q_layout selects the packed-indices layout:
@@ -438,4 +469,50 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("n_hi"),
           py::arg("bits_hi"),
           py::arg("dtype") = at::kFloat);
+
+    // W20.9.1 -- the QJL chain pair (src/kernel_tq.cu): the W9.2 qjl
+    // flag's kernel legs, flag-off complete (the runtime keeps --qjl
+    // default off; the dispatcher's qjl routing is later work). The
+    // scale-invariance identity sign(FHT(r/gamma)) == sign(FHT(r))
+    // (turboquant.py:892-893) lets the sketch sign the butterfly's
+    // output verbatim; G20.P3's qjl leg (TASKS.md:1431, "the qjl leg
+    // completes W20.9") is the parity gate.
+    m.def("tq_qjl_quant", &tq_qjl_quant,
+          "Batched TurboQuant QJL encode: the residual sketch over the "
+          "prefill's (M, d) fp32 unit matrix -> (qjl_signs (M, d) int8, "
+          "gamma (M,) fp32); r = x - tq_dequant_batched's fp32 "
+          "reconstruction of the caller's codes, gamma = the residual's "
+          "row norms, qjl = sign(FHT(r)) -- scale-invariant, the 1/gamma "
+          "division never materializes (turboquant.py:892-893); signs are "
+          "the quantizer's FIRST-draw (d,) fp32 rotation vector, "
+          "qjl_rotation the SECOND draw (fht.rotation_signs(d, "
+          "seed+7777)); the wrapper never reads device memory (no D2H)",
+          py::arg("x"),
+          py::arg("signs"),
+          py::arg("codes_lo"),
+          py::arg("codes_hi"),
+          py::arg("norms"),
+          py::arg("centroids_lo"),
+          py::arg("centroids_hi"),
+          py::arg("n_lo"),
+          py::arg("bits_lo"),
+          py::arg("n_hi"),
+          py::arg("bits_hi"),
+          py::arg("qjl_rotation"));
+
+    m.def("tq_qjl_compensate", &tq_qjl_compensate,
+          "Batched TurboQuant QJL decode compensation: out = g + "
+          "(QJL_C * gamma[m] / sqrt(K)) * fht_adjoint(qjl_signs) with "
+          "QJL_C = sqrt(pi/2) (turboquant.py:268 / :1193) -- the paper's "
+          "Alg.-2 residual term; g is the (M, K) fp32 MSE "
+          "reconstruction (tq_dequant_batched's float32 width -- the "
+          "requested output dtype converts at the caller's very end), "
+          "qjl_signs the (M, K) int8 sketch, gamma the (M,) fp32 residual "
+          "norms, qjl_rotation the SECOND-draw (K,) fp32 rotation vector "
+          "(the adjoint's rotation); out-of-place (g is never written); "
+          "the wrapper never reads device memory (no D2H)",
+          py::arg("g"),
+          py::arg("qjl_signs"),
+          py::arg("gamma"),
+          py::arg("qjl_rotation"));
 }
