@@ -201,7 +201,7 @@ def test_a2_zero_gate_tqcache_vs_plain_cache_baseline():
     layer = _tiny_layer()
     _attach_m1m2(layer)                      # zero gates (P3 init)
     xs = _loop_inputs()
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     with torch.no_grad():
         out_tq = layer(hidden_states=xs[0], cache_params=cache)
         out_plain = _tiny_layer()(
@@ -304,15 +304,15 @@ def test_c_zero_gates_two_forwards_bit_identical_to_baseline():
     round-trips exactly) and the S path works alongside."""
     # baseline: no m1m2, TQCache
     base_outs = _run_online_loop(_tiny_layer(),
-                                 TQCache(layer_types=["linear_attention"]))
-    base_cache = TQCache(layer_types=["linear_attention"])
+                                 TQCache(layer_types=["linear_attention"], s_flat=True))
+    base_cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     _run_online_loop(_tiny_layer(), base_cache)
     assert base_cache.s_codes[0] is not None
 
     # zero gates + TQCache: bit-identical everywhere, codes live after fwd 1
     layer = _tiny_layer()
     _attach_m1m2(layer)                      # P3 zero gates
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     outs = []
     xs = _loop_inputs()
     with torch.no_grad():
@@ -338,11 +338,11 @@ def test_c_open_gates_first_forward_identical_second_differs():
     causal M1/M2 contract). The SECOND forward (and the decode steps
     after it) diverge macroscopically."""
     base_outs = _run_online_loop(_tiny_layer(),
-                                 TQCache(layer_types=["linear_attention"]))
+                                 TQCache(layer_types=["linear_attention"], s_flat=True))
 
     layer = _tiny_layer()
     _attach_m1m2(layer, gates=(0.5, 0.7))
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     outs = _run_online_loop(layer, cache)
 
     assert torch.equal(outs[0], base_outs[0])          # read saw zero M1/M2
@@ -516,7 +516,7 @@ def test_d6_composability_through_the_quantized_store():
     kB = torch.randn(1, H, 5, D, device=DEVICE); vB = torch.randn(1, H, 5, D, device=DEVICE)
 
     # the §3.2 first forward: a cache with no codes reads back ZEROS
-    fresh = TQCache(layer_types=[])
+    fresh = TQCache(layer_types=[], s_flat=True)
     m1z, m2z = m1m2_from_cache(fresh, mod, torch.float32)
     # fresh cache returns CPU tensors; move to device for comparison
     m1z = m1z.to(DEVICE)
@@ -526,18 +526,18 @@ def test_d6_composability_through_the_quantized_store():
 
     with torch.no_grad():
         # run A: fresh cache, write tokens A
-        cA = TQCache(layer_types=[])
+        cA = TQCache(layer_types=[], s_flat=True)
         a1, a2 = m1m2_from_cache(cA, mod, torch.float32)
         a1, a2 = a1.to(DEVICE), a2.to(DEVICE)
         dA = push_to_cache(cA, *mod.write(kA, vA, a1, a2, layer_idx=0))
         # run B: ANOTHER fresh cache, write tokens B (the standalone delta)
-        cB = TQCache(layer_types=[])
+        cB = TQCache(layer_types=[], s_flat=True)
         b1, b2 = m1m2_from_cache(cB, mod, torch.float32)
         b1, b2 = b1.to(DEVICE), b2.to(DEVICE)
         dB = push_to_cache(cB, *mod.write(kB, vB, b1, b2, layer_idx=0))
         # run AB: the online loop — write A, then the next forward READS
         # the round-trip and writes B on top of it
-        cAB = TQCache(layer_types=[])
+        cAB = TQCache(layer_types=[], s_flat=True)
         f1, f2 = m1m2_from_cache(cAB, mod, torch.float32)
         f1, f2 = f1.to(DEVICE), f2.to(DEVICE)
         push_to_cache(cAB, *mod.write(kA, vA, f1, f2, layer_idx=0))

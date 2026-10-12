@@ -111,7 +111,7 @@ def _rand(shape, seed: int, dtype=torch.float16) -> torch.Tensor:
 # --- construction: the layer_types stub route -------------------------------- #
 def test_layer_types_route_builds_the_stack():
     cache = TQCache(layer_types=["linear_attention", "full_attention",
-                                 "linear_attention"])
+                                 "linear_attention"], s_flat=True)
     assert isinstance(cache, DynamicCache)          # a real transformers Cache
     assert len(cache.layers) == 3
     l0, l1, l2 = cache.layers
@@ -130,14 +130,14 @@ def test_layer_types_route_builds_the_stack():
 
 def test_layer_types_route_rejects_unknown_types():
     with pytest.raises(ValueError, match="unknown layer type"):
-        TQCache(layer_types=["bogus_attention"])
+        TQCache(layer_types=["bogus_attention"], s_flat=True)
 
 
 # --- contract 1: quantize-on-write / dequantize-on-read --------------------- #
 @pytest.mark.parametrize("seed", [100, 101, 102])
 def test_conv_quantize_on_write_dequantize_on_read(seed):
     g = torch.Generator().manual_seed(seed)
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     x = torch.randn(1, 32, 7, generator=g, dtype=torch.float16).to(DEVICE)  # prefill, T > k
     full = cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
     layer = cache.layers[0]
@@ -163,7 +163,7 @@ def test_conv_quantize_on_write_dequantize_on_read(seed):
 @pytest.mark.parametrize("seed", [200, 201, 202])
 def test_s_quantize_on_write_dequantize_on_read(seed):
     g = torch.Generator().manual_seed(seed)
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
     out = cache.update_recurrent_state(s, 0)
     layer = cache.layers[0]
@@ -185,7 +185,7 @@ def test_s_quantize_on_write_dequantize_on_read(seed):
 # --- contract 2: the no-fp16 invariant ---------------------------------------- #
 def test_no_fp16_invariant():
     g = torch.Generator().manual_seed(910)
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     layer = cache.layers[0]
 
     # reads before any write are None (the parent dict.fromkeys semantics)
@@ -220,7 +220,7 @@ def test_no_fp16_invariant():
 # --- contract 3: interception counters ---------------------------------------- #
 def test_interception_counters():
     g = torch.Generator().manual_seed(950)
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     layer = cache.layers[0]
     assert layer.reads == {"conv": 0, "s": 0}
     assert layer.writes == {"conv": 0, "s": 0}
@@ -317,7 +317,7 @@ def test_conv_windowing_pads_short_prefill_differentially():
 @pytest.mark.parametrize("seed", [300, 301, 302])
 def test_inplace_mutation_capture(seed):
     g = torch.Generator().manual_seed(seed)
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     layer = cache.layers[0]
     x = torch.randn(*CONV_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
     cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
@@ -352,7 +352,8 @@ def test_inplace_mutation_capture(seed):
 # --- contract 6: has_previous_state flow -------------------------------------- #
 def test_has_previous_state_flow():
     g = torch.Generator().manual_seed(900)
-    cache = TQCache(layer_types=["linear_attention", "full_attention"])
+    cache = TQCache(layer_types=["linear_attention", "full_attention"],
+                     s_flat=True)
     layer = cache.layers[0]
     assert cache.has_previous_state(0) is False
     assert layer.has_previous_state == {0: False}
@@ -379,7 +380,7 @@ def test_has_previous_state_flow():
 @pytest.mark.parametrize("seed", [600, 601, 602])
 def test_m1_m2_roundtrip_and_d3_seeds(seed):
     g = torch.Generator().manual_seed(seed)
-    cache = TQCache(layer_types=[])
+    cache = TQCache(layer_types=[], s_flat=True)
     m1 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
     m2 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
 
@@ -404,7 +405,7 @@ def test_m1_m2_roundtrip_and_d3_seeds(seed):
 
 
 def test_m1_m2_read_before_write_is_none():
-    cache = TQCache(layer_types=[])
+    cache = TQCache(layer_types=[], s_flat=True)
     assert cache.read_m1() is None
     assert cache.read_m2() is None
     assert cache.m1_codes is None and cache.m2_codes is None
@@ -412,13 +413,13 @@ def test_m1_m2_read_before_write_is_none():
 
 def test_m1_m2_code_install_setters():
     g = torch.Generator().manual_seed(604)
-    src = TQCache(layer_types=[])
+    src = TQCache(layer_types=[], s_flat=True)
     m1 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
     src.update_m1(m1)
     m2 = torch.randn(*M_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
     src.update_m2(m2)
 
-    dst = TQCache(layer_types=[])
+    dst = TQCache(layer_types=[], s_flat=True)
     dst.m1_codes = src.m1_codes           # the install path: codes only
     dst.m2_codes = src.m2_codes
     assert dst.m1_codes is src.m1_codes
@@ -434,7 +435,7 @@ def test_m1_m2_code_install_setters():
 # --- contract 8: code injection (the W7 install path) ------------------------- #
 def test_code_injection_reshapes_to_layer_shape():
     g = torch.Generator().manual_seed(800)
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     layer = cache.layers[0]
     s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
 
@@ -460,7 +461,7 @@ def test_code_injection_reshapes_to_layer_shape():
 def test_cache_code_views_and_setters():
     g = torch.Generator().manual_seed(810)
     cache = TQCache(layer_types=["linear_attention", "full_attention",
-                                 "linear_attention"])
+                                 "linear_attention"], s_flat=True)
     assert cache.linear_layer_indices() == [0, 2]
     assert cache.s_codes == {0: None, 2: None}
     assert cache.conv_codes == {0: None, 2: None}
@@ -497,7 +498,8 @@ def test_cache_code_views_and_setters():
 # --- contract 9: offline fallback (D4) ----------------------------------------- #
 def _offline_cache(seed: int = 700):
     g = torch.Generator().manual_seed(seed)
-    cache = TQCache(layer_types=["linear_attention"], online=False)
+    cache = TQCache(layer_types=["linear_attention"], online=False,
+                    s_flat=True)
     x = torch.randn(1, 32, 7, generator=g, dtype=torch.float16).to(DEVICE)  # prefill, T > k
     s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
     full = cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
@@ -557,7 +559,8 @@ def test_cache_level_snapshot_codes_offline_returns_codes():
 
     Exact repro of the old bug (transformers 5.19.0, commit a27f6fc):
 
-        cache = TQCache(layer_types=["linear_attention"], online=False)
+        cache = TQCache(layer_types=["linear_attention"], online=False,
+                    s_flat=True)
         cache.update_conv_state(x, 0, conv_kernel_size=4)   # raw tensor stored
         cache.update_recurrent_state(s, 0)
         cache.snapshot_codes()   # -> {"s": {0: None}, "conv": {0: None}, ...}
@@ -664,7 +667,7 @@ def test_next_pow2_helper():
 @pytest.mark.parametrize("seed", [700, 701, 702])
 def test_nonpow2_conv_padding_contract(seed):
     g = torch.Generator().manual_seed(seed)
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     layer = cache.layers[0]
     x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
 
@@ -719,7 +722,7 @@ def test_nonpow2_conv_mutation_capture():
     # adversarial by construction — see the contract-5 note), then the
     # next read re-captures it into codes.
     g = torch.Generator().manual_seed(710)
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     layer = cache.layers[0]
     x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
     cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
@@ -768,7 +771,7 @@ def test_nonpow2_conv_codes_setter_and_frame_guard():
     # initialized layer when the unit d matches; a mismatched d (geometry
     # or frame drift) raises LOUDLY instead of silently mis-stripping.
     g = torch.Generator().manual_seed(730)
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     layer = cache.layers[0]
     x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
     cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
@@ -800,7 +803,7 @@ def test_conv_full_window_no_truncation_regression():
     round-trip within the standard budget, and a hard zeroed-tail would
     blow the budget by construction."""
     g = torch.Generator().manual_seed(760)
-    cache = TQCache(layer_types=["linear_attention"])
+    cache = TQCache(layer_types=["linear_attention"], s_flat=True)
     layer = cache.layers[0]
     x = torch.randn(*CONV_NP2_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
     cache.update_conv_state(x, 0, conv_kernel_size=CONV_KERNEL)
@@ -844,7 +847,7 @@ def test_w28_protocol_guards_refuse_loudly():
     through raw-tensor arithmetic. The malfunction-localizer
     scripts/gpu/tq_gen_matrix.py --trace prints the exact call sequence
     when one of these fires on the GPU box."""
-    cache = TQCache(layer_types=["linear_attention", "full_attention"])
+    cache = TQCache(layer_types=["linear_attention", "full_attention"], s_flat=True)
     layer = cache.layers[0]
     for meth in ("crop", "batch_repeat_interleave", "reorder_cache"):
         fn = getattr(layer, meth, None)

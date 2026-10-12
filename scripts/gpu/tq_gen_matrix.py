@@ -85,7 +85,12 @@ boot()
 # ------------------------------------------------------------- gate utils --
 def gen_gate(tokenizer, new_token_ids, token_confs):
     """The [gen gate] line (W27's honest metrics — conf alone passed the
-    box's soup at 0.382 once already)."""
+    box's soup at 0.382 once already).
+
+    W29: token_confs is expected from BOTH driving styles now — the
+    generate() cells collect per-step max-probs from output_scores (the
+    G3 conf=0.000 artifact of the first run labeled COHERENT text
+    GARBAGE-RANGE; the conf is real data, never a missing-data zero)."""
     answer = tokenizer.decode(new_token_ids, skip_special_tokens=True)
     toks = list(new_token_ids)
     conf = (sum(token_confs) / len(token_confs)) if token_confs else 0.0
@@ -180,6 +185,22 @@ def build_and_parity_report():
             print(f"      (the block spread was "
                   f"{float(scales.max()/scales.min()):.0f}x; the TOTAL "
                   f"rel-MSE hides exactly this — see FINDINGS W28)")
+            # W29 — THE REPAIR, measured at production geometry: the SAME
+            # state through the per-head units regime (32 units of 16,384,
+            # own norms, the permuted frame). Expected: worst-block at the
+            # Gaussian floor (~0.02) — the flat regime's spread-amplified
+            # floor (above) is the defect this row closes.
+            q_h = TurboQuant(kind="S", bits=3.5, d=DK * DV, seed=101)
+            x2 = x.reshape(H, DK * DV)
+            xh = q_h.dequant(q_h.quant_units(x2)).reshape(H, DK * DV)
+            rel_h = float(((xh - x2) ** 2).sum()
+                          / max((x2 ** 2).sum(), 1e-30))
+            block_rel_h = (((xh - x2) ** 2).sum(-1)
+                           / ((x2 ** 2).sum(-1).clamp_min(1e-30)))
+            print(f"      [W29 per-head units] TOTAL rel-MSE {rel_h:.4f} | "
+                  f"worst-block rel-MSE {float(block_rel_h.max()):.4f} "
+                  f"(the repair: 32 units x d={DK * DV}, own norms, the "
+                  f"permuted frame — the floor, spread-independent)")
     if have_kernels:
         print("    PARITY: kernel-vs-torch divergences above ~1e-4 on "
               "ANY row = a STALE/MISMATCHED EXTENSION BUILD — rebuild "
@@ -209,11 +230,22 @@ def manual_greedy(model, ids, cache, max_new_tokens):
 
 
 def generate_greedy(model, ids, cache, max_new_tokens):
-    """The user's test, verbatim: model.generate with the cache."""
+    """The user's test, verbatim PLUS the honest conf (W29): generate()
+    with output_scores=True + return_dict_in_generate=True — the per-step
+    scores are the SAME max-probs the manual loop collects, so the G3/G4
+    cells' [gen gate] conf is real data (the first run's conf=0.000 was
+    the missing-data artifact that mislabeled coherent text
+    GARBAGE-RANGE). input echo excluded: the NEW tokens only."""
     out = model.generate(ids, max_new_tokens=max_new_tokens,
-                         do_sample=False, past_key_values=cache)
-    # input echo excluded: the NEW tokens only
-    return [int(t) for t in out[0][ids.shape[1]:]], []
+                         do_sample=False, past_key_values=cache,
+                         output_scores=True,
+                         return_dict_in_generate=True)
+    new_ids = [int(t) for t in out.sequences[0][ids.shape[1]:]]
+    confs = []
+    for sc in out.scores:
+        probs = torch.softmax(sc.float(), dim=-1)
+        confs.append(float(probs.max()))
+    return new_ids, confs
 
 
 # ------------------------------------------------------- [3] the trace ----
@@ -284,10 +316,14 @@ def main() -> int:
     ap.add_argument("--trace", action="store_true",
                     help="print every Cache/layer method call the "
                          "generation makes (the protocol evidence)")
+    ap.add_argument("--s-flat", action="store_true",
+                    help="run the TQ cells in the W28 FLAT S regime "
+                         "(the A/B control; the W29 default is the "
+                         "per-head repair)")
     args = ap.parse_args()
 
     print("=" * 60)
-    print("TQ GEN MATRIX (scripts/gpu/tq_gen_matrix.py) — W28")
+    print("TQ GEN MATRIX (scripts/gpu/tq_gen_matrix.py) — W29")
     print("=" * 60)
 
     build_and_parity_report()
@@ -309,7 +345,11 @@ def main() -> int:
         return DynamicCache(config=model.config)
 
     def fresh_tq():
-        return TQCache(config=model.config, bits=args.bits, online=True)
+        return TQCache(config=model.config, bits=args.bits, online=True,
+                       s_flat=args.s_flat)
+
+    print(f"    TQCache S regime: "
+          f"{'FLAT (the W28 A/B control)' if args.s_flat else 'PER-HEAD (the W29 repair)'}")
 
     cells = [
         ("G1 raw   + manual loop ", fresh_raw, manual_greedy),
@@ -344,8 +384,9 @@ def main() -> int:
     print("\n    THE DECISION TREE (read G2 and G4 first):")
     if g2[0] != "CLEAN-RANGE":
         print("    * G2 garbage -> THE QUANTIZER/WIRING on real states: "
-              "read [0]'s per-block row; the per-head unit split is the "
-              "repair (a re-ingest decision — report to the dev box).")
+              "read [0]'s per-block row AND the [W29 per-head units] "
+              "row; if the units row is at the floor but G2 is garbage, "
+              "the wiring differs from the probe — paste all four cells.")
     if g2[0] == "CLEAN-RANGE" and g4[0] != "CLEAN-RANGE":
         print("    * G2 clean, G4 garbage -> THE GENERATE() INTERPLAY: "
               "re-run with --trace (the protocol call sequence, "
@@ -355,9 +396,10 @@ def main() -> int:
         print("    * G3 garbage too -> NOT TQ: the model/generate "
               "interplay — paste all four cells.")
     if all(r[0] == "CLEAN-RANGE" for r in (g1, g2, g3, g4)):
-        print("    * all clean -> the malfunction was the ENVIRONMENT "
-              "(stale extension / drifted copy): check [0]'s parity "
-              "numbers, rebuild flute_extended, re-run.")
+        print("    * all clean -> THE REPAIR IS CONFIRMED end-to-end at "
+              f"bits={args.bits} (the W29 per-head S regime). Optional: "
+              "re-run with --s-flat to reproduce the W28 defect (the "
+              "controlled A/B), then proceed to the HANDOVER W29 steps.")
     print("\nPASTE THIS WHOLE OUTPUT BACK (the GPU-only law).")
     return 0
 

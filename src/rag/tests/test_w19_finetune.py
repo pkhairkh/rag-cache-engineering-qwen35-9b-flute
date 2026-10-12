@@ -338,7 +338,7 @@ def test_w19f_5_capture_pool_amortizes_the_prefills():
     model = modeling.Qwen3_5TextModel(cfg).eval().to(DEVICE)
 
     from ingest import prefill_system
-    sys_cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    sys_cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     g = torch.Generator().manual_seed(11)
     system = prefill_system(model, torch.randint(
         0, 128, (1, 4), generator=g).to(DEVICE), sys_cache,
@@ -353,7 +353,7 @@ def test_w19f_5_capture_pool_amortizes_the_prefills():
 
         def factory():
             count["n"] += 1
-            return TQCache(layer_types=LAYER_TYPES, bits=BITS)
+            return TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
 
         def _batches():
             i = 0
@@ -413,7 +413,7 @@ def test_w19f_6_history_carries_grad_and_phase_fields():
         use_m1m2=True, m1m2_mem_size=MEM)
     model = modeling.Qwen3_5TextModel(cfg).eval().to(DEVICE)
     from ingest import prefill_system
-    sys_cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    sys_cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     g = torch.Generator().manual_seed(13)
     system = prefill_system(model, torch.randint(
         0, 128, (1, 4), generator=g).to(DEVICE), sys_cache,
@@ -430,7 +430,7 @@ def test_w19f_6_history_carries_grad_and_phase_fields():
                             log_every=0, refresh_every=2)
     c = ft.train_gates(
         model, _batches(), system,
-        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS),
+        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True),
         cfg=c)
     assert len(c.history) == 2
     for h in c.history:

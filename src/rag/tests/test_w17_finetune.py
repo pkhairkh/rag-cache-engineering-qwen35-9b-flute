@@ -61,7 +61,7 @@ def _ids(n, seed):
 def _system(model):
     """The zero reset point (a system prefill through a fresh cache)."""
     from ingest import prefill_system
-    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     return prefill_system(model, _ids(4, 1), cache,
                           system_ref="w17ft", bits=BITS)
 
@@ -76,7 +76,7 @@ def _rel_mse(a, b):
 def test_w17f_1_recorder_sees_every_layer(model):
     system = _system(model)
     ids = _ids(12, 3)
-    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     calls, m1_i, m2_i = ft.prefill_capture_calls(model, ids, cache, system)
     assert len(calls) == 2  # one per linear-attention layer
     layer_ids = [c[2] for c in calls]
@@ -99,7 +99,7 @@ def test_w17f_2_replay_matches_cache_state(model):
     property (the trainer trains the state the cache actually holds)."""
     system = _system(model)
     ids = _ids(16, 5)
-    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     calls, m1_i, m2_i = ft.prefill_capture_calls(model, ids, cache, system)
     m1, m2 = ft.replay_states(model.m1m2, calls, m1_i, m2_i,
                               checkpoint=False)
@@ -132,7 +132,7 @@ def test_w17f_3_gate_gradients_flow_only_to_gates(model):
     model.m1m2.read_gate.grad = None
     system = _system(model)
     ids = _ids(12, 7)
-    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     calls, m1_i, m2_i = ft.prefill_capture_calls(model, ids, cache, system)
     m1, m2 = ft.replay_states(model.m1m2, calls, m1_i, m2_i,
                               checkpoint=False)
@@ -204,7 +204,7 @@ def test_w17f_5_training_reduces_the_objective(model):
             for ids_a, ids_b in pairs:
                 ps = []
                 for ids in (ids_a, ids_b):
-                    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+                    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
                     calls, m1_i, m2_i = ft.prefill_capture_calls(
                         model, ids, cache, system)
                     m1, m2 = ft.replay_states(model.m1m2, calls, m1_i,
@@ -228,7 +228,7 @@ def test_w17f_5_training_reduces_the_objective(model):
                               tau=0.5, log_every=0, seed=7)
     cfg = ft.train_gates(
         model, batches(), system,
-        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS),
+        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True),
         cfg=cfg)
     loss_after = _pair_loss()
     assert loss_after < loss_before, (
@@ -257,7 +257,7 @@ def test_w17f_6_train_gates_smoke(model):
                               log_every=0)
     cfg = ft.train_gates(
         model, batches(), system,
-        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS),
+        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True),
         cfg=cfg)
     assert len(cfg.history) == 3
     assert all("loss" in h and "cos_pos" in h for h in cfg.history)
@@ -327,7 +327,7 @@ def test_w17f_9_module_vs_codes_geometry_loud(model):
     system = _system(model)
     big = M1M2(num_heads=H, head_dim=D, mem_size=MEM * 2,
                num_linear_layers=2).to(DEVICE)
-    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     with torch.no_grad():
         big.write_gate_k.fill_(0.5)
         m1, m2 = big.write(

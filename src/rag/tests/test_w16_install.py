@@ -167,10 +167,10 @@ def rig(tmp_path_factory):
 
         # the system reset point + the chunk ingested once (the record
         # carries BOTH the deltas and the absolutes)
-        tq = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+        tq = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
         model(input_ids=sys_ids, past_key_values=tq)
         system = SystemState.from_cache(tq, system_ref="w16", bits=BITS)
-        tq2 = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+        tq2 = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
         record = ingest_chunk(model, docs[0], tq2, system)
         record.chunk_idx = 0
         snap_abs = record.to_snapshot(system, protocol="absolute")
@@ -183,7 +183,7 @@ def rig(tmp_path_factory):
                                    (disk_v1, "delta-v1", docs)):
         drv = IngestDriver(model, sys_ids, chunks, disk,
                            cache_factory=lambda: TQCache(
-                               layer_types=LAYER_TYPES, bits=BITS),
+                               layer_types=LAYER_TYPES, bits=BITS, s_flat=True),
                            chunk_protocol=protocol, system_ref="w16")
         drv.run()
 
@@ -197,7 +197,7 @@ def rig(tmp_path_factory):
 
 
 def _install(rig, snaps, protocol_hint=None):
-    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     reseed_cache(cache, rig["system"])
     report = install_snapshot(cache, rig["system"], snaps)
     return cache, report
@@ -262,15 +262,15 @@ def test_multi_chunk_absolute_sum(rig):
     # build the absolute 3-pack from the record's protocol switch: the
     # v1 corpus holds all 3 chunks; re-tag them as absolute via the
     # driver? Simpler: ingest the 3 docs AGAIN storing absolutes.
-    cache_a = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache_a = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     reseed_cache(cache_a, rig["system"])
-    cache_v = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache_v = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     reseed_cache(cache_v, rig["system"])
 
     with torch.no_grad():
         abs_snaps = []
         for i, doc in enumerate(rig["docs"]):
-            tqi = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+            tqi = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
             rec = ingest_chunk(rig["model"], doc, tqi, rig["system"])
             rec.chunk_idx = i
             abs_snaps.append(rec.to_snapshot(rig["system"],
@@ -291,7 +291,7 @@ def test_multi_chunk_absolute_sum(rig):
 
 # ============================================ 4. mixed protocol refusal ======
 def test_mixed_protocol_refuses(rig):
-    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     reseed_cache(cache, rig["system"])
     with pytest.raises(ValueError, match="mixed snapshot protocols"):
         install_snapshot(cache, rig["system"],

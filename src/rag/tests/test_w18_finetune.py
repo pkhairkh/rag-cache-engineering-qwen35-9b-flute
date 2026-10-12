@@ -65,14 +65,14 @@ def _ids(n, seed):
 
 def _system(model):
     from ingest import prefill_system
-    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     return prefill_system(model, _ids(4, 1), cache,
                           system_ref="w18ft", bits=BITS)
 
 
 def _capture(model, n, seed):
     system = _system(model)
-    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     calls, m1_i, m2_i = ft.prefill_capture_calls(model, _ids(n, seed),
                                                  cache, system)
     return calls, m1_i, m2_i

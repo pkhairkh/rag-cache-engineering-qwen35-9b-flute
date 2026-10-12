@@ -1,14 +1,14 @@
 """test_tq_cache_live.py — W2.3: the TQ cache wrapper against the REAL
 transformers cache machinery.
 
-W2.2 tested the stub route (`TQCache(layer_types=[...])`). This file builds
+W2.2 tested the stub route (`TQCache(layer_types=[...], s_flat=True)`). This file builds
 the production-side objects for real and verifies the wrapper integrates:
 
   * A REAL `Qwen3_5TextConfig` (the model class the vendored
     `src/scripts/modeling.py` implements — checked importable in
     transformers 5.19.0 as `transformers.Qwen3_5TextConfig`) with a tiny
     4-layer hybrid plan [linear_attention, full_attention, linear_attention,
-    full_attention] and small head dims. `TQCache(config=...)` then runs the
+    full_attention] and small head dims. `TQCache(config=..., s_flat=True)` then runs the
     REAL `DynamicCache.__init__(config=...)` path — `get_layer_types_and_
     kwargs` + `DYNAMIC_LAYER_TYPE_MAPPING` — and `_wrap_linear_layers`
     swaps the built `LinearAttentionLayer`s for TQ layers while leaving the
@@ -112,7 +112,7 @@ def test_real_config_builds_and_wraps_layers():
             {"number_of_states": 1} if lt == "linear_attention" else {}
             for lt in LAYER_PLAN]
 
-    cache = TQCache(config=cfg)
+    cache = TQCache(config=cfg, s_flat=True)
     assert isinstance(cache, DynamicCache)             # a real transformers Cache
     assert len(cache.layers) == 4
 
@@ -136,7 +136,7 @@ def test_real_config_builds_and_wraps_layers():
 # --- the full inherited Cache API on the config-built cache ------------------- #
 def test_config_route_full_cache_api_roundtrip():
     cfg = _tiny_config()
-    cache = TQCache(config=cfg)
+    cache = TQCache(config=cfg, s_flat=True)
     layer = cache.layers[0]
 
     # the inherited has_previous_state routes through the TQ layer's dicts
@@ -188,7 +188,7 @@ def test_config_route_full_cache_api_roundtrip():
 
 def test_second_linear_layer_is_isolated():
     cfg = _tiny_config()
-    cache = TQCache(config=cfg)
+    cache = TQCache(config=cfg, s_flat=True)
     g = torch.Generator().manual_seed(126)
     x = torch.randn(*CONV_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
     s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
@@ -223,7 +223,7 @@ def test_live_differential_vs_real_dynamic_cache(seed):
     s = torch.randn(*S_UNIT, generator=g, dtype=torch.float16).to(DEVICE)
 
     real = DynamicCache(config=cfg)    # the REAL machinery, unwrapped
-    tqc = TQCache(config=cfg)          # the wrapped cache
+    tqc = TQCache(config=cfg, s_flat=True)          # the wrapped cache
 
     # prefill: identical shape (B, D, T), exact values
     f_real = real.update_conv_state(prefill, 0, conv_kernel_size=CONV_KERNEL)
@@ -261,7 +261,7 @@ def test_config_cache_decode_loop():
     g = torch.Generator().manual_seed(321)
     prefill = torch.randn(1, 32, 7, generator=g, dtype=torch.float16).to(DEVICE)
     real = DynamicCache(config=cfg)
-    tqc = TQCache(config=cfg)
+    tqc = TQCache(config=cfg, s_flat=True)
     real.update_conv_state(prefill, 0, conv_kernel_size=CONV_KERNEL)
     tqc.update_conv_state(prefill, 0, conv_kernel_size=CONV_KERNEL)
 

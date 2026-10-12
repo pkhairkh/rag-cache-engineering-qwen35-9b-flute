@@ -1,4 +1,4 @@
-# HANDOVER.md — the on-box agent handover (W28 · 2026-10-12)
+# HANDOVER.md — the on-box agent handover (W29 · 2026-10-12)
 
 **Who you are**: the A10G GPU-box agent. Your box owns the runtime —
 the venv, the palettized model artifacts, the ingested corpus, and
@@ -10,41 +10,35 @@ only if you want the why; this file is the what-to-run.
 
 ---
 
-## 0. The situation (60 seconds — updated after the box's E-ladder attempt)
+## 0. The situation (60 seconds — updated after the W28 matrix verdict + the W29 repair)
 
-The W26 ladder RAN on this box (the hermes session) and did not
-measure what it was designed to measure:
+The W28 matrix RAN on this box and the verdict is CLASSIFIED:
 
-- **E1** (top-k 1, gates): multilingual soup again — but it ran with
-  a **hand-broadcast forgery** of a gates artifact (see §0.1), so its
-  garbage is classified as contamination, not as evidence.
-- **E2 and E3** (the `--no-answer-m1m2` runs): **CRASHED** at
-  `query_cache_vector` — `torch.cat` on mixed devices (host M1/M2
-  codes vs model-device S codes) — **before the install ever ran**.
-  The F1-vs-F3 isolation the ladder exists for NEVER HAPPENED.
+- **G2 (TQ + manual loop) = GARBAGE** with EXACT kernel parity
+  (max|diff| 0.000e+00 on all three probe distributions) and
+  worst-block rel-MSE **7.65 at a 38x head-norm spread** — **F2b
+  CONFIRMED** (FINDINGS W28 item 9 / W29 item 13): the flat S unit's
+  single fp norm set the per-coordinate noise floor at the GLOBAL
+  energy and crushed the small heads at every decode step.
+- **G3 (raw + generate) = COHERENT text mislabeled GARBAGE-RANGE** —
+  the conf 0.000 was a measurement artifact (generate() returned no
+  per-step scores). FIXED in W29 (output_scores=True — the conf is
+  real data now). The generate() interplay is ELIMINATED as a cause.
+- The W26-era ladder state (E1 soup, E2/E3 crash) is unchanged
+  history — W27's fixes (device alignment, forgery refusals, the
+  regime diagnosis, the verdict band) are all still in.
 
-The fixes are in the repo, behind tag `w28-tq-repair` (W27: the ladder
-repair — see FINDINGS Errata W27; W28: the TQ localizer — see Errata
-W28):
+**The repair is IN (W29, tag w29-per-head)**: the S state now
+quantizes as 32 PER-HEAD units of d=16,384, each with its OWN fp norm
+(the paper's per-vector recipe), in the PERMUTED rotation frame (the
+2^14 Hadamard's Kronecker alignment with the 128x128 matrix layout
+required it — FINDINGS W29 item 15; sim: worst-head 10.69 -> 0.023 at
+55x, 297 -> 0.023 at 525x). Python-only — **no kernel rebuild needed**
+(the per-head path rides the torch twin; the kernel pair is untouched).
 
-- **W27.1** — the device crash is fixed at the crash site (uniform
-  flows bit-identical).
-- **W27.2** — `load_gates` now REFUSES the box's two "fixed" gates
-  files (no `meta_write_addr`; broadcast write_gate_k rows). They are
-  deleted from the repo. **Do not rebuild them** — the honest artifact
-  comes from a W21+ retrain (§5).
-- **W27.3** — `run_query.py` now introspects the corpus's M1/M2
-  ingest regime and prints it (`[W27] corpus M1/M2 memories EMPTY
-  ...`): the test100 corpus was ingested with ZERO write gates, its
-  memory codes are exact zeros, the memory subspace is INERT — F3 is
-  untestable on this corpus, and retrieval rides the S subspace alone.
-- **W27.4** — the gen gate now prints a non-ascii ratio and a verdict
-  band: E1's soup "passed" the 0.20 conf bar at 0.382 — a conf number
-  alone cannot see mixed-script soup. Judge the TEXT.
-
-**Your job**: pull, run Gate Zero (pytest), then the corrected
-GATELESS ladder (§2), then retrieval ground truth (§3). No code
-changes on your side.
+**Your job**: pull, run Gate Zero (pytest, incl. the NEW W29 file),
+re-run Gate 0.5 (the matrix — the repair is the DEFAULT now), then
+the re-ingest + the W27 ladder (§2). No code changes on your side.
 
 ### 0.1 The gates-artifact situation (why the ladder is gateless)
 
@@ -86,11 +80,13 @@ git remote add origin \
   https://pkhairkh:${GHA_TOKEN}@github.com/pkhairkh/rag-cache-engineering-qwen35-9b-flute.git
 git fetch origin
 git reset --hard origin/main        # the code becomes exactly the repo
-git describe --tags                 # MUST print w28-tq-repair or later
+git describe --tags                 # MUST print w29-per-head or later
 source /home/ubuntu/venv/bin/activate
-# W28 — REBUILD THE EXTENSION (the repo is a copy, not a build): the
-# kernel sources changed after the box's last verified build, and a
-# stale .so under new wrappers produces silently wrong numbers
+# W28 — REBUILD THE EXTENSION (the repo is a copy, not a build): a
+# stale .so under new wrappers produces silently wrong numbers.
+# (W29 is PYTHON-ONLY — the kernel sources did NOT change this wave;
+# a box that already rebuilt at W28 may skip this; the rebuild is
+# always safe to re-run.)
 cd src/flute_extended && pip install -e . --no-build-isolation && cd ../..
 python3 -c "import sys; sys.path.insert(0,'src/rag'); sys.path.insert(0,'src/flute_extended'); import turboquant; print('TQ kernels:', 'present' if turboquant._load_tq_kernel() is not None else 'ABSENT (torch twin)')"
 ```
@@ -105,7 +101,7 @@ Your assets (adjust if they moved): corpus
 driver defaults already.
 
 **Gate Zero — convert the authored tests into measurements**
-(~2 min, once, before the ladder):
+(~3 min, once, before the ladder):
 
 ```bash
 python -m pytest src/rag/tests/test_w27_regime_guards.py -x
@@ -113,13 +109,20 @@ python -m pytest "src/rag/tests/test_query.py::test_query_cache_vector_device_al
                  "src/rag/tests/test_query.py::test_corpus_memory_state_real_loader" \
                  "src/rag/tests/test_query.py::test_install_gdn_best_mode" \
                  "src/rag/tests/test_tq_cache.py::test_w28_protocol_guards_refuse_loudly" -x
+# W29 — the per-head repair gates (AUTHORED on the dev box, first run
+# here): the vectorization pin, the dynamic-range immunity (incl. the
+# production geometry), the codes contract, the wiring, the sums, the
+# disk edge. ~2-4 min on CPU-torch; no GPU needed.
+python -m pytest src/rag/tests/test_w29_per_head.py -x
 ```
 
 Expect PASS on all. If anything FAILS, stop and paste the assert —
 do not patch. The first file closes the forgery path (regime meta +
 broadcast signature + the corpus-regime trichotomy); the second
 reproduces and closes the E2/E3 device crash; the third is the W26
-install gate; the fourth pins the W28 protocol guards.
+install gate; the fourth pins the W28 protocol guards; the fifth pins
+the W29 repair (per-head units, the permuted frame, the units codes
+contract through every edge).
 
 **Gate 0.5 — THE TQ MALFUNCTION LOCALIZER (W28, run BEFORE the ladder)**
 
@@ -131,17 +134,23 @@ Gaussian / heavy-tail / per-head-spread states + the build report):
 
 ```bash
 python3 scripts/gpu/tq_gen_matrix.py --max-new-tokens 48
+# the honest A/B — reproduce the W28 defect on demand:
+python3 scripts/gpu/tq_gen_matrix.py --max-new-tokens 48 --s-flat
 # if the verdict says "the generate() interplay":
 python3 scripts/gpu/tq_gen_matrix.py --trace --max-new-tokens 8
 ```
 
-Paste the WHOLE output. The printed decision tree names the branch:
-G2 (TQ + manual loop) garbage = the quantizer on real states (read
-[0]'s PER-BLOCK rel-MSE row — the per-head dynamic-range finding,
-FINDINGS W28 item 9); G2 clean + G4 (generate) garbage = the
-generate()/Cache-protocol interplay (the W28 guards fire loudly; the
---trace output is the evidence); G3 (raw + generate) garbage = not TQ;
-all clean = the stale-extension environment (the rebuild above).
+Paste the WHOLE output. **W29: the per-head repair is the DEFAULT** —
+the TQ cells now quantize S as 32 per-head units (own norms, the
+permuted frame) and the G3/G4 conf is REAL data (output_scores=True;
+the W28 run's conf 0.000 was the missing-data artifact that mislabeled
+G3's coherent text GARBAGE-RANGE — fixed). The probe's per-head-spread
+row now also prints the **[W29 per-head units]** measurement (the same
+state through the repair — expected at the ~0.02 floor vs the flat
+row's 7.65). Expected: **G1/G2/G3/G4 all CLEAN**; the --s-flat control
+reproduces the W28 soup (G2/G4 garbage) — the controlled proof the
+per-head regime is what closed it. If anything is NOT clean, the
+printed decision tree names the branch.
 
 ---
 
@@ -154,6 +163,15 @@ no-op, and the only loaded artifact on the box is a refused forgery.
 The ladder therefore isolates exactly F1 (the n≥2 S-state sum) vs F2
 (the quantized write-path floor). The `[W26] GDN S install` line
 confirms the install regime per run.
+
+**W29 regime note**: the codes are self-describing — the OLD corpus
+(flat codes) installs FLAT (the codes teach the layer the flat frame;
+the session runs the corpus's regime, consistently), a re-ingested
+corpus (§2.5) installs per-head. **Run the ladder FIRST on the old
+corpus** (the apples-to-apples W27 baseline), then re-ingest and
+re-run E1/E3 — the second run's write path rides the per-head repair
+end-to-end. A mixed-regime install is REFUSED loudly by design (the
+install guards' re-ingest hint).
 
 ```bash
 cd /home/ubuntu/RAGGA && source /home/ubuntu/venv/bin/activate
@@ -191,6 +209,36 @@ verdict band:
 | garbage | garbage | clean | **F2 CONFIRMED** (the quantized write-path floor) → §5 E5 bisect, paste the matrix |
 | garbage | garbage | garbage | **F2 deep** (even the n=1 verbatim install garbles) → §5 E5, paste the matrix |
 | E1 ≠ E3 | any | any | NEW information (the zero-state read does something) → paste both runs verbatim |
+
+---
+
+## 2.5 THE RE-INGEST (W29 — only after the ladder's baseline runs + Gate 0.5 clean)
+
+The per-head repair is the LIVE-CACHE default, but the corpus on disk
+still carries the W28 flat codes (the snapshots are self-describing —
+they decode fine, they install flat). To activate the repair
+END-TO-END (the ingest-side quantization + the install + the decode
+write path all per-head), re-ingest the corpus into a NEW directory
+(never overwrite the old one — it is the A/B control and the §3
+baseline):
+
+```bash
+# re-ingest at the per-head regime (the default — the ingest driver's
+# TQCache carries it; the chunks + the system snapshot land as
+# partition="units" codes)
+python3 scripts/gpu/run_ingestion.py \
+    --out-dir /home/ubuntu/ragga_ingested_test100_w29 \
+    --n-docs 100 --max-tokens 0          # match the ORIGINAL ingest's
+                                         # manifest line (n-docs / corpus
+                                         # / system prompt) — paste it
+# then re-build the index over the NEW corpus (§3's step 1) and re-run
+# E1/E3 with --disk-dir /home/ubuntu/ragga_ingested_test100_w29
+```
+
+The new snapshots carry `units` keys (partition="units"); the old
+readers/old digests are unaffected; a mixed install is REFUSED loudly
+with the re-ingest hint. Paste the new manifest line + the E1/E3
+verdicts.
 
 ---
 
@@ -309,24 +357,34 @@ a one-line follow-up commit (not you).
 
 ---
 
-## 8. Map of the W27 change (where to look in the code)
+## 8. Map of the W27/W29 change (where to look in the code)
 
 | file | what |
 |---|---|
 | `src/rag/query.py` | `query_cache_vector` — the device alignment (W27.1: every §4 piece hops to the S pieces' device; uniform flows are bit-identical no-ops) |
 | `src/rag/m1m2_finetune.py` | `save_gates` bakes the write-kernel regime meta; `load_gates` refuses (a) artifacts without `meta_write_addr` on a content-addressing module, (b) write_gate_k rows constant across heads (the broadcast signature) (W27.2) |
-| `src/rag/index.py` | `corpus_memory_state(loader)` — the empty / carries-content / absent trichotomy (W27.3) |
+| `src/rag/index.py` | `corpus_memory_state(loader)` — the empty / carries-content / absent trichotomy (W27.3); the batched decode stackers are UNITS-SAFE (the kernel eligibility gate refuses non-flat codes before the stack — W29) |
 | `scripts/gpu/run_query.py` | the `[W27]` corpus-regime diagnosis + the retrieval-prefill regime match (M1/M2 OFF for the prefill when the corpus memories are empty and gates are loaded) + the gen gate's non-ascii ratio and verdict band (W27.3/4) |
 | `src/rag/tests/test_w27_regime_guards.py` | gates A–C (AUTHORED, PENDING this box): the forgery refusals, the honest round-trip with baked regime meta, the corpus-regime trichotomy |
 | `src/rag/tests/test_query.py` | `test_query_cache_vector_device_alignment` (the E2/E3 crash reproduced and closed) + `test_corpus_memory_state_real_loader` |
-| `FINDINGS.md` | Errata W27 (items 4–7): the forged-artifact classification, the corrected gateless ladder, the retrieval decomposition + Errata W28 (items 8–12: the TQ core verified correct three ways, the per-head dynamic-range hazard measured, the generate-interplay gap, the build-staleness hazard, the protocol guards) |
-| `scripts/gpu/tq_gen_matrix.py` | W28 — THE TQ MALFUNCTION LOCALIZER: the 2x2 generation matrix (raw/TQ x manual/generate), the kernel parity probe on Gaussian/heavy-tail/per-head-spread states (PER-BLOCK rel-MSE), the build-state report, `--trace` |
-| `src/rag/tq_cache.py` | W28 protocol guards: `crop` / `batch_repeat_interleave` refuse loudly on TQ layers (never a silent parent fallback on code stores); the quantize paths untouched (bit-identical) |
-| `scripts/w28_tq_sim.py` | the dev-box numpy reproduction of the TQ round-trip (the per-head dynamic-range measurement behind FINDINGS W28 item 9) |
+| `src/rag/turboquant.py` | **W29**: `UNITS_PERM_OFFSET` (the permuted frame + the Kronecker note), `quant_units` / `_dequant_units` (the vectorized multi-unit twin + the kernel batch at eligible d), the units routing in `dequant`, the loud refusals (split / qjl / misalignment) |
+| `src/rag/tq_codes.py` | **W29**: the `partition="units"` mode — the `units` field, the (M,) per-unit norms vector, the type cops, to_arrays/from_arrays + the units key (old readers/digests unaffected) |
+| `src/rag/tq_cache.py` | **W29**: the per-head S wiring (DEFAULT ON; `s_flat=True` the W28 A/B; the qjl x per-head mutual exclusion refused at construction), `_init_s`'s per-unit resolution, the s_codes setter's regime/units guards; the W28 protocol guards (`crop` / `batch_repeat_interleave`) unchanged |
+| `src/rag/install.py` | **W29**: `_requant_flat` (the sums' requant routed on the codes' partition — units sums keep per-unit norms) + `_units_guard` (the mixed-regime REFUSAL, re-ingest hint) in both sums |
+| `src/rag/snapshot.py` | **W29**: `_read_unit`'s units validation (units present-iff-units, the (M,) norm, the M×L stream lengths) + the digest's units bytes |
+| `src/rag/ingest.py` | **W29**: `reference()`'s norms-vector fold (the system-state hash) |
+| `FINDINGS.md` | Errata W27 (items 4–7) + Errata W28 (items 8–12) + **Errata W29 (items 13–16: the box verdict classified, the per-head repair, the Kronecker discovery, the surface map)** |
+| `scripts/gpu/tq_gen_matrix.py` | W28 the localizer; **W29**: the `[W29 per-head units]` probe row, the honest generate() conf (output_scores), the `--s-flat` A/B flag, the updated verdict tree |
+| `scripts/w28_tq_sim.py` | the numpy reproduction — **W29**: the per-head regime rows (the permuted frame; worst-head 10.69→0.023 at 55x, 297→0.023 at 525x) |
+| `src/rag/tests/test_w29_per_head.py` | **W29** (AUTHORED, PENDING this box): the vectorization pin, the dynamic-range immunity (d=1,024 + the production geometry), the codes contract + serialization, the seed-addressed frame, the layer wiring, zero-norm units, the install sums, the disk edge, the refusals |
+| `src/rag/tests/test_tq_cache.py` + the W16–W19 suites | **W29**: pinned to `s_flat=True` (their authored flat semantics preserved — the per-head coverage is the W29 file's) |
 | `m1m2_gates_trained_fixed.npz`, `m1m2_gates_trained_w26.npz` | **DELETED** (the hermes forgeries — refused by W27.2; the full box log that motivated them is preserved at commit `a9bbda2`) |
 
-Default behaviors are bit-identical to pre-W27 on every uniform-device
-flow — pinned by the existing suite plus the two new gates above.
+Default behaviors: W27's device alignment is bit-identical on
+every uniform-device flow (the existing suite pins it); W29's units
+regime is the NEW DEFAULT for the 4-D S path (the repair) with
+`s_flat=True` restoring the pre-W29 bytes exactly — the pinned suites
+prove the flat contract, test_w29_per_head.py proves the repair.
 
 ---
 

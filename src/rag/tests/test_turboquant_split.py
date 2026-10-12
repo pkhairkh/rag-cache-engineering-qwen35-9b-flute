@@ -221,7 +221,7 @@ def test_layer_conv_split_readback_and_idempotency():
     """TQLinearAttentionLayer quantizes conv through the split (group =
     kernel); the read-back stays inside the house budget and the decode
     round-trip is idempotent (the W15 probe's measured property)."""
-    cache = TQCache(layer_types=["linear_attention"], bits=BITS)
+    cache = TQCache(layer_types=["linear_attention"], bits=BITS, s_flat=True)
     layer = cache.layers[0]
     g = torch.Generator().manual_seed(SEED)
     x = _channel_window(SEED + 1).reshape(1, N_CH, TAPS).half().to(DEVICE)
@@ -269,7 +269,7 @@ def test_install_carries_split_conv_verbatim(tmp_path):
         chunk_id=0, s_codes={0: chunk_s}, conv_codes={0: chunk_conv},
         m1_codes=None, m2_codes=None, system_ref="w15")
 
-    cache = TQCache(layer_types=["linear_attention"], bits=bits)
+    cache = TQCache(layer_types=["linear_attention"], bits=bits, s_flat=True)
     reseed_cache(cache, system)
     report = install_snapshot(cache, system, [snap])
     installed = cache.layers[0].conv_codes

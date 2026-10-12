@@ -132,7 +132,7 @@ def test_w17_2_forward_parity_zero_gate(ckpt):
     ids = _ids(12, 7)
     outs = {}
     for tag, mdl in (("native", native), ("wired", wired)):
-        cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+        cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
         with torch.no_grad():
             o = mdl(input_ids=ids, past_key_values=cache, use_cache=True)
         h = o.last_hidden_state if hasattr(o, "last_hidden_state") else o[0]
@@ -229,7 +229,7 @@ def test_w17_7_ingest_snapshot_loader_vector_with_m1m2(ckpt, tmp_path):
     disk = str(tmp_path)
     drv = IngestDriver(
         wired.model, sys_ids, docs, disk,
-        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS),
+        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True),
         chunk_protocol="absolute", system_ref="w17")
     drv.run()
 
@@ -251,7 +251,7 @@ def test_w17_7_ingest_snapshot_loader_vector_with_m1m2(ckpt, tmp_path):
     assert not np.allclose(tail0_m1, tail1_m1, atol=1e-6)
 
     # the query side: reseed + prefill captures the same-space vector
-    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     reseed_cache(cache, system)
     with torch.no_grad():
         wired(input_ids=_ids(10, 4), past_key_values=cache, use_cache=True)
@@ -270,14 +270,14 @@ def test_w17_8_install_restores_m1m2_codes(ckpt, tmp_path):
     disk = str(tmp_path)
     IngestDriver(
         wired.model, sys_ids, docs, disk,
-        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS),
+        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True),
         chunk_protocol="absolute", system_ref="w17").run()
     from snapshot import load_chunk
     from install import install_snapshot
     system = load_system_state(disk)
     snap = load_chunk(os.path.join(disk, "snapshots", "chunk_00000.npz"))
     assert snap.m1_codes is not None
-    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     reseed_cache(cache, system)
     report = install_snapshot(cache, system, [snap])
     assert report["M1"]["mode"] == "verbatim"
@@ -327,7 +327,7 @@ def test_w17_10_geometry_guards_from_disk(ckpt, tmp_path):
     disk = str(tmp_path)
     IngestDriver(
         wired.model, sys_ids, docs, disk,
-        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS),
+        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True),
         chunk_protocol="absolute", system_ref="w17").run()
     system = load_system_state(disk)
     assert m1m2_mem_size_from_system(system) == MEM
@@ -356,14 +356,14 @@ def test_w17_11_forward_loud_on_codes_geometry_mismatch(ckpt, w17_corpus):
     wired, _ = _load(ckpt, use_m1m2=True, m1m2_mem_size=MEM)
     system = load_system_state(w17_corpus)
     ids = _ids(8, 9)
-    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     reseed_cache(cache, system)
     # poison the m1 geometry: codes from a DIFFERENT mem module
     big, _ = _load(ckpt, use_m1m2=True, m1m2_mem_size=MEM * 2)
     with torch.no_grad():
         big.model.m1m2.write_gate_k.fill_(0.5)
         big.model.m1m2.write_gate_v.fill_(0.5)
-    c2 = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    c2 = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
     with torch.no_grad():
         big(input_ids=ids, past_key_values=c2, use_cache=True)
     cache.m1_codes = c2.m1_codes          # d = 1024 vs the module's 512
@@ -384,6 +384,6 @@ def w17_corpus(ckpt, tmp_path_factory):
     disk = str(tmp_path_factory.mktemp("w17_corpus"))
     IngestDriver(
         wired.model, sys_ids, docs, disk,
-        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS),
+        cache_factory=lambda: TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True),
         chunk_protocol="absolute", system_ref="w17").run()
     return disk

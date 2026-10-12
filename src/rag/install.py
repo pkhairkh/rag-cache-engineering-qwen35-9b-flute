@@ -104,6 +104,45 @@ __all__ = ["sum_turboquant_codes", "install_snapshot", "install_from_disk",
            "sum_absolute_codes"]
 
 
+def _requant_flat(q, acc: torch.Tensor, template: TQCodes) -> TQCodes:
+    """The sum's ONE requant, routed on the TEMPLATE codes' partition (W29):
+    flat codes -> q.quant (the legacy (d,) path); units codes ->
+    q.quant_units over the (M, d) reshape of the flat accumulator (the
+    per-head regime's own norms — requanting the sum through the flat
+    single-unit path would re-introduce the dynamic-range hazard the
+    units mode exists to remove). The accumulator's flat length is
+    M*d in both regimes — the §4/§6 geometry is regime-invariant."""
+    if template.partition == "units":
+        m = int(template.units)
+        return q.quant_units(acc.reshape(m, int(template.d)))
+    return q.quant(acc)
+
+
+def _units_guard(op: str, kind: str, system: TQCodes, other: TQCodes,
+                 i: Optional[int] = None) -> None:
+    """W29: the units-regime frame guard — every addend must carry the
+    SAME partition and (on units codes) the same units count as the
+    system codes. A flat<->units mix (an old-regime corpus installed
+    against a per-head cache, or vice versa) is REFUSED loudly here —
+    never silently summed across regimes (the dequants would be
+    original-frame compatible, but the requant frame and the codes'
+    self-description would drift); re-ingest the corpus at the cache's
+    regime."""
+    label = f"delta {i}" if i is not None else "codes"
+    if other.partition != system.partition:
+        raise ValueError(
+            f"{op}({kind}): {label} is partition={other.partition!r} but "
+            f"the system codes are partition={system.partition!r} — a "
+            f"regime mix (W29: re-ingest the corpus at the cache's S "
+            f"regime; flat and units codes never sum into one frame)")
+    if system.partition == "units":
+        if int(other.units) != int(system.units):
+            raise ValueError(
+                f"{op}({kind}): {label} carries units={other.units} but the "
+                f"system codes carry units={system.units} — a per-head "
+                f"geometry drift (batch/head layout mismatch)")
+
+
 def _dequant_units_batched(q, units: Sequence[TQCodes]):
     """W20.10.1 — ONE tq_dequant_batched over a fold's units (the serving
     batch, PROPOSAL §3.6): the units' packed idx streams stack into the
@@ -207,6 +246,7 @@ def sum_turboquant_codes(system: TQCodes, deltas: Iterable[TQCodes],
                 f"but the frame's system codes sit on {system.device} — a "
                 f"mixed-device frame; move the unit's codes to ONE device "
                 f"(one sanctioned .to) before installing")
+        _units_guard("sum_turboquant_codes", kind, system, d, i)
     rows = _dequant_units_batched(q, [system, *deltas])
     if rows is not None:
         # the batched chain: ONE torch sum over the stacked rows (the
@@ -219,9 +259,11 @@ def sum_turboquant_codes(system: TQCodes, deltas: Iterable[TQCodes],
         acc = q.dequant(system)
         for d in deltas:
             acc = acc + q.dequant(d)
-    # ONE requant of the sum — q.quant routes CUDA+eligible to
-    # tq_quant_batched through the dispatcher (W20.8.2)
-    return q.quant(acc)
+    # ONE requant of the sum — routed on the system codes' partition
+    # (W29: units codes requant through quant_units' per-unit norms;
+    # q.quant routes CUDA+eligible to tq_quant_batched through the
+    # dispatcher, W20.8.2)
+    return _requant_flat(q, acc, system)
 
 
 def _last_conv(retrieved: Sequence[ChunkSnapshot], layer_idx: int
@@ -327,6 +369,7 @@ def sum_absolute_codes(system: TQCodes, absolutes: Sequence[TQCodes],
                 f"{system.device} — a mixed-device frame; move the unit's "
                 f"codes to ONE device (one sanctioned .to) before "
                 f"installing")
+        _units_guard("sum_absolute_codes", kind, system, a, i)
     rows = _dequant_units_batched(q, [system, *absolutes])
     if rows is not None:
         # the batched chain: (1-n)·dequant(sys) + Σ dequant(abs_i) —
@@ -338,7 +381,9 @@ def sum_absolute_codes(system: TQCodes, absolutes: Sequence[TQCodes],
         acc = q.dequant(system) * (1 - len(absolutes))
         for a in absolutes:
             acc = acc + q.dequant(a)
-    return q.quant(acc)
+    # ONE requant of the sum — routed on the system codes' partition
+    # (W29; the N23 contract)
+    return _requant_flat(q, acc, system)
 
 
 def install_snapshot(cache: TQCache, system: SystemState,

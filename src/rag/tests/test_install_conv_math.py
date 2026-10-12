@@ -172,17 +172,17 @@ def rig():
         }
 
         # the TQ protocol: system prefill -> SystemState -> chunk ingest
-        tq = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+        tq = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
         model(input_ids=sys_ids, past_key_values=tq)
         system = SystemState.from_cache(tq, system_ref="w12rig", bits=BITS)
-        tq2 = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+        tq2 = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
         record = ingest_chunk(model, doc_ids, tq2, system)
         record.chunk_idx = 0
         snap = record.to_snapshot(system)
 
         def tq_hidden(variant: str):
             with torch.no_grad():
-                cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+                cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
                 reseed_cache(cache, system)
                 if variant == "s-only":
                     install_snapshot(cache, system, [snap])
@@ -197,7 +197,7 @@ def rig():
                 return model(input_ids=qry_ids, past_key_values=cache)
 
         # the full install's standing state (gate 1)
-        full_cache = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+        full_cache = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
         reseed_cache(full_cache, system)
         install_snapshot(full_cache, system, [snap])
         installed = full_cache
@@ -208,7 +208,7 @@ def rig():
         model(input_ids=qry_ids, past_key_values=raw_dec)
         for t in range(N_DECODE):
             model(input_ids=dec_ids[:, t:t + 1], past_key_values=raw_dec)
-        tq_dec = TQCache(layer_types=LAYER_TYPES, bits=BITS)
+        tq_dec = TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
         reseed_cache(tq_dec, system)
         install_snapshot(tq_dec, system, [snap])
         model(input_ids=qry_ids, past_key_values=tq_dec)

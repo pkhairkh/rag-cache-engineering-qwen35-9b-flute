@@ -35,7 +35,7 @@ GATES (all deterministic; plain asserts; tmp out dirs):
          WHAT MMAP ACTUALLY DOES is asserted, not just documented (array
          members come back as zero-copy views onto np.memmap roots; the
          sha256 digest still gates the load; verify_chunk agrees);
-     (c) tq_cache graph_safe: TQCache(layer_types=..., graph_safe=True) vs
+     (c) tq_cache graph_safe: TQCache(layer_types=..., graph_safe=True, s_flat=True) vs
          False — the same update/read sequence produces bit-identical
          (torch.equal) dequantized reads AND bit-identical code streams;
          before_graph_capture()/after_graph_capture() exist and are
@@ -404,8 +404,8 @@ def test_tq_cache_graph_safe_parity():
     (torch.equal) AND bit-identical code streams; the capture hooks exist
     and are callable no-ops (calling them leaves codes + counters
     untouched — the provable CPU no-op)."""
-    c_off = TQCache(layer_types=_LAYER_TYPES)                  # default OFF
-    c_on = TQCache(layer_types=_LAYER_TYPES, graph_safe=True)  # flag ON
+    c_off = TQCache(layer_types=_LAYER_TYPES, s_flat=True)                  # default OFF
+    c_on = TQCache(layer_types=_LAYER_TYPES, graph_safe=True, s_flat=True)  # flag ON
     assert c_off.layers[0].graph_safe is False
     assert c_on.layers[0].graph_safe is True
 

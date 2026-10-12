@@ -2556,3 +2556,96 @@ gate), the generate()-interplay gap closed with tq_gen_matrix.py (the
 2x2 localizer + the kernel parity probe + --trace), the Cache-protocol
 guards loud — 'TQ on kernel works fine' is now a one-command
 measurement"
+
+## WAVE W29 — the per-head repair wave: F2b confirmed by the box matrix,
+the S state quantized per head (the paper's per-vector norm recipe)
+
+The box's Gate 0.5 verdict (2026-10-12, pasted verbatim): G2 (TQ +
+manual) garbage, kernel parity EXACT (0.000e+00 on all three probe
+distributions), worst-block rel-MSE 7.65 at a 38x head-norm spread —
+F2b confirmed (FINDINGS W28 item 9 / W29 item 13). G3's GARBAGE-RANGE
+label was the conf artifact (generate() returned no per-step scores);
+the text was coherent — the generate() interplay eliminated. The
+repair: 32 per-head units of d=16,384, own norms, the PERMUTED frame
+(the Kronecker discovery below); Python-only, no kernel changes.
+
+#### W29.1 — the sim proof (numpy, the dev box's own GPU-less law)
+- [x] done
+ROLE core author · EXTEND scripts/w28_tq_sim.py: the per-head regime
+(own norms, seed 101 at d=16,384, the committed cb_b{3,4}_d16384
+tables) measured against the flat regime on the same states —
+worst-head 10.69 -> 0.023 at 55x, 297 -> 0.023 at 525x, TOTAL 0.022
+(better than the flat total). The Kronecker experiment
+(/home/z/my-project/scripts/w29_perm_experiment.py, scratch): the plain
+2^14 FHT on rank-1/rank-8 heads measures 0.087/0.056 (the H_(2^7) (x)
+H_(2^7) alignment with the 128x128 matrix layout rotates k (x) v to
+products of Gaussians — codebook mismatch); the fixed coordinate
+permutation restores the CLT: 0.0221 structure-independent.
+DO-D: python3 scripts/w28_tq_sim.py runs, prints the W29 rows.
+
+#### W29.2 — the container: TQCodes partition="units"
+- [x] done
+ROLE core author · EDIT src/rag/tq_codes.py: the `units` field
+(present IFF partition="units"), the (M,) per-unit norms vector (the
+type cops validate shape-vs-units; 0-dim-on-units and stray-units
+refused), nbytes' units x 4 accounting, to_arrays/from_arrays + the
+units key (conditional — old readers/digests byte-identical).
+DO-D: python3 -m py_compile src/rag/tq_codes.py exit 0.
+
+#### W29.3 — the quantizer: quant_units / _dequant_units + the perm frame
+- [x] done
+ROLE core author · EDIT src/rag/turboquant.py: UNITS_PERM_OFFSET=4545
+(the frame y = FHT(P x), P = randperm(seed+4545) — deterministic,
+seed-addressed, no new serialization); quant_units (ONE vectorized
+pass: norms + batched fht_apply + batched searchsorted + pack; the
+kernel batch at kernel-eligible d; the loud refusals: split / qjl /
+misalignment; zero-norm rows branchless); _dequant_units (the flat
+(M*d,) decode: unpack -> long-indexed LUT gather -> batched adjoint ->
+per-unit norms -> inverse perm; the kernel branch at eligible d; the
+stream-length validation); dequant()'s units routing + _route_for's
+flat-twin route.
+DO-D: python3 -m py_compile src/rag/turboquant.py exit 0.
+
+#### W29.4 — the wiring: per-head S in the cache + the honest matrix conf
+- [x] done
+ROLE core author · EDIT src/rag/tq_cache.py (the per-head DEFAULT:
+_init_s resolves B*H units at K*V keeping the kind's seed;
+update_recurrent_state rides quant_units; the s_codes setter's
+regime/units guards; s_flat=True the W28 A/B; the qjl x per-head
+mutual exclusion refused at construction) + scripts/gpu/
+tq_gen_matrix.py (output_scores=True — the G3/G4 conf is real data;
+the [W29 per-head units] probe row; --s-flat; the updated verdict
+tree). M1/M2 stay flat (inert on the corpora; the split rides the
+gates retrain).
+DO-D: python3 -m py_compile src/rag/tq_cache.py scripts/gpu/tq_gen_matrix.py exit 0.
+
+#### W29.5 — the consumers: install sums + snapshot edge + ingest hash
+- [x] done
+ROLE core author · EDIT src/rag/install.py (_requant_flat routed on
+the codes' partition — units sums requant per-unit; _units_guard's
+mixed-regime REFUSAL with the re-ingest hint in both sums),
+src/rag/snapshot.py (_read_unit's units validation: units
+present-iff-units, the (M,) norm, the M*L stream lengths; the digest's
+units bytes; _OPTIONAL_CODE_FIELDS += units), src/rag/ingest.py
+(reference()'s norms-vector fold).
+DO-D: python3 -m py_compile src/rag/install.py src/rag/snapshot.py src/rag/ingest.py exit 0.
+
+#### W29.6 — the gates: test_w29_per_head.py + the suites pinned flat
+- [x] done (AUTHORED, PENDING the box)
+ROLE test author · WRITE src/rag/tests/test_w29_per_head.py (A the
+vectorization pin, bit-exact; B the dynamic-range immunity at d=1,024
+AND the production geometry 32 x 16,384 + the flat A/B hazard gates; C
+the codes contract + serialization; D the seed-addressed frame; E the
+layer wiring; F zero-norm units; G the install sums + refusals; H the
+disk edge + digest) · EDIT the W16-W19/tq_cache suites: 70 TQCache
+sites pinned s_flat=True (the authored flat semantics preserved).
+DO-D: python3 -m py_compile src/rag/tests/*.py exit 0.
+
+#### W29.7 — the docs + the auditor + the commit
+- [x] done
+ROLE core author · FINDINGS.md Errata W29 (items 13-16) + HANDOVER.md
+W29 (the matrix re-run instructions, Gate Zero's fifth pytest block,
+§2.5 the re-ingest, §8's surface map) + this wave. The auditor wave
+W29 registered; commits + tag w29-per-head pushed.
+DO-D: the auditor's --wave W29 run (28/28) + --all (25/25 waves) on
+the box.

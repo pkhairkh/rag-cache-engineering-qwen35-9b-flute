@@ -561,3 +561,82 @@ codebooks.py, fht.py, kernel_tq.cu, bindings.cpp) against the paper
     the parent's raw-tensor arithmetic on code stores. Pinned by
     test_tq_cache.py's contract 12. The read/write quantize paths are
     UNTOUCHED (default bit-identical).
+
+## Errata (W29 — the box matrix verdict is in: F2b CONFIRMED; the per-head repair implemented)
+
+The box's Gate 0.5 run (2026-10-12, tq_gen_matrix.py --max-new-tokens 48,
+pasted verbatim to the dev box): G1 clean (conf 0.702), **G2 (TQ + manual)
+garbage** (conf 0.544, soup), G3 (raw + generate) COHERENT text at conf
+0.000 (the missing-data artifact — generate() returned no per-step scores,
+so the gate's conf collapsed to 0 and mislabeled it GARBAGE-RANGE), G4
+(TQ + generate) the same soup as G2. The parity probe: kernel-vs-torch
+max|diff| 0.000e+00 on ALL THREE distributions (the extension build is
+CLEAN — the stale-build hypothesis eliminated), total rel-MSE 0.0220 on
+all three, **worst-block rel-MSE 7.65 on the per-head-spread state (38x
+block spread)**. The verdict tree's G2 branch fired: F2b, item 9, on real
+states. The G3 label was a measurement bug (fixed with the repair —
+W29.4), not a model/generate defect: the text was the same coherent Helm
+answer as G1.
+
+13. **F2b is CONFIRMED as the production killer.** The box's worst-block
+    7.65 at 38x matches the sim's 10.7 at 55x (FINDINGS W28 item 9) to
+    within the spread difference — the per-unit dynamic-range hazard is
+    the sole surviving candidate (the kernel parity is exact, the
+    generate() interplay is eliminated by G3's coherent text, the build
+    is current). The repair is no longer a proposal: it is implemented
+    (item 14).
+
+14. **THE REPAIR (implemented): the per-head S quantization.** The S
+    state (B, H, K, V) now quantizes as B*H PER-HEAD units of d=K*V (32
+    units of 16,384 at production), each unit its OWN fp32 norm (the
+    paper's per-vector norm recipe — Theorem 1 applied per unit: the
+    per-coordinate noise floor is each unit's OWN energy), through
+    TurboQuant.quant_units — ONE vectorized pass (norm reduction +
+    batched fht_apply + batched searchsorted + pack; no per-unit Python
+    loop), partition="units" codes ((M,) norms vector, row-major
+    concatenated streams). Sim worst-head rel-MSE: **10.69 -> 0.023 at
+    55x spread; 297 -> 0.023 at 525x; TOTAL 0.022 — BETTER than the flat
+    regime's own total (0.027-0.030)**. The s_flat=True flag restores the
+    W28 flat regime (the A/B control; the box matrix's --s-flat).
+
+15. **THE SECOND DISCOVERY (the Kronecker alignment — why the repair
+    needs the permuted frame).** The naive per-head split (own norms,
+    the plain 2^14 FHT) measures worst-head 0.108 — a 100x improvement
+    but NOT the floor: the d=2^14 Hadamard factors as H_(2^7) (x) H_(2^7)
+    — EXACTLY the 128x128 per-head matrix layout — so a rank-1 head
+    k (x) v rotates to coordinatewise PRODUCTS of Gaussians (heavy-
+    tailed), mismatching the Lloyd-Max codebook (measured: rank-1 0.087,
+    rank-8 0.056 vs the 0.022 floor; the i.i.d. control is at the floor
+    — structure, not scale). The fix: the units frame is the PERMUTED
+    rotation y = FHT(P x) with P a FIXED random coordinate permutation
+    drawn from the kind's seed + 4545 (turboquant.UNITS_PERM_OFFSET —
+    deterministic, seed-addressed, NO new serialization fields): P
+    scatters the (i, j) pairs before the butterfly and restores the CLT
+    — measured 0.0221 on rank-1, rank-8, full-rank and scaled states
+    alike (structure-independent, the paper's per-unit floor). The
+    flat 2^19 regime never showed this because its H_(2^14) (x) H_(2^5)
+    factor mixes across heads (the CLT rides the 32-head sum) — the same
+    alignment, hidden by the cross-head mixing AND the one-norm hazard
+    it enabled.
+
+16. **The W29 surface (all Python — no kernel changes this wave).**
+    tq_codes.py: the partition="units" mode (units count, the (M,) norms
+    vector, type cops, to_arrays/from_arrays + the units key — old
+    readers/digests unaffected). turboquant.py: quant_units /
+    _dequant_units (the vectorized twin + the kernel batch at
+    kernel-eligible d — the per-head 16,384 rides the torch twin, whose
+    fht calls still ride the small-K CUDA kernels; a W30 tile
+    relaxation is the follow-up), the perm frame helpers, the dequant
+    routing, the loud refusals (split/qjl/misalignment). tq_cache.py:
+    the per-head wiring (DEFAULT ON; s_flat the A/B; the qjl x per-head
+    mutual exclusion refused at construction), the s_codes setter's
+    regime/units guards. install.py: the sums' units branches
+    (_requant_flat routed on the codes' partition; the mixed-regime
+    REFUSAL with the re-ingest hint). snapshot.py: _read_unit's units
+    validation + the digest's units bytes. ingest.py: reference()'s
+    norms-vector fold. The M1/M2 kinds stay flat (the memory subspace
+    is inert on the ingested corpora; the split rides the gates
+    retrain). The G3/G4 conf artifact fixed (output_scores=True —
+    W29.4). Tests: test_w29_per_head.py (AUTHORED, PENDING the box);
+    the existing suites pinned to s_flat=True (their authored flat
+    semantics preserved — 70 sites).

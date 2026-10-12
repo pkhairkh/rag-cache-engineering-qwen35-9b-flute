@@ -113,16 +113,23 @@ class SystemState:
             m2_shape=tuple(cache._m2_shape) if cache._m2_shape else None)
 
     def reference(self) -> str:
-        """A stable string identifying this reset point (manifest field)."""
+        """A stable string identifying this reset point (manifest field).
+
+        W29: units codes (the per-head S regime) carry a (M,) norms
+        VECTOR — the hash folds it through its sum (a deterministic
+        scalar reduction; new ingests get new references, the manifest's
+        own field — old system files keep their stored reference)."""
+        def _norm_scalar(c: TQCodes) -> float:
+            return float(c.norm) if c.norm.dim() == 0 else float(c.norm.sum())
         if self.system_ref:
             return self.system_ref
         h = 0
         for L in sorted(self.s_codes):
             c = self.s_codes[L]
-            h = (h * 1000003 + int(float(c.norm) * 1e6) + L) & 0xFFFFFFFF
+            h = (h * 1000003 + int(_norm_scalar(c) * 1e6) + L) & 0xFFFFFFFF
         for c in (self.m1_codes, self.m2_codes):
             if c is not None:
-                h = (h * 1000003 + int(float(c.norm) * 1e6)) & 0xFFFFFFFF
+                h = (h * 1000003 + int(_norm_scalar(c) * 1e6)) & 0xFFFFFFFF
         return f"sysstate-{h:08x}"
 
 

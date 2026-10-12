@@ -133,7 +133,7 @@ def _rel_mse(a, b) -> float:
 
 
 def _make_cache() -> TQCache:
-    return TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    return TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
 
 
 def _codes_equal(a, b) -> bool:

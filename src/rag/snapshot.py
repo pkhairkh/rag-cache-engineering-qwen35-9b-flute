@@ -134,11 +134,13 @@ _NPZ_EXT = ".npz"
 # carrying exactly ONE of the pair is a corruption signal, refused
 # loudly in _read_unit) + the OPTIONAL W15 outlier-split keys
 # (group/mask/norm_hi — present IFF partition == "outlier"; the triple
-# is all-or-none, refused loudly when partial). Still derived from the
-# dataclass so a REQUIRED field change fails loudly here; the optional
-# sets are carved out and mirrored by hand.
+# is all-or-none, refused loudly when partial) + the OPTIONAL W29 units
+# key (present IFF partition == "units"; the multi-unit container's
+# count). Still derived from the dataclass so a REQUIRED field change
+# fails loudly here; the optional sets are carved out and mirrored by
+# hand.
 _OPTIONAL_CODE_FIELDS: tuple = ("qjl_signs", "gamma", "group", "mask",
-                                 "norm_hi")
+                                 "norm_hi", "units")
 _SPLIT_CODE_FIELDS: tuple = ("group", "mask", "norm_hi")
 _CODE_FIELDS: tuple = tuple(f.name for f in _dc_fields(TQCodes)
                             if f.name not in _OPTIONAL_CODE_FIELDS)
@@ -302,6 +304,13 @@ def _unit_digest_bytes(tag: str, codes: TQCodes) -> bytes:
             out += np.zeros(4, dtype=np.float32).tobytes()
         out += np.asarray(int(a.get("group") or 1),
                           dtype=np.int64).tobytes()
+    # W29: the units count (present IFF partition == "units") — a
+    # tampered units count must change the digest (the stream lengths
+    # track it, but the count is the container's OWN metadata — digest
+    # it explicitly, the group discipline). "half"/"outlier" units
+    # digest BYTE-IDENTICALLY to the pre-W29 formula.
+    if "units" in a:
+        out += np.asarray(int(a["units"]), dtype=np.int64).tobytes()
     return out
 
 
@@ -660,10 +669,39 @@ def _read_unit(z: np.lib.npyio.NpzFile, prefix: str) -> TQCodes:
     # W15: the outlier-split triple (group/mask/norm_hi) — present IFF
     # partition == "outlier" (all-or-none; a partial triple or a stray
     # triple on a "half" unit is a corruption signal).
+    # W29: the units key — present IFF partition == "units" (the
+    # multi-unit count); in that mode the norm member is the (units,)
+    # per-unit norms vector and the idx streams are units*ceil(n*bits/8)
+    # bytes (the row-major concatenation of the per-unit streams).
     split_present = [f for f in _SPLIT_CODE_FIELDS
                      if f"{prefix}{f}" in z.files]
     raw = {f: z[f"{prefix}{f}"] for f in _CODE_FIELDS}
     part = str(np.asarray(raw["partition"]))
+    units_key = f"{prefix}units"
+    has_units = units_key in z.files
+    if part == "units" and not has_units:
+        raise ValueError(
+            f"load_chunk: unit '{label}' is partition=units but carries NO "
+            f"{units_key} member — the multi-unit count is required (W29; "
+            f"corrupt npz?)")
+    if part != "units" and has_units:
+        raise ValueError(
+            f"load_chunk: unit '{label}' is partition={part!r} but carries a "
+            f"stray {units_key} member — the units count rides ONLY on "
+            f"partition='units' codes (W29; corrupt npz?)")
+    if has_units:
+        u = np.asarray(z[units_key])
+        if u.dtype != np.int64 or u.size != 1 or int(u) < 1:
+            raise ValueError(
+                f"load_chunk: unit '{label}' units must be a positive int "
+                f"scalar, got dtype={u.dtype}, value={u!r}")
+        nu = np.asarray(raw["norm"])
+        if nu.dtype != np.float32 or nu.ndim != 1 or nu.shape[0] != int(u):
+            raise ValueError(
+                f"load_chunk: unit '{label}' norm must be a ({int(u)},) fp32 "
+                f"per-unit norms vector (partition='units', W29), got "
+                f"dtype={nu.dtype}, shape={nu.shape}")
+        raw["units"] = int(u)
     if part == "outlier":
         if len(split_present) != len(_SPLIT_CODE_FIELDS):
             raise ValueError(
@@ -682,12 +720,14 @@ def _read_unit(z: np.lib.npyio.NpzFile, prefix: str) -> TQCodes:
                 f"bit-stream, got dtype={a.dtype}, ndim={a.ndim}")
     n_lo, n_hi = int(raw["n_lo"]), int(raw["n_hi"])
     bits_lo, bits_hi = int(raw["bits_lo"]), int(raw["bits_hi"])
+    mult = int(raw["units"]) if "units" in raw else 1
     for f, n, b in (("idx_lo", n_lo, bits_lo), ("idx_hi", n_hi, bits_hi)):
-        want = _packed_len(n, b)
+        want = mult * _packed_len(n, b)
         got = np.asarray(raw[f]).shape[0]
         if got != want:
             raise ValueError(
                 f"load_chunk: unit '{label}' {f} holds {got} bytes, expected "
+                f"{'' if mult == 1 else str(mult) + ' x '}"
                 f"ceil({n}*{b}/8) = {want} (corrupt npz?)")
     if has_q:
         s = np.asarray(z[ql_key])

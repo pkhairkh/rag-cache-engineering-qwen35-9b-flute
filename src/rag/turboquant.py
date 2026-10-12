@@ -231,7 +231,7 @@ __all__ = [
     # TQCodes; index imports SEEDS; evals imports the module handle;
     # query/m1m2 consume through tq_cache (no direct import).
     "KINDS", "SEEDS", "TQCodes", "TurboQuant", "get_quantizer",
-    "pack_bits_t", "unpack_bits_t",
+    "pack_bits_t", "unpack_bits_t", "UNITS_PERM_OFFSET",
 ]
 
 # ---------------------------------------------------------------- kinds ----
@@ -263,6 +263,21 @@ QJL_SEED_OFFSET = 7777
 # the OUTLIER sub-quantizer's own D3 frame seed offset, added to the kind's
 # seed (the regular sub-quantizer keeps the kind's own seed).
 SPLIT_SEED_OFFSET = 555
+# W29 — the UNITS frame's coordinate-permutation seed offset (the
+# per-head S repair): the units-mode rotation is y = FHT(P x) with P a
+# FIXED random coordinate permutation drawn from the kind's seed + this
+# offset (deterministic — the frame stays seed-addressed, so the codes
+# need NO new serialization fields beyond `units`). WHY the permutation
+# is REQUIRED (measured, scripts/w28_tq_sim.py + the Kronecker
+# experiment): the d=2^14 Hadamard factors as H_(2^7) (x) H_(2^7), which
+# EXACTLY aligns with the 128x128 per-head S matrix layout — a rank-1
+# head k (x) v rotates to coordinatewise PRODUCTS of Gaussians
+# (heavy-tailed), mismatching the Lloyd-Max codebook: per-head rel-MSE
+# 0.087 (rank-1) / 0.056 (rank-8) vs the 0.022 floor. The fixed
+# permutation scatters the (i, j) pairs before the butterfly, restoring
+# the CLT: 0.0221 on rank-1, rank-8, full-rank and scaled states alike —
+# structure-independent, the paper's per-unit floor.
+UNITS_PERM_OFFSET = 4545
 # The paper's Alg.-2 IP-estimator constant (PROPOSAL §1.2: (√(π/2)/d)·γ·Sᵀ·qjl
 # with S unit-variance; folded with S = √d·FHT -> (√(π/2)/√d)·γ·FHT_adjoint).
 QJL_C = math.sqrt(math.pi / 2.0)
@@ -630,6 +645,16 @@ class TurboQuant:
         # torch path feeds fht_apply, mirrored once per instance per
         # device; see _device_signs)
         self._dev_signs: Dict[str, torch.Tensor] = {}
+        # W29 — the lazy UNITS-frame permutation caches (built on the first
+        # quant_units/_dequant_units call, the _signs lazy discipline): a
+        # (d,) int64 permutation P and its inverse, drawn ONCE from the
+        # kind's seed + UNITS_PERM_OFFSET (deterministic frame — see the
+        # UNITS_PERM_OFFSET note for WHY the permutation is required),
+        # plus the per-device mirrors for the kernel-adjacent gathers.
+        self._perm: Optional[torch.Tensor] = None
+        self._perm_inv: Optional[torch.Tensor] = None
+        self._dev_perm: Dict[str, torch.Tensor] = {}
+        self._dev_perm_inv: Dict[str, torch.Tensor] = {}
         # W9.2 qjl flag (DEFAULT OFF — the fields below are computed
         # unconditionally but USED only on qjl paths, so flag-off output
         # is bit-identical to the pre-W9.2 behavior):
@@ -751,6 +776,247 @@ class TurboQuant:
         if self.qjl:
             self._attach_qjl(codes, x32)
         return codes
+
+    # ------------------------------------------- W29: the units (per-head) --
+    def _units_perm(self, device: torch.device) -> torch.Tensor:
+        """The UNITS frame's coordinate permutation P on `device` — the
+        (d,) int64 draw from seed+UNITS_PERM_OFFSET, built once (CPU) and
+        mirrored per device (the _device_signs discipline: one .to per
+        device, cached). Deterministic in (d, seed) — the frame is
+        seed-addressed, so units codes decode anywhere the seed is known.
+        """
+        key = str(device)
+        if device.type == "cpu":
+            if self._perm is None:
+                g = torch.Generator().manual_seed(
+                    int(self.seed) + UNITS_PERM_OFFSET)
+                self._perm = torch.randperm(self.d, generator=g)
+                self._perm_inv = torch.argsort(self._perm)
+            return self._perm
+        if key not in self._dev_perm:
+            p = self._units_perm(torch.device("cpu")).to(device)
+            self._dev_perm[key] = p
+            self._dev_perm_inv[key] = torch.argsort(p)
+        return self._dev_perm[key]
+
+    def _units_perm_inv(self, device: torch.device) -> torch.Tensor:
+        """P's inverse on `device` (the dequant-side scatter index)."""
+        if device.type == "cpu":
+            self._units_perm(torch.device("cpu"))   # builds both
+            return self._perm_inv
+        key = str(device)
+        if key not in self._dev_perm_inv:
+            self._units_perm(device)                # builds both
+        return self._dev_perm_inv[key]
+
+    def _units_alignment_ok(self) -> bool:
+        """The units container's idx-stream layout law: each unit's packed
+        stream must occupy WHOLE bytes (n*bits % 8 == 0 per stream) so the
+        row-major concatenation is byte-separable and the (M, L) row view
+        the kernel batch expects is well-formed. The production per-head
+        geometry (d=16,384, 50/50 split, 3/4 bits: 8,192*3=24,576 bits =
+        3,072 B; 8,192*4=32,768 bits = 4,096 B) satisfies it exactly."""
+        return (self.n_lo * self.bits_lo) % 8 == 0 \
+            and (self.n_hi * self.bits_hi) % 8 == 0
+
+    def quant_units(self, x2: torch.Tensor) -> TQCodes:
+        """Quantize M units of this frame in ONE vectorized pass (W29 —
+        the per-head S repair, FINDINGS W28 item 9 / the box matrix's
+        worst-block 7.65 measurement): x2 is an (M, d) tensor — M units,
+        each row a (d,) vector quantized with its OWN fp32 norm (the
+        paper's per-vector norm recipe, Theorem 1 applied per unit: the
+        per-coordinate noise floor is each unit's OWN energy, so a 38x
+        head-norm spread no longer crushes the small heads).
+
+        THE FRAME: y = FHT(P x) — the kind's D3 rotation composed with
+        the fixed coordinate permutation P (seed+UNITS_PERM_OFFSET; see
+        the UNITS_PERM_OFFSET note for the measured Kronecker-alignment
+        reason the permutation is REQUIRED at the per-head 2^14 scale).
+        One P for every row — the frame is shared, the NORMS are per row.
+
+        THE CODES: one TQCodes with partition="units", units=M, the
+        (M,) fp32 norms vector, and the row-major concatenated packed
+        idx streams (per-unit byte-aligned — _units_alignment_ok, else a
+        LOUD refusal naming the geometry).
+
+        Dispatch (the REV-3 routing table's units row): CUDA input +
+        kernel pair present + geometry eligible (d > 16,384) -> ONE
+        tq_quant_batched call over the (M, d) permuted rows (the kernel
+        computes per-row norms natively — the install path's own batched
+        pattern, W20.10.1); every other case (the production per-head
+        d=16,384 rides HERE: one 64 KiB tile is the small-K paths' own)
+        -> the vectorized torch twin: ONE norm reduction, ONE batched
+        fht_apply, ONE batched searchsorted per bit-width, ONE pack per
+        stream — M units in a fixed ~8-op chain, no per-unit Python
+        loop, no host round trips (zero-norm rows are branchless: the
+        all-zero scaled boundaries bucket to index 0 and the 0-norm
+        multiply zeroes the reconstruction exactly).
+
+        Unsupported combinations (LOUD, never silent): the W15 outlier
+        split (group > 1) and the W9.2 qjl flag — both refuse; the A/B
+        surfaces ride the flat single-unit quant this wave."""
+        x2 = torch.as_tensor(x2)
+        if x2.dim() != 2 or x2.shape[1] != self.d:
+            raise ValueError(
+                f"TurboQuant({self.kind}): quant_units expects an "
+                f"(M, {self.d}) tensor, got {tuple(x2.shape)}")
+        if x2.shape[0] < 1:
+            raise ValueError(
+                f"TurboQuant({self.kind}): quant_units needs M >= 1 units, "
+                f"got {tuple(x2.shape)}")
+        if not torch.is_floating_point(x2):
+            raise TypeError(
+                f"TurboQuant: x2 must be floating point, got {x2.dtype}")
+        if self.split:
+            raise ValueError(
+                f"TurboQuant({self.kind}, bits={self.bits_spec}, "
+                f"group={self.group}): quant_units does not support the "
+                f"W15 outlier split — the units mode and the channel split "
+                f"are separate partitions (quant a (d,) unit through "
+                f"quant() for split semantics)")
+        if self.qjl:
+            raise ValueError(
+                f"TurboQuant({self.kind}): quant_units does not support the "
+                f"W9.2 qjl flag this wave (the residual sketch is "
+                f"per-unit-length d — the units A/B lands with the fused "
+                f"kernel chain); use qjl=False")
+        if not self._units_alignment_ok():
+            raise ValueError(
+                f"TurboQuant({self.kind}, bits=({self.bits_lo}, "
+                f"{self.bits_hi}), n=({self.n_lo}, {self.n_hi})): the units "
+                f"container needs byte-aligned per-unit streams "
+                f"(n_lo*bits_lo and n_hi*bits_hi multiples of 8) — got "
+                f"{self.n_lo}*{self.bits_lo} and {self.n_hi}*{self.bits_hi} "
+                f"bits; re-split or quantize per-unit through quant()")
+        x32 = x2.detach().to(torch.float32)
+        m = x32.shape[0]
+        dev = x32.device
+        # the frame's permutation, mirrored once per device
+        perm = self._units_perm(dev)
+        cb_lo, cb_hi = self._device_codebooks(dev)
+        if self._quant_kernel_eligible(x32.reshape(-1)) and m > 0:
+            # CUDA + kernel pair + eligible geometry (d > 16,384): ONE
+            # tq_quant_batched over the PERMUTED (M, d) rows — the kernel
+            # chain computes the per-row norms natively (the W20.10.1
+            # install pattern); the streams come back as (M, L) rows.
+            C = _load_tq_kernel()
+            assert C is not None
+            signs = self._device_signs(dev)
+            _check_kernel_devices(dev, (
+                ("x2 (the unit rows)", x32),
+                ("the rotation signs mirror", signs),
+                ("the boundaries_lo mirror", cb_lo.boundaries),
+                ("the boundaries_hi mirror", cb_hi.boundaries),
+            ))
+            units = x32[:, perm].contiguous()
+            codes_lo, codes_hi, norms = C.tq_quant_batched(
+                units, self.d, signs,
+                cb_lo.boundaries, cb_hi.boundaries,
+                self.n_lo, self.bits_lo, self.n_hi, self.bits_hi)
+            return TQCodes(
+                self.kind, self.d, norms.reshape(m),
+                self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
+                codes_lo.reshape(-1), codes_hi.reshape(-1),
+                self.seed, partition="units", units=m)
+        # the vectorized torch twin (the production per-head path):
+        # ONE norm reduction over the rows — (M,) per-unit norms, the
+        # paper's per-vector recipe applied per unit.
+        norms = x32.norm(dim=1)
+        # the frame: permute, then rotate (y = FHT(P x), one batched
+        # fht_apply over all M rows — leading batch dims supported)
+        xp = x32[:, perm]
+        y = fht.fht_apply(xp, self._signs)
+        # per-row boundary scaling (the boundary-scaling identity, per
+        # row): boundaries (Lb,) -> (M, Lb) sorted per row (norms >= 0
+        # preserve order; a zero-norm row degenerates to all-zero
+        # boundaries, bucketing its zero row to index 0 — deterministic,
+        # the reconstruction is exactly 0 through the norm multiply)
+        b_lo = cb_lo.boundaries.reshape(1, -1) * norms.reshape(m, 1)
+        b_hi = cb_hi.boundaries.reshape(1, -1) * norms.reshape(m, 1)
+        idx_lo = torch.searchsorted(b_lo, y[:, : self.n_lo], right=False)
+        idx_hi = torch.searchsorted(b_hi, y[:, self.n_lo:], right=False)
+        # pack the flattened (M*n,) index arrays — the row-major
+        # concatenated streams (byte-aligned per unit, the layout law)
+        return TQCodes(
+            self.kind, self.d, norms,
+            self.bits_lo, self.bits_hi, self.n_lo, self.n_hi,
+            pack_bits_t(idx_lo.reshape(-1).to(torch.uint8), self.bits_lo),
+            pack_bits_t(idx_hi.reshape(-1).to(torch.uint8), self.bits_hi),
+            self.seed, partition="units", units=m)
+
+    def _dequant_units(self, codes: TQCodes,
+                       dtype: torch.dtype = torch.float32,
+                       device: Optional[torch.device] = None
+                       ) -> torch.Tensor:
+        """Decode partition="units" codes to the FLAT (M*d,) vector — the
+        layer's flat layout (every §4 consumer's geometry unchanged).
+
+        The frame's inverse: x_hat = P^T ( FHT_adj(y_hat) * norm ) — the
+        adjoint rotates, the per-unit norm scales, the inverse scatter
+        lands the row back in the original coordinate order. One batched
+        unpack + LUT gather + fht_adjoint over all M rows; zero-norm
+        units reconstruct to the exact zero vector (0 x finite, the
+        branchless discipline).
+
+        Kernel path (CUDA codes + pair present + d > 16,384 + dtype in
+        {fp32, fp16}): the streams reshape to (M, L) rows + the (M,)
+        norms vector -> ONE tq_dequant_batched call (per-row norms
+        native), then the inverse permutation scatters the columns —
+        the torch twin is the reference and the CPU path (the production
+        per-head d=16,384 rides the twin: one tile, small-K kernels)."""
+        if codes.qjl_signs is not None or codes.gamma is not None:
+            raise ValueError(
+                f"TurboQuant({self.kind}): units codes carry a QJL sketch — "
+                f"the units mode does not support qjl this wave (the sketch "
+                f"is per-unit-length d; a units container with sketch "
+                f"fields is a corrupted or hand-built artifact)")
+        m = int(codes.units)
+        l_lo = _packed_len(self.n_lo, self.bits_lo)
+        l_hi = _packed_len(self.n_hi, self.bits_hi)
+        if codes.idx_lo.numel() != m * l_lo or codes.idx_hi.numel() != m * l_hi:
+            raise ValueError(
+                f"TurboQuant({self.kind}, d={self.d}): units codes carry "
+                f"{codes.idx_lo.numel()}/{codes.idx_hi.numel()} stream bytes "
+                f"but partition='units' with units={m} needs "
+                f"{m * l_lo}/{m * l_hi} (row-major concatenation of the "
+                f"per-unit streams — corrupt codes?)")
+        dev = codes.idx_lo.device
+        if self._dequant_kernel_eligible(codes, dtype):
+            C = _load_tq_kernel()
+            assert C is not None
+            signs = self._device_signs(dev)
+            cb_lo, cb_hi = self._device_codebooks(dev)
+            perm_inv = self._units_perm_inv(dev)
+            codes_lo = codes.idx_lo.reshape(m, l_lo).contiguous()
+            codes_hi = codes.idx_hi.reshape(m, l_hi).contiguous()
+            rows = C.tq_dequant_batched(
+                codes_lo, codes_hi, codes.norm.reshape(m), signs,
+                cb_lo.centroids, cb_hi.centroids,
+                self.n_lo, self.bits_lo, self.n_hi, self.bits_hi, dtype)
+            out = rows[:, perm_inv].reshape(-1)
+        else:
+            # the vectorized torch twin (the reference AND the CPU path)
+            idx_lo = unpack_bits_t(codes.idx_lo, self.bits_lo,
+                                   m * self.n_lo).reshape(m, self.n_lo)
+            idx_hi = unpack_bits_t(codes.idx_hi, self.bits_hi,
+                                   m * self.n_hi).reshape(m, self.n_hi)
+            cb_lo, cb_hi = self._device_codebooks(dev)
+            # uint8 indices widened to long for torch advanced indexing
+            # (the flat path's gather discipline — uint8 would be read
+            # as a boolean mask)
+            yhat = torch.cat(
+                [cb_lo.centroids[idx_lo.to(torch.long)],
+                 cb_hi.centroids[idx_hi.to(torch.long)]], dim=1)
+            # the adjoint (batched over the M rows), then the per-unit
+            # norm scaling, then the inverse permutation scatter
+            xhat = fht.fht_adjoint(yhat, self._signs)
+            xhat = xhat * codes.norm.reshape(m, 1)
+            perm_inv = self._units_perm_inv(dev)
+            out = xhat[:, perm_inv].reshape(-1)
+        out = out.to(dtype)
+        if device is not None:
+            out = out.to(device)
+        return out
 
     def _device_codebooks(self, device: torch.device) -> tuple:
         """(lo, hi) codebook pair mirrored onto `device` — the 2.2 surface
@@ -1109,7 +1375,9 @@ class TurboQuant:
         """The quantizer that owns CODES' partition (self, or the twin with
         the right group semantics). Codes are self-describing: outlier
         codes need split semantics (self's group must equal the codes'
-        group); half codes need flat semantics."""
+        group); half AND units codes need flat semantics (the units mode
+        is a flat-frame composition — the kind's rotation + the units
+        permutation — never the channel split)."""
         part = getattr(codes, "partition", "half")
         if part == "outlier":
             grp = int(codes.group) if codes.group is not None else 1
@@ -1168,8 +1436,19 @@ class TurboQuant:
         outlier-partition codes, qjl codes, other dtypes) takes the
         torch reference path below — the differential twin AND the
         CPU path.
+
+        W29: partition="units" codes (the per-head S mode) route to
+        _dequant_units — the vectorized multi-unit decode returning the
+        FLAT (M*d,) vector (the layer's flat layout, so every §4
+        consumer's geometry is unchanged); the cardinals are pinned by
+        _check_codes and the stream lengths validated there.
         """
-        if getattr(codes, "partition", "half") == "outlier":
+        part = getattr(codes, "partition", "half")
+        if part == "units":
+            q = self._route_for(codes)
+            q._check_codes(codes)
+            return q._dequant_units(codes, dtype, device=device)
+        if part == "outlier":
             q = self._route_for(codes)
             q._check_codes(codes)
             out = q._dequant_split_mse(codes, dtype=torch.float32)

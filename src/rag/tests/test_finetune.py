@@ -226,7 +226,7 @@ class FinetuneStubModel(nn.Module):
 
 
 def _make_cache() -> TQCache:
-    return TQCache(layer_types=[LIN], bits=BITS)
+    return TQCache(layer_types=[LIN], bits=BITS, s_flat=True)
 
 
 def _batches(n: int = 3, seed: int = 7):

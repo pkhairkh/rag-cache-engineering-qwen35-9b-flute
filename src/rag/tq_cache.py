@@ -35,6 +35,36 @@ M1/M2 slots (spec §2.2/§5): the two global memories are cache STATE —
 `update_m1/read_m1/m1_codes` (+ M2) quantize/dequantize with their own
 kinds and D3 seeds, exactly like S.
 
+THE W29 PER-HEAD S MODE (the F2b repair — FINDINGS W28 item 9, the box
+matrix's worst-block 7.65 at 38x head-norm spread): a 4-D recurrent
+state (B, H, K, V) is quantized as B*H PER-HEAD units of d=K*V (the
+production geometry: 32 units of 16,384, the SAME kind seed 101 at the
+per-head scale — the D3 frame contract at every scale), each unit with
+its OWN fp32 norm (the paper's per-vector norm recipe — Theorem 1
+applied per unit), through TurboQuant.quant_units' vectorized chain
+(ONE norm reduction + ONE batched fht + ONE batched searchsorted per
+bit-width + one pack per stream — no per-unit Python loop). The frame
+is the PERMUTED rotation y = FHT(P x) (P from seed+4545: the 2^14
+Hadamard's Kronecker alignment with the 128x128 matrix layout makes
+the plain rotation mismatch the codebook on rank-1/low-rank heads —
+measured 0.087/0.056 vs the 0.022 floor; the permutation restores the
+CLT — 0.0221 structure-independent; scripts/w28_tq_sim.py). Sim
+worst-head rel-MSE: 10.69 -> 0.023 at 55x spread, 297 -> 0.023 at
+525x. The layer's read path, snapshot codes and every §4 consumer see
+the SAME flat (B*H*K*V,) geometry (dequant returns the flat vector).
+
+s_flat=True (DEFAULT False) restores the W28 flat regime — ONE 524,288-
+dim unit, ONE norm, the legacy bit-exact path (the A/B flag; also the
+fallback for non-4-D states). Codes are self-describing: units codes
+decode through dequant's partition routing, flat codes through the
+legacy route — a mixed-regime install is REFUSED loudly by the frame
+guards (re-ingest the corpus at the per-head regime to install).
+
+M1/M2 stay on the flat single-unit regime this wave (documented:
+the memory subspace is INERT on the ingested corpora — zero-init
+gates, exact-zero codes — so the hazard is unmeasured there; the
+split decision rides the W21+ gates retrain, HANDOVER §5).
+
 Quantizer resolution: the production S shape hits the canonical kind
 (1×32×128×128 = 524,288). The conv unit resolves at the window's flat
 size rounded up to a multiple of 32 (the Qwen3.5 in_proj Q+V geometry:
@@ -238,7 +268,7 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
 
     def __init__(self, number_of_states: int = 1, bits: float = 3.5,
                  online: bool = True, graph_safe: bool = False,
-                 qjl: bool = False):
+                 qjl: bool = False, s_flat: bool = False):
         super().__init__(number_of_states=number_of_states)
         self.bits = float(bits)
         self.online = bool(online)
@@ -247,12 +277,28 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         self.graph_safe = bool(graph_safe)
         # W15: the Alg.-2 qjl A/B flag, plumbed through (default OFF).
         self.qjl = bool(qjl)
+        # W29: the per-head S mode (DEFAULT ON — the F2b repair, FINDINGS
+        # W28 item 9; s_flat=True restores the W28 flat single-unit regime
+        # for the A/B and the non-4-D fallback).
+        self.s_flat = bool(s_flat)
+        if self.qjl and not self.s_flat:
+            raise ValueError(
+                "TQLinearAttentionLayer: the W9.2 qjl A/B flag and the W29 "
+                "per-head S mode are mutually exclusive this wave (the "
+                "residual sketch is defined per FLAT unit; the units A/B "
+                "lands with the fused kernel chain) — pass s_flat=True to "
+                "run the qjl A/B on the legacy flat regime")
         self._tq_s: Optional[TurboQuant] = None
         self._tq_conv: Optional[TurboQuant] = None
         self._s_codes: Optional[TQCodes] = None
         self._conv_codes: Optional[TQCodes] = None
         self._s_shape: Optional[torch.Size] = None
         self._s_dtype: torch.dtype = torch.float16
+        # W29: the per-head S geometry — None in the flat regime; in the
+        # per-head regime (_s_units, _s_unit_d) = (B*H, K*V) of the
+        # learned state shape, and the quantizer is the PER-UNIT frame.
+        self._s_units: Optional[int] = None
+        self._s_unit_d: Optional[int] = None
         self._conv_shape: Optional[torch.Size] = None
         self._conv_dtype: torch.dtype = torch.float16
         self._conv_numel: Optional[int] = None   # real window size (pre-pad)
@@ -313,8 +359,29 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
             self._handed_conv = None
 
     def _init_s(self, tensor: torch.Tensor, state_idx: int) -> None:
+        """Resolve the S quantizer for the learned state geometry.
+
+        W29: a 4-D (B, H, K, V) state in the per-head mode (the default)
+        resolves B*H units of d=K*V — the per-unit quantizer KEEPS the
+        kind's seed (resolve_quantizer's custom-d path, the D3 frame
+        contract at every scale) and quant_units applies the per-unit
+        norms + the permuted rotation. Non-4-D states and s_flat=True
+        resolve the legacy flat unit at numel (bit-identical W28 path).
+        The 4-D shape must have H >= 1 and K*V == the resolved d — a
+        degenerate (K*V == 0) state falls back to the flat regime
+        (nothing to split)."""
         n = tensor.numel()
-        self._tq_s = resolve_quantizer("S", n, self.bits, qjl=self.qjl)
+        per_head = (not self.s_flat) and tensor.dim() == 4 \
+            and tensor.shape[1] >= 1 and tensor.shape[2] * tensor.shape[3] > 0
+        if per_head:
+            self._s_units = int(tensor.shape[0]) * int(tensor.shape[1])
+            self._s_unit_d = int(tensor.shape[2]) * int(tensor.shape[3])
+            self._tq_s = resolve_quantizer(
+                "S", self._s_unit_d, self.bits, qjl=self.qjl)
+        else:
+            self._s_units = None
+            self._s_unit_d = None
+            self._tq_s = resolve_quantizer("S", n, self.bits, qjl=self.qjl)
         self._s_shape = tuple(tensor.shape)
         self._s_dtype = tensor.dtype
         if self._device is None:
@@ -417,14 +484,27 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
                                state_idx: int = 0,
                                **kwargs) -> torch.Tensor:
         """Quantize-on-write for S; returns the dequantized state (the
-        read path — a transient, never persisted)."""
+        read path — a transient, never persisted).
+
+        W29: a per-head layer (4-D state, s_flat=False) quantizes the
+        (B, H, K, V) state as B*H PER-HEAD units — quant_units' ONE
+        vectorized pass, each unit its OWN norm (the paper's per-vector
+        recipe — the dynamic-range repair; the OLD path's single 524,288-
+        dim norm set the per-coordinate noise floor at the GLOBAL energy
+        and crushed the small heads at every decode step). The flat
+        regime is bit-identical to W28."""
         if not self.online:
             return super().update_recurrent_state(
                 recurrent_states, state_idx=state_idx, **kwargs)
         if not self.is_recurrent_states_initialized[state_idx]:
             self._init_s(recurrent_states, state_idx)
         self.writes["s"] += 1
-        self._s_codes = self._tq_s.quant(recurrent_states.reshape(-1))
+        if self._s_units is not None:
+            # the per-head regime: ONE vectorized quant over (B*H, K*V)
+            x2 = recurrent_states.reshape(self._s_units, self._s_unit_d)
+            self._s_codes = self._tq_s.quant_units(x2)
+        else:
+            self._s_codes = self._tq_s.quant(recurrent_states.reshape(-1))
         # W18: the dequant device parameter — the round-trip state lands
         # on the writer's device directly.
         out = self._tq_s.dequant(self._s_codes, dtype=self._s_dtype,
@@ -471,9 +551,21 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
     def s_codes(self, codes: Optional[TQCodes]) -> None:
         self._s_codes = codes
         if codes is not None:
+            units = int(codes.units) if getattr(codes, "units", None) is not None \
+                and codes.partition == "units" else None
             if not self.is_recurrent_states_initialized.get(0):
+                # the codes' OWN cardinals resolve the frame (self-
+                # describing): d is the PER-UNIT d on units codes — the
+                # kind's seed at the per-head scale (D3 at every scale).
                 self._tq_s = resolve_quantizer("S", codes.d, self.bits)
-                if self._s_shape is None:
+                if units is not None:
+                    self._s_units = units
+                    self._s_unit_d = int(codes.d)
+                    if self._s_shape is None:
+                        # flat until a real shape is known — the units
+                        # container's flat length (the §4 geometry)
+                        self._s_shape = (units * int(codes.d),)
+                elif self._s_shape is None:
                     self._s_shape = (codes.d,)  # flat until a real shape is known
                 self._s_dtype = torch.float16
                 # placement default for code-installed layers that never ran
@@ -486,7 +578,16 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
                 raise ValueError(
                     f"s_codes setter: codes.d={codes.d} != the layer's "
                     f"quantizer unit d={self._tq_s.d} (geometry/frame "
-                    f"drift — the codes and the layer must share the S frame)")
+                    f"drift — the codes and the layer must share the S frame; "
+                    f"a flat<->units regime mix is exactly this: re-ingest "
+                    f"the corpus at the layer's regime, W29)")
+            elif units is not None and self._s_units is not None \
+                    and units != self._s_units:
+                raise ValueError(
+                    f"s_codes setter: codes carry units={units} but the "
+                    f"layer's per-head geometry is {self._s_units} units of "
+                    f"d={self._s_unit_d} — a batch/head geometry drift (the "
+                    f"codes and the layer must share the per-head layout)")
             self.has_previous_state[0] = True
 
     @property
@@ -543,7 +644,12 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
         if s is not None and self._tq_s is None:
             self._init_s(s, 0)
         if s is not None:
-            out["s"] = self._tq_s.quant(s.reshape(-1))
+            if self._s_units is not None:
+                # W29: the per-head regime — quant_units over (B*H, K*V)
+                out["s"] = self._tq_s.quant_units(
+                    s.reshape(self._s_units, self._s_unit_d))
+            else:
+                out["s"] = self._tq_s.quant(s.reshape(-1))
         if c is not None and self._tq_conv is None:
             self._init_conv(c, 0, None)
         if c is not None:
@@ -616,16 +722,25 @@ class TQCache(DynamicCache):
     graph_safe (W9.2, DEFAULT False): the P7 flag — passed through to
     every TQLinearAttentionLayer (see that class + the module docstring;
     provably a no-op on CPU).
+
+    s_flat (W29, DEFAULT False = per-head ON): the F2b repair flag —
+    False quantizes the 4-D (B, H, K, V) recurrent state as B*H
+    per-head units (own norms, the paper's per-vector recipe);
+    True restores the W28 flat single-unit regime (the A/B).
     """
 
     def __init__(self, config=None, layer_types: Optional[Iterable[str]] = None,
                  bits: float = 3.5, online: bool = True,
-                 graph_safe: bool = False, qjl: bool = False):
+                 graph_safe: bool = False, qjl: bool = False,
+                 s_flat: bool = False):
         self._tq_bits = float(bits)
         self._online = bool(online)
         # W9.2 P7 flag (DEFAULT OFF) — passed through to every wrapped /
         # built TQLinearAttentionLayer; a no-op on CPU (module docstring).
         self._graph_safe = bool(graph_safe)
+        # W29: the per-head S mode (DEFAULT ON — the F2b repair, FINDINGS
+        # W28 item 9; s_flat=True restores the W28 flat regime for the A/B).
+        self._tq_s_flat = bool(s_flat)
         # W15: the paper's Alg.-2 qjl A/B flag, plumbed to every layer's
         # quantizers (DEFAULT OFF — the D1 A/B contract; the GPU box's
         # Phase-5 decision measures it end-to-end with TQCache(qjl=True)).
@@ -648,7 +763,8 @@ class TQCache(DynamicCache):
                 if lt == "linear_attention":
                     layers.append(TQLinearAttentionLayer(
                         bits=self._tq_bits, online=self._online,
-                        graph_safe=self._graph_safe, qjl=self._tq_qjl))
+                        graph_safe=self._graph_safe, qjl=self._tq_qjl,
+                        s_flat=self._tq_s_flat))
                 else:
                     cls = DYNAMIC_LAYER_TYPE_MAPPING.get(lt)
                     if cls is None:
@@ -668,7 +784,8 @@ class TQCache(DynamicCache):
                 self.layers[i] = TQLinearAttentionLayer(
                     number_of_states=layer.number_of_states,
                     bits=self._tq_bits, online=self._online,
-                    graph_safe=self._graph_safe, qjl=self._tq_qjl)
+                    graph_safe=self._graph_safe, qjl=self._tq_qjl,
+                    s_flat=self._tq_s_flat)
 
     def linear_layer_indices(self) -> List[int]:
         return [i for i, l in enumerate(self.layers)

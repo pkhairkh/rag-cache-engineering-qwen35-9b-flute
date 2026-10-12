@@ -156,7 +156,7 @@ class _StackModel(nn.Module):
 def _build_stub(layer_types=None, silent=()):
     """(layers ModuleList, bound TQCache) for a layer plan."""
     types = list(layer_types if layer_types is not None else SPEC_LAYER_TYPES)
-    cache = TQCache(layer_types=types)
+    cache = TQCache(layer_types=types, s_flat=True)
     layers = nn.ModuleList([
         _StubLinear(i, cache, write=(i not in silent)) if lt == LIN
         else _StubFull()
@@ -473,7 +473,7 @@ def test_bind_and_capture_loud_validation():
         hooks.attach(torch.zeros(3, device=DEVICE))
 
     # bind: cache plan disagrees with the hook map
-    cache4 = TQCache(layer_types=[LIN, FULL, LIN, FULL])
+    cache4 = TQCache(layer_types=[LIN, FULL, LIN, FULL], s_flat=True)
     with pytest.raises(ValueError, match="disagrees"):
         hooks.bind(cache4)
 
@@ -548,7 +548,7 @@ def test_real_model_integration():
     torch.manual_seed(21)
     m = modeling.Qwen3_5TextModel(cfg).eval().to(DEVICE)
 
-    cache = TQCache(config=cfg)
+    cache = TQCache(config=cfg, s_flat=True)
     hooks = CaptureHooks(plan)
     hooks.attach(m.layers)
     hooks.bind(cache)

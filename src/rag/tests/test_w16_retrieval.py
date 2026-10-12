@@ -94,7 +94,7 @@ QUERY_TOPIC = 2
 
 
 def _make_cache() -> TQCache:
-    return TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    return TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
 
 
 # ------------------------------------------------------------- the stub ---

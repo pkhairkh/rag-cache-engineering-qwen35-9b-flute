@@ -168,7 +168,7 @@ def _key_hash(key: tuple) -> int:
 
 
 def _make_cache() -> TQCache:
-    return TQCache(layer_types=LAYER_TYPES, bits=BITS)
+    return TQCache(layer_types=LAYER_TYPES, bits=BITS, s_flat=True)
 
 
 # ------------------------------------------------------------- the stub ---
