@@ -1,4 +1,4 @@
-# HANDOVER.md — the on-box agent handover (W29 · 2026-10-12)
+# HANDOVER.md — the on-box agent handover (W30 · 2026-10-12)
 
 **Who you are**: the A10G GPU-box agent. Your box owns the runtime —
 the venv, the palettized model artifacts, the ingested corpus, and
@@ -10,7 +10,7 @@ only if you want the why; this file is the what-to-run.
 
 ---
 
-## 0. The situation (60 seconds — updated after the W28 matrix verdict + the W29 repair)
+## 0. The situation (60 seconds — updated after the W29 re-run verdict + the W30 isolator)
 
 The W28 matrix RAN on this box and the verdict is CLASSIFIED:
 
@@ -28,6 +28,28 @@ The W28 matrix RAN on this box and the verdict is CLASSIFIED:
   history — W27's fixes (device alignment, forgery refusals, the
   regime diagnosis, the verdict band) are all still in.
 
+**The W29 re-run verdict (this box, 2026-10-12, pasted verbatim)**:
+the repair reached the FLOOR at the probe — `[W29 per-head units]`
+worst-block rel-MSE 0.0234, spread-independent, kernel parity exact —
+but **G2/G4 are STILL garbage** (conf 0.527, rep 0.87, the text
+degenerates at token 3; the flat A/B's multilingual soup is GONE —
+the degenerate text is English now, a different failure mode). The
+dev box re-read every hop of the real path (the decode read -> the
+GDN recurrence -> the write): NO wiring defect — the read and the
+write share ONE quantizer instance (the frame cannot mismatch), the
+(B,H,K,V) -> (B*H,K*V) reshape is exact, the dequant computes fp32
+and casts once. The surviving candidate is **F2c, the compounding
+hazard**: the online regime requantizes S at EVERY decode step and
+the dequantized state feeds back into the GDN recurrence — one floor
+round is a 15% NORM perturbation (sqrt of 0.022) per GDN layer per
+step, and the paper's 3.5-bit parity is a ONE-SHOT KV-cache claim
+(softmax averaging over the context; no recurrence, no requant —
+FINDINGS W30 item 17). The bits ceiling is 4 (the Lloyd-Max codebook
+range, the constructor refuses eff bits > 4) — raising bits cannot
+reach fp16-level noise. **W30 ships THE NOISE ISOLATOR (Gate 0.6)**:
+five structural cells + the real-path telemetry that name the cause
+with this box's own numbers.
+
 **The repair is IN (W29, tag w29-per-head)**: the S state now
 quantizes as 32 PER-HEAD units of d=16,384, each with its OWN fp norm
 (the paper's per-vector recipe), in the PERMUTED rotation frame (the
@@ -36,9 +58,13 @@ required it — FINDINGS W29 item 15; sim: worst-head 10.69 -> 0.023 at
 55x, 297 -> 0.023 at 525x). Python-only — **no kernel rebuild needed**
 (the per-head path rides the torch twin; the kernel pair is untouched).
 
-**Your job**: pull, run Gate Zero (pytest, incl. the NEW W29 file),
-re-run Gate 0.5 (the matrix — the repair is the DEFAULT now), then
-the re-ingest + the W27 ladder (§2). No code changes on your side.
+**Your job**: pull, run Gate Zero (pytest — the W29 file's type-cop
+test carried an authored-test bug, FIXED in W30; re-run it), then
+**Gate 0.6 — THE NOISE ISOLATOR** (the W30 decision measurement
+below). The ladder (§2) and the re-ingest (§2.5) remain queued, but
+their answer gates may be dominated by the online noise until the
+W31 mitigation lands — run the isolator FIRST and paste it whole. No
+code changes on your side.
 
 ### 0.1 The gates-artifact situation (why the ladder is gateless)
 
@@ -80,7 +106,7 @@ git remote add origin \
   https://pkhairkh:${GHA_TOKEN}@github.com/pkhairkh/rag-cache-engineering-qwen35-9b-flute.git
 git fetch origin
 git reset --hard origin/main        # the code becomes exactly the repo
-git describe --tags                 # MUST print w29-per-head or later
+git describe --tags                 # MUST print w30-noise-isolator or later
 source /home/ubuntu/venv/bin/activate
 # W28 — REBUILD THE EXTENSION (the repo is a copy, not a build): a
 # stale .so under new wrappers produces silently wrong numbers.
@@ -113,6 +139,11 @@ python -m pytest "src/rag/tests/test_query.py::test_query_cache_vector_device_al
 # here): the vectorization pin, the dynamic-range immunity (incl. the
 # production geometry), the codes contract, the wiring, the sums, the
 # disk edge. ~2-4 min on CPU-torch; no GPU needed.
+# W30: the type-cop test's two `codes.norm.reshape(())` sites raised
+# torch RuntimeError BEFORE the constructor's TypeError could fire
+# (reshape(()) on a 4-element tensor is illegal) — FIXED to
+# `codes.norm[:1].reshape(())` (a true 0-dim, 1 element); re-run
+# after pulling — all 19 should PASS now.
 python -m pytest src/rag/tests/test_w29_per_head.py -x
 ```
 
@@ -151,6 +182,45 @@ row's 7.65). Expected: **G1/G2/G3/G4 all CLEAN**; the --s-flat control
 reproduces the W28 soup (G2/G4 garbage) — the controlled proof the
 per-head regime is what closed it. If anything is NOT clean, the
 printed decision tree names the branch.
+
+**Gate 0.6 — THE E2E NOISE ISOLATOR (W30, THE next step)**
+
+The W29 re-run left exactly one question: the probe is at the floor,
+the wiring reads clean, the text still garbles — WHAT kills
+generation? This command answers it with five structural cells plus
+the real-path telemetry:
+
+- **C0** raw DynamicCache — the reference
+- **C1** TQ online 3.5 — the failure, TELEMETRY ON (per-write S
+  round-trip rel-MSE in the real path — the direct floor check; the
+  conv round-trip; the energy trajectory; the head spread)
+- **C2** TQ online 4.0 — the bits ceiling (the constructor's 1..4
+  Lloyd-Max range — the ladder's top rung, still ~9.7% norm/step)
+- **C3** TQ online 3.5 + THE S-EXACT INSTRUMENT — every write stores
+  the EXACT state, the read returns it verbatim, the codes requant
+  every K-th write; the conv store stays fully online. A measurement
+  patched onto the cache INSTANCE only (the --trace idiom — the
+  library is untouched, nothing persists)
+- **C4** TQ online=False — the D4 regime: raw during forward, codes
+  only at snapshot — the plumbing control
+
+```bash
+python3 scripts/gpu/tq_noise_isolator.py --max-new-tokens 48
+# optional: a tighter requant cadence for the S-exact cell
+python3 scripts/gpu/tq_noise_isolator.py --s-exact-every 8
+```
+
+Paste the WHOLE output. The printed decision tree maps the cells to
+causes: **C4 != C0** = plumbing (beyond the stubs — re-run the matrix
+with --trace); **C4 == C3 == C0 clean with C1 garbage** = **F2c
+CONFIRMED** — the S per-step requant noise compounds through the
+recurrence, the conv store is exonerated, and the W31 mitigation
+decision (requant cadence with an exact working copy / D4-for-decode /
+bits) rides these very numbers; **C3 garbage** = the conv store
+contributes; **the C1 telemetry off the floor** = a real wiring
+divergence (paste the telemetry table whole). Each cell also prints
+the FIRST-DIVERGENCE token index vs C0 (greedy is deterministic —
+the index is exact).
 
 ---
 
@@ -357,7 +427,7 @@ a one-line follow-up commit (not you).
 
 ---
 
-## 8. Map of the W27/W29 change (where to look in the code)
+## 8. Map of the W27/W29/W30 change (where to look in the code)
 
 | file | what |
 |---|---|
@@ -373,10 +443,11 @@ a one-line follow-up commit (not you).
 | `src/rag/install.py` | **W29**: `_requant_flat` (the sums' requant routed on the codes' partition — units sums keep per-unit norms) + `_units_guard` (the mixed-regime REFUSAL, re-ingest hint) in both sums |
 | `src/rag/snapshot.py` | **W29**: `_read_unit`'s units validation (units present-iff-units, the (M,) norm, the M×L stream lengths) + the digest's units bytes |
 | `src/rag/ingest.py` | **W29**: `reference()`'s norms-vector fold (the system-state hash) |
-| `FINDINGS.md` | Errata W27 (items 4–7) + Errata W28 (items 8–12) + **Errata W29 (items 13–16: the box verdict classified, the per-head repair, the Kronecker discovery, the surface map)** |
+| `FINDINGS.md` | Errata W27 (items 4–7) + Errata W28 (items 8–12) + **Errata W29 (items 13–16: the box verdict classified, the per-head repair, the Kronecker discovery, the surface map)** + **Errata W30 (items 17–19: F2c the compounding hazard — the paper's one-shot KV parity vs the recurrent requant, the floor math, the bits ceiling + the isolator design)** |
 | `scripts/gpu/tq_gen_matrix.py` | W28 the localizer; **W29**: the `[W29 per-head units]` probe row, the honest generate() conf (output_scores), the `--s-flat` A/B flag, the updated verdict tree |
 | `scripts/w28_tq_sim.py` | the numpy reproduction — **W29**: the per-head regime rows (the permuted frame; worst-head 10.69→0.023 at 55x, 297→0.023 at 525x) |
-| `src/rag/tests/test_w29_per_head.py` | **W29** (AUTHORED, PENDING this box): the vectorization pin, the dynamic-range immunity (d=1,024 + the production geometry), the codes contract + serialization, the seed-addressed frame, the layer wiring, zero-norm units, the install sums, the disk edge, the refusals |
+| `src/rag/tests/test_w29_per_head.py` | **W29** (AUTHORED, PENDING this box): the vectorization pin, the dynamic-range immunity (d=1,024 + the production geometry), the codes contract + serialization, the seed-addressed frame, the layer wiring, zero-norm units, the install sums, the disk edge, the refusals · **W30**: the type-cop test's two `reshape(())` sites fixed to true 0-dim norms (the authored-test bug the box's Gate Zero caught) |
+| `scripts/gpu/tq_noise_isolator.py` | **W30 — THE E2E NOISE ISOLATOR (Gate 0.6)**: the five structural cells (raw / the instrumented failure / the 4-bit ceiling / the S-exact instrument K-cadence / the D4 offline control) + the real-path telemetry (per-write S and conv round-trips, the energy trajectory, the head spread) + the first-divergence metric + the decision tree. INSTANCE-level instrumentation only — the library is untouched |
 | `src/rag/tests/test_tq_cache.py` + the W16–W19 suites | **W29**: pinned to `s_flat=True` (their authored flat semantics preserved — the per-head coverage is the W29 file's) |
 | `m1m2_gates_trained_fixed.npz`, `m1m2_gates_trained_w26.npz` | **DELETED** (the hermes forgeries — refused by W27.2; the full box log that motivated them is preserved at commit `a9bbda2`) |
 

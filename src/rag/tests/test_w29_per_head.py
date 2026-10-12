@@ -280,7 +280,11 @@ def test_units_codes_type_cops_refuse_loudly():
     at construction."""
     q, x2, codes = _mk_units_codes()
     with pytest.raises(TypeError, match="norm"):
-        TQCodes(codes.kind, codes.d, codes.norm.reshape(()),
+        # a TRUE 0-dim norm (1 element) — reshape(()) on the 4-element
+        # norms vector itself raises RuntimeError in torch BEFORE the
+        # constructor's type cops can fire (the authored-test bug the
+        # box's Gate Zero caught, W29.2)
+        TQCodes(codes.kind, codes.d, codes.norm[:1].reshape(()),
                 codes.bits_lo, codes.bits_hi, codes.n_lo, codes.n_hi,
                 codes.idx_lo, codes.idx_hi, codes.seed,
                 partition="units", units=codes.units)
@@ -290,7 +294,9 @@ def test_units_codes_type_cops_refuse_loudly():
                 codes.idx_lo, codes.idx_hi, codes.seed,
                 partition="units", units=None)
     with pytest.raises(TypeError, match="stray units|units"):
-        TQCodes(codes.kind, codes.d, codes.norm.reshape(()),
+        # 0-dim norm is the CORRECT type for a half unit — the stray
+        # units count is the corruption under test here
+        TQCodes(codes.kind, codes.d, codes.norm[:1].reshape(()),
                 codes.bits_lo, codes.bits_hi, codes.n_lo, codes.n_hi,
                 codes.idx_lo, codes.idx_hi, codes.seed,
                 partition="half", units=4)

@@ -2649,3 +2649,69 @@ W29 (the matrix re-run instructions, Gate Zero's fifth pytest block,
 W29 registered; commits + tag w29-per-head pushed.
 DO-D: the auditor's --wave W29 run (28/28) + --all (25/25 waves) on
 the box.
+
+## WAVE W30 — the noise-isolation wave: the W29 re-run verdict read
+(the repair at the floor, the E2E still broken), F2c named, the
+isolator shipped
+
+The box's W29 re-run (pasted verbatim, 2026-10-12): the [W29 per-head
+units] probe at the floor (worst-block 0.0234, spread-independent,
+parity exact) but G2/G4 still garbage (conf 0.527, rep 0.87 — English
+degenerate text now, NOT the W28 soup: the repair is live and changed
+the numerics; the floor itself is fatal). The dev box re-read every
+hop of the real path (modeling.py:691-718, the _StateView read,
+update_recurrent_state, quant_units/_dequant_units, the conv lazy
+re-capture) + the paper's assumptions: NO wiring defect; the paper's
+3.5-bit parity is a ONE-SHOT KV-cache claim (no recurrence, no
+requant, softmax averaging). F2c — the compounding hazard — named
+(FINDINGS W30 item 17): the online regime requantizes S every decode
+step, the dequantized state feeds back into the recurrence, and one
+floor round is a 15% NORM perturbation per GDN layer per step. The
+bits ceiling is 4 (the Lloyd-Max codebook range) — the fix is
+structural, not a bits knob.
+
+#### W30.0 — the authored-test fix (the box's Gate Zero catch)
+- [x] done
+ROLE test author · EDIT src/rag/tests/test_w29_per_head.py: the
+type-cop test's two `codes.norm.reshape(())` sites raised torch
+RuntimeError (reshape(()) on a 4-element tensor) BEFORE the
+constructor's TypeError could fire — fixed to
+`codes.norm[:1].reshape(())` (a true 0-dim, 1 element) in both the
+norm case and the stray-units case.
+DO-D: the box's re-run — 19/19 PASS.
+
+#### W30.1 — THE E2E NOISE ISOLATOR (the decision measurement)
+- [x] done (AUTHORED, PENDING the box)
+ROLE core author · WRITE scripts/gpu/tq_noise_isolator.py: five
+structural cells (C0 raw reference / C1 TQ online 3.5 INSTRUMENTED /
+C2 TQ online 4.0 the bits ceiling / C3 the S-EXACT INSTRUMENT — the
+exact state at every write, the read verbatim, the codes requant
+every K-th, the conv store online — patched onto the cache INSTANCE
+only / C4 online=False the D4 plumbing control) + the real-path
+telemetry (per-write S round-trip rel-MSE — the floor measured IN
+the path, naming the layer if off; the conv round-trip; the energy
+trajectory; the head spread) + the first-divergence token index vs
+C0 + the printed decision tree (C4≠C0 plumbing; C4==C3==C0 clean
+with C1 garbage F2c CONFIRMED; C3 garbage the conv contributes; the
+telemetry off the floor a real wiring divergence).
+DO-D: python3 -m py_compile scripts/gpu/tq_noise_isolator.py exit 0.
+
+#### W30.2 — the docs + the auditor + the commit
+- [x] done
+ROLE core author · FINDINGS.md Errata W30 (items 17-19: F2c the
+compounding hazard — the paper's one-shot KV parity vs the recurrent
+requant; the bits ceiling; the isolator design) + HANDOVER.md W30
+(the situation, the tag check, Gate Zero's W29-fix note, Gate 0.6 =
+the isolator, §8's rows) + this wave. The auditor wave W30
+registered; commit + tag w30-noise-isolator pushed.
+DO-D: the auditor's --wave W30 run green + --all (26/26 waves).
+
+#### W30.3 — the box run (the handover owns it)
+- [x] done (AUTHORED — PENDING the box run; HANDOVER Gate 0.6 is the
+instruction, the paste-back is the measurement)
+ROLE box agent · pull >= w30-noise-isolator; Gate Zero (the fixed
+W29 file — 19/19); **Gate 0.6**: python3 scripts/gpu/
+tq_noise_isolator.py --max-new-tokens 48; paste the WHOLE output
+(the W31 mitigation decision — requant cadence with an exact working
+copy / D4-for-decode / bits — rides these numbers).
+DO-D: the isolator's five cells + the verdict tree pasted back.

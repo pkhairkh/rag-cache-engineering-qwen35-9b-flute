@@ -640,3 +640,83 @@ answer as G1.
     W29.4). Tests: test_w29_per_head.py (AUTHORED, PENDING the box);
     the existing suites pinned to s_flat=True (their authored flat
     semantics preserved — 70 sites).
+
+## Errata (W30 — the W29 re-run verdict: the repair reached the floor, the E2E is still broken; F2c named, the isolator shipped)
+
+The box's W29 re-run (2026-10-12, pasted verbatim): the probe's
+[W29 per-head units] row measured **worst-block rel-MSE 0.0234 — the
+floor, spread-independent** (vs the flat row's 7.65), kernel parity
+exact, the regime line PER-HEAD active — yet **G2/G4 are STILL
+GARBAGE** (conf 0.527, rep 0.87, the text `'\n\nHow\n\r\n'` — it
+degenerates at token 3). The failure MODE changed (W28's flat regime:
+multilingual soup, small heads crushed; W29's per-head floor:
+English tokens, a degenerate repeat loop) — the repair IS live in the
+path and it DID change the numerics; the noise floor itself remains
+fatal. The dev box re-read every hop of the real path —
+modeling.py:691-718 (the decode read → the fused GDN step → the
+write), the _StateView read, update_recurrent_state, quant_units/
+_dequant_units, the conv lazy re-capture — and found **NO wiring
+defect**: the read and the write share ONE quantizer instance (the
+permuted frame cannot mismatch itself), the (B,H,K,V)→(B*H,K*V)
+reshape matches quant_units' contract exactly, dequant computes fp32
+and casts once at the end, the stub tests pin the identical code.
+
+17. **F2c — the compounding hazard (the named candidate).** The
+    online regime quantizes-on-write at EVERY decode step and the
+    dequantized state FEEDS BACK into the recurrence (modeling.py
+    reads `recurrent_states[0]` as the fused kernel's initial_state
+    every step; the write's return is discarded). One round of the
+    3.5-bit floor is rel-MSE ~0.022 = a **15% NORM perturbation**
+    (sqrt) of the state per GDN layer per step. The paper's 3.5-bit
+    parity claim (LongBench 50.06 vs 50.06, abstract: "absolute
+    quality neutrality with 3.5 bits") is a **KV-cache claim**: each
+    token's d=128 vector is quantized ONCE at write, read back under
+    softmax averaging over the whole context — no recurrence, no
+    feedback, no requantization of an evolving state; Theorem 1's
+    D_mse bounds are per-unit ONE-SHOT. The GDN recurrence has none
+    of that averaging: the error compounds as E_t = λ·E_{t-1} + ε_t
+    across steps AND is injected at every GDN layer simultaneously —
+    the exact regime the paper never analyzes. The first two tokens
+    matching G1 and the token-3 flip are the compounding signature
+    (thin margins flip, then the trajectory degenerates).
+
+18. **THE BITS CEILING (why "raise the bits" is not the fix).**
+    TurboQuant's constructor refuses realized bit-widths outside the
+    Lloyd-Max codebook range **1..4** (the paper solved codebooks for
+    b=1..4 only — the Panter-Dite high-resolution formula for b>4
+    stays in the theory). The achievable ladder tops out at 4.0
+    uniform: D_mse 0.009 ≈ a 9.7% norm perturbation per layer per
+    step — still ~200x fp16 rounding (~0.05% norm). The mitigation
+    decision is therefore STRUCTURAL, not a bits knob: (a) requant
+    CADENCE with an exact working copy (the loop rides the exact
+    state; the codes refresh every K writes; ~1 MiB/layer at B=1
+    decode — ~30 MiB total, nothing on the A10G), (b) D4-for-decode
+    (online=False during generation; codes at snapshot boundaries —
+    the ingest/disk surfaces unchanged), (c) bits=4 as a partial
+    supplement. The honest accounting: online=True's value is
+    multi-stream SERVING memory; at B=1 RAG decode it buys nothing
+    measurable and costs the generation surface.
+
+19. **THE W30 MEASUREMENT (tq_noise_isolator.py — the box decides).**
+    Five structural cells + the real-path telemetry: **C0** raw (the
+    reference); **C1** TQ online 3.5 INSTRUMENTED (per-write S
+    round-trip rel-MSE — the floor measured IN the real path; if it
+    is NOT ~0.022 the wiring DOES differ and the table names the
+    layer; the conv round-trip at every lazy re-capture; the energy
+    trajectory; the head spread); **C2** TQ online 4.0 (the ceiling);
+    **C3** the S-EXACT INSTRUMENT (every write stores the exact state,
+    the read returns it verbatim, the codes requant every K-th write,
+    the conv store stays online — patched onto the cache INSTANCE,
+    the library untouched); **C4** online=False (the D4 plumbing
+    control). The decision tree: C4≠C0 → plumbing; C4==C3==C0 clean
+    with C1 garbage → **F2c CONFIRMED** (the conv exonerated, W31
+    lands the cadence/D4 decision on these numbers); C3 garbage → the
+    conv store contributes; C1 telemetry off the floor → a real
+    wiring divergence. Each cell prints the first-divergence token
+    index vs C0 (greedy is deterministic). ALSO W30.0: the W29
+    authored-test bug — test_w29_per_head.py's type-cop case passed
+    `codes.norm.reshape(())` (a 4-element tensor) which raises torch
+    RuntimeError BEFORE the constructor's TypeError could fire; fixed
+    to `codes.norm[:1].reshape(())` (a true 0-dim) in both sites —
+    the box's Gate Zero caught the test's own bug, exactly what Gate
+    Zero is for.
