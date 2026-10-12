@@ -1350,7 +1350,7 @@ CHECKS = {
         {"kind": "grep", "target": "scripts/w28_tq_sim.py",
          "pattern": r"def quant_dequant"},
         {"kind": "grep", "target": "scripts/w28_tq_sim.py",
-         "pattern": r"per-head-norm spread"},
+         "pattern": r"head_norm_spread"},
         {"kind": "py_compile", "target": "scripts/w28_tq_sim.py"},
         # W28.3 — the localizer (the 2x2 matrix + parity + trace)
         {"kind": "grep", "target": "scripts/gpu/tq_gen_matrix.py",
