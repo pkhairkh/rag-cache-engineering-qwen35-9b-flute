@@ -833,3 +833,35 @@ def test_nonpow2_conv_offline_snapshot():
     v = layer._tq_conv.dequant(codes, dtype=torch.float32, device=DEVICE)
     stripped = v[: 24576].reshape(*CONV_NP2_UNIT)     # the pad strip
     assert _rel_mse(stripped, raw) < REL_MSE_GATE     # measured 0.016
+
+
+# --- contract 12: W28 protocol guards (the generate() machinery) ------------- #
+def test_w28_protocol_guards_refuse_loudly():
+    """The Cache-protocol mutation surface a generate() path may invoke
+    (crop / batch_repeat_interleave / reorder_cache) on a TQ layer with
+    CODE stores refuses LOUDLY (NotImplementedError naming the W28
+    guard), never a silent parent fallback that would corrupt codes
+    through raw-tensor arithmetic. The malfunction-localizer
+    scripts/gpu/tq_gen_matrix.py --trace prints the exact call sequence
+    when one of these fires on the GPU box."""
+    cache = TQCache(layer_types=["linear_attention", "full_attention"])
+    layer = cache.layers[0]
+    for meth in ("crop", "batch_repeat_interleave", "reorder_cache"):
+        fn = getattr(layer, meth, None)
+        assert callable(fn), f"missing {meth} on TQLinearAttentionLayer"
+        with pytest.raises(NotImplementedError, match="TurboQuant code"):
+            fn([0])
+    # the cache-level walk: a DynamicCache-level crop that reaches the
+    # TQ layer MUST propagate the refusal (whichever dispatch the
+    # installed transformers uses, the layer's guard is the floor)
+    try:
+        cache.crop(8)
+    except NotImplementedError:
+        pass          # the guard propagated — the intended contract
+    except Exception as exc:  # a raw-tensor parent fallback: the bug
+        pytest.fail(
+            f"DynamicCache.crop reached a non-guard path on a TQ layer: "
+            f"{type(exc).__name__}: {exc}")
+    # (no error at all is ALSO suspicious but transformers-version
+    # dependent — the layer-level guards above are the hard pin; the
+    # box's tq_gen_matrix.py --trace is the runtime evidence)

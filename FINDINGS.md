@@ -488,3 +488,76 @@ session log). Verdict per leg, with the new evidence:
    contract changed: oracle mode still computes the (now
    crash-free) query vector, the install still overwrites the codes
    the prefill left.
+
+---
+
+## Errata (W28 — "TQ is the broken part": the user's direct measurement, classified)
+
+The user's new evidence (2026-10-12, the box, `scripts/gpu/test_base_gen.py`,
+verbatim paste): the palettized model with **NO M1/M2, no corpus, no
+install — just `TQCache(config, bits=3.5, online=True)` +
+`model.generate()` — produces multilingual soup**, while the model
+without TurboQuant "performs very well". This is F2 measured DIRECTLY
+and in its purest form yet. The classification, after a full re-read of
+every TQ-relevant file (turboquant.py, tq_cache.py, tq_codes.py,
+codebooks.py, fht.py, kernel_tq.cu, bindings.cpp) against the paper
+(arXiv:2504.19874v1, the uploaded tar):
+
+8. **The TQ core math is CORRECT — verified three ways.** (a) Static:
+   the quant/dequant pair, the FHT forward/adjoint pair (signs on the
+   output in the forward, on the input in the adjoint — both torch and
+   kernel), the boundary-scaling identity, the kernel binding
+   signatures vs the Python call sites, the split sub-quantizer
+   geometry: all exact. (b) The committed codebook npz tables carry the
+   paper's constants (mse_per_variance 0.0345/0.0095 at b=3/4; centroids
+   at the correct 1/sqrt(d) scale). (c) An independent numpy
+   reproduction (scripts/w28_tq_sim.py — the repo's exact math, no repo
+   imports) measures the round-trip at **2.2% total rel-MSE on Gaussian
+   inputs**, matching every green gate. **F2 is NOT a wrong formula.**
+9. **THE REAL FINDING (F2b, new): the per-unit norm + shared codebook
+   over the CONCATENATED 32-head S unit is a dynamic-range hazard.**
+   The GDN state (1, 32, 128, 128) is quantized as ONE 524,288-dim unit
+   with ONE fp norm; the codebook noise floor per coordinate is set by
+   the GLOBAL norm (the dominant heads' energy). Sim (same script):
+   at a 55x per-head norm spread the smallest head's rel-MSE is
+   **10.7 (signal fully replaced by noise)**; at 525x it is **297**;
+   the TOTAL stays 2.7% — **which is exactly why every green budget
+   gate (all measured on equal-energy Gaussian states / total rel-MSE)
+   missed it**. The W14 "0.15 corruption budget" and the W15 "0.3%/step
+   online decode" measurements are TOTAL-energy metrics: they cannot
+   see per-head fidelity. THE REPAIR (if the box matrix confirms — see
+   item 10): quantize S per head (32 units of 16,384 dims, own norm
+   each) — a PROPOSAL D2 unit-mapping change that requires re-ingest.
+10. **The generate()-interplay gap (never gated).** Every historically
+    CLEAN TQCache result drove the model with a MANUAL greedy loop (the
+    box's 2026-10-10 session: TQCache + manual loop = "Paris<|im_end|>"
+    — but that tree predates W15/W20 and was never re-gated); the
+    user's failing test uses **`model.generate()`**, which exercises
+    Cache-protocol machinery (crop / prepare / get_seq_length / trace
+    paths) the TQ layer has NO gate for. The repo has NEVER run
+    TQCache+generate until the user did. **scripts/gpu/
+    tq_gen_matrix.py (W28) localizes it in one run**: the 2x2 matrix
+    (raw/TQ x manual/generate, the same prompt), a kernel-vs-torch
+    parity probe at production geometry on THREE distributions
+    (including the per-head-spread states, reporting PER-BLOCK
+    rel-MSE), a build-state report, and --trace (every Cache method
+    call printed). The verdict tree: G2 garbage -> F2b (item 9); G2
+    clean + G4 garbage -> the generate() interplay (the protocol
+    guards below name the culprit if it is crop/batch_repeat); G3
+    garbage -> not TQ at all.
+11. **The build-staleness hazard (the copy problem).** The box repo is
+    a plain COPY, not a build: the venv's flute_extended._C must match
+    the copied source, and the kernel sources changed AFTER the box's
+    last verified build (W20.9.5's QJL constants fix was itself a
+    box-side discovery). A stale .so under new wrappers produces
+    silently wrong numbers — the matrix's [0] parity probe measures
+    this with numbers (a kernel-vs-torch divergence > 1e-4 on ANY
+    distribution = rebuild). The HANDOVER's W28 bootstrap adds the
+    rebuild step.
+12. **W28 guards (tq_cache.py):** the Cache-protocol mutation surface a
+    generate() path may invoke — `crop`, `batch_repeat_interleave` (+
+    the existing `reorder_cache`) — now refuses LOUDLY on TQ layers
+    (NotImplementedError naming the guard) instead of falling through
+    the parent's raw-tensor arithmetic on code stores. Pinned by
+    test_tq_cache.py's contract 12. The read/write quantize paths are
+    UNTOUCHED (default bit-identical).

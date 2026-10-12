@@ -1345,6 +1345,51 @@ CHECKS = {
         {"kind": "git_log", "target": "W27.1 —"},
         {"kind": "git_tag", "target": "w27-ladder-repair"},
     ],
+    "W28": [
+        # W28.1 — the verification (the sim + the paper)
+        {"kind": "grep", "target": "scripts/w28_tq_sim.py",
+         "pattern": r"def quant_dequant"},
+        {"kind": "grep", "target": "scripts/w28_tq_sim.py",
+         "pattern": r"per-head-norm spread"},
+        {"kind": "py_compile", "target": "scripts/w28_tq_sim.py"},
+        # W28.3 — the localizer (the 2x2 matrix + parity + trace)
+        {"kind": "grep", "target": "scripts/gpu/tq_gen_matrix.py",
+         "pattern": r"def manual_greedy"},
+        {"kind": "grep", "target": "scripts/gpu/tq_gen_matrix.py",
+         "pattern": r"def generate_greedy"},
+        {"kind": "grep", "target": "scripts/gpu/tq_gen_matrix.py",
+         "pattern": r"def build_and_parity_report"},
+        {"kind": "grep", "target": "scripts/gpu/tq_gen_matrix.py",
+         "pattern": r"trace_cache_calls"},
+        {"kind": "grep", "target": "scripts/gpu/tq_gen_matrix.py",
+         "pattern": r"PER-BLOCK rel-MSE"},
+        {"kind": "py_compile", "target": "scripts/gpu/tq_gen_matrix.py"},
+        # W28.4 — the protocol guards (loud, never silent)
+        {"kind": "grep", "target": "src/rag/tq_cache.py",
+         "pattern": r"def crop"},
+        {"kind": "grep", "target": "src/rag/tq_cache.py",
+         "pattern": r"def batch_repeat_interleave"},
+        {"kind": "grep", "target": "src/rag/tq_cache.py",
+         "pattern": r"W28 guard"},
+        {"kind": "py_compile", "target": "src/rag/tq_cache.py"},
+        # the guard gate (AUTHORED, PENDING the A10G box)
+        {"kind": "grep", "target": "src/rag/tests/test_tq_cache.py",
+         "pattern": r"test_w28_protocol_guards_refuse_loudly"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_tq_cache.py"},
+        # W28.5 — the docs
+        {"kind": "grep", "target": "FINDINGS.md",
+         "pattern": r"## Errata \(W28"},
+        {"kind": "grep", "target": "HANDOVER.md",
+         "pattern": r"tq_gen_matrix"},
+        {"kind": "grep", "target": "HANDOVER.md",
+         "pattern": r"REBUILD THE EXTENSION"},
+        {"kind": "grep", "target": "TASKS.md",
+         "pattern": r"## WAVE W28"},
+        {"kind": "ledger", "target": "W28"},
+        {"kind": "py_compile", "target": "scripts/w20_static_audit.py"},
+        {"kind": "git_log", "target": "W28.1 —"},
+        {"kind": "git_tag", "target": "w28-tq-repair"},
+    ],
 }
 
 

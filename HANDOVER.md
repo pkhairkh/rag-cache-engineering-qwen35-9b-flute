@@ -1,4 +1,4 @@
-# HANDOVER.md — the on-box agent handover (W27 · 2026-10-12)
+# HANDOVER.md — the on-box agent handover (W28 · 2026-10-12)
 
 **Who you are**: the A10G GPU-box agent. Your box owns the runtime —
 the venv, the palettized model artifacts, the ingested corpus, and
@@ -23,7 +23,9 @@ measure what it was designed to measure:
   codes vs model-device S codes) — **before the install ever ran**.
   The F1-vs-F3 isolation the ladder exists for NEVER HAPPENED.
 
-The fixes are in the repo, behind tag `w27-ladder-repair`:
+The fixes are in the repo, behind tag `w28-tq-repair` (W27: the ladder
+repair — see FINDINGS Errata W27; W28: the TQ localizer — see Errata
+W28):
 
 - **W27.1** — the device crash is fixed at the crash site (uniform
   flows bit-identical).
@@ -84,8 +86,13 @@ git remote add origin \
   https://pkhairkh:${GHA_TOKEN}@github.com/pkhairkh/rag-cache-engineering-qwen35-9b-flute.git
 git fetch origin
 git reset --hard origin/main        # the code becomes exactly the repo
-git describe --tags                 # MUST print w27-ladder-repair or later
+git describe --tags                 # MUST print w28-tq-repair or later
 source /home/ubuntu/venv/bin/activate
+# W28 — REBUILD THE EXTENSION (the repo is a copy, not a build): the
+# kernel sources changed after the box's last verified build, and a
+# stale .so under new wrappers produces silently wrong numbers
+cd src/flute_extended && pip install -e . --no-build-isolation && cd ../..
+python3 -c "import sys; sys.path.insert(0,'src/rag'); sys.path.insert(0,'src/flute_extended'); import turboquant; print('TQ kernels:', 'present' if turboquant._load_tq_kernel() is not None else 'ABSENT (torch twin)')"
 ```
 
 (If `scripts/gpu/run_query.py` carries the old sed hotfix, the reset
@@ -104,14 +111,37 @@ driver defaults already.
 python -m pytest src/rag/tests/test_w27_regime_guards.py -x
 python -m pytest "src/rag/tests/test_query.py::test_query_cache_vector_device_alignment" \
                  "src/rag/tests/test_query.py::test_corpus_memory_state_real_loader" \
-                 "src/rag/tests/test_query.py::test_install_gdn_best_mode" -x
+                 "src/rag/tests/test_query.py::test_install_gdn_best_mode" \
+                 "src/rag/tests/test_tq_cache.py::test_w28_protocol_guards_refuse_loudly" -x
 ```
 
 Expect PASS on all. If anything FAILS, stop and paste the assert —
 do not patch. The first file closes the forgery path (regime meta +
 broadcast signature + the corpus-regime trichotomy); the second
 reproduces and closes the E2/E3 device crash; the third is the W26
-install gate.
+install gate; the fourth pins the W28 protocol guards.
+
+**Gate 0.5 — THE TQ MALFUNCTION LOCALIZER (W28, run BEFORE the ladder)**
+
+The user's direct measurement: the model + `TQCache(online=True)` +
+`model.generate()` = soup; the model without TurboQuant = fine. This
+ONE command localizes it (the 2x2 generation matrix raw/TQ x
+manual/generate + the kernel parity probe at production geometry on
+Gaussian / heavy-tail / per-head-spread states + the build report):
+
+```bash
+python3 scripts/gpu/tq_gen_matrix.py --max-new-tokens 48
+# if the verdict says "the generate() interplay":
+python3 scripts/gpu/tq_gen_matrix.py --trace --max-new-tokens 8
+```
+
+Paste the WHOLE output. The printed decision tree names the branch:
+G2 (TQ + manual loop) garbage = the quantizer on real states (read
+[0]'s PER-BLOCK rel-MSE row — the per-head dynamic-range finding,
+FINDINGS W28 item 9); G2 clean + G4 (generate) garbage = the
+generate()/Cache-protocol interplay (the W28 guards fire loudly; the
+--trace output is the evidence); G3 (raw + generate) garbage = not TQ;
+all clean = the stale-extension environment (the rebuild above).
 
 ---
 
@@ -289,7 +319,10 @@ a one-line follow-up commit (not you).
 | `scripts/gpu/run_query.py` | the `[W27]` corpus-regime diagnosis + the retrieval-prefill regime match (M1/M2 OFF for the prefill when the corpus memories are empty and gates are loaded) + the gen gate's non-ascii ratio and verdict band (W27.3/4) |
 | `src/rag/tests/test_w27_regime_guards.py` | gates A–C (AUTHORED, PENDING this box): the forgery refusals, the honest round-trip with baked regime meta, the corpus-regime trichotomy |
 | `src/rag/tests/test_query.py` | `test_query_cache_vector_device_alignment` (the E2/E3 crash reproduced and closed) + `test_corpus_memory_state_real_loader` |
-| `FINDINGS.md` | Errata W27 (items 4–7): the forged-artifact classification, the corrected gateless ladder, the retrieval decomposition |
+| `FINDINGS.md` | Errata W27 (items 4–7): the forged-artifact classification, the corrected gateless ladder, the retrieval decomposition + Errata W28 (items 8–12: the TQ core verified correct three ways, the per-head dynamic-range hazard measured, the generate-interplay gap, the build-staleness hazard, the protocol guards) |
+| `scripts/gpu/tq_gen_matrix.py` | W28 — THE TQ MALFUNCTION LOCALIZER: the 2x2 generation matrix (raw/TQ x manual/generate), the kernel parity probe on Gaussian/heavy-tail/per-head-spread states (PER-BLOCK rel-MSE), the build-state report, `--trace` |
+| `src/rag/tq_cache.py` | W28 protocol guards: `crop` / `batch_repeat_interleave` refuse loudly on TQ layers (never a silent parent fallback on code stores); the quantize paths untouched (bit-identical) |
+| `scripts/w28_tq_sim.py` | the dev-box numpy reproduction of the TQ round-trip (the per-head dynamic-range measurement behind FINDINGS W28 item 9) |
 | `m1m2_gates_trained_fixed.npz`, `m1m2_gates_trained_w26.npz` | **DELETED** (the hermes forgeries — refused by W27.2; the full box log that motivated them is preserved at commit `a9bbda2`) |
 
 Default behaviors are bit-identical to pre-W27 on every uniform-device

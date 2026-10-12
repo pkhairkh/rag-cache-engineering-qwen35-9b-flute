@@ -2476,3 +2476,83 @@ push w20-wave-<n>`.
 
 The orchestrator returns ONLY when every box above is checked
 (PROMPT.md §8). The A10G box executes `env/W20_GPU_PROTOCOL.md` next.
+
+## WAVE W28 — the TQ repair wave: the malfunction localized, the kernel
+gated without M1/M2 (the user's direct measurement)
+
+The user's evidence (2026-10-12, scripts/gpu/test_base_gen.py on the
+box): the palettized model with NO M1/M2 and NO install — just
+TQCache(config, bits=3.5, online=True) + model.generate() — produces
+multilingual soup; the model without TurboQuant "performs very well".
+The full TQ surface re-read against the paper (arXiv:2504.19874v1, the
+uploaded tar): turboquant.py, tq_cache.py, tq_codes.py, codebooks.py,
+fht.py, kernel_tq.cu, bindings.cpp.
+
+#### W28.1 — the verification (three ways)
+- [x] done
+ROLE core author · STATIC: the quant/dequant pair, the FHT
+forward/adjoint pair (torch + kernel: signs on the output forward-side,
+on the input adjoint-side), the boundary-scaling identity, the binding
+signatures vs the Python call sites, the split sub-quantizer geometry —
+all exact. The committed codebook npz tables carry the paper's constants
+(mse 0.0345/0.0095; the 1/sqrt(d) centroid scale). SIM:
+scripts/w28_tq_sim.py (numpy, the repo's exact math, zero repo imports)
+reproduces 2.2% total round-trip rel-MSE on Gaussian — the green
+suite's number. F2 is NOT a wrong formula.
+
+#### W28.2 — the finding: F2b, the per-unit dynamic-range hazard
+- [x] done
+ROLE core author · MEASURED (the same sim): ONE fp norm + ONE shared
+codebook over the CONCATENATED 32-head S unit (524,288 dims) sets the
+per-coordinate noise floor at the GLOBAL norm — heads with smaller
+norms get their signal replaced by noise: worst-head rel-MSE 10.7 at a
+55x head-norm spread, 297 at 525x, while the TOTAL stays 2.7% (why
+every green TOTAL-rel-MSE gate missed it — the W14 budget and the W15
+0.3%/step decode measurement are total-energy metrics). THE REPAIR
+candidate (if the box matrix confirms): quantize S per head (32 units
+of 16,384, own norm each) — a PROPOSAL D2 unit-mapping change,
+re-ingest required. NOT decided unilaterally — the box matrix's [0]
+per-block row is the measurement that decides.
+
+#### W28.3 — the gap: TQCache + model.generate() was NEVER gated
+- [x] done
+ROLE driver author · WRITE scripts/gpu/tq_gen_matrix.py — THE
+MALFUNCTION LOCALIZER: [0] the build-state report + the kernel-vs-torch
+parity probe at production geometry on Gaussian / heavy-tail /
+per-head-spread states (PER-BLOCK rel-MSE reported); [1] the 2x2
+generation matrix (raw/TQ x manual-loop/generate, the same prompt, the
+gen-gate metrics per cell); [2] the printed verdict tree (G2 garbage ->
+F2b; G2 clean + G4 garbage -> the generate interplay; G3 garbage ->
+not TQ; all clean -> the stale-extension environment); [3] --trace
+(every Cache/layer method call the generation makes, verbatim). The
+historically-clean TQCache results ALL drove the model manually; the
+user's failing test uses generate() — the one surface with no gate.
+DO-D: python3 -m py_compile scripts/gpu/tq_gen_matrix.py exit 0.
+
+#### W28.4 — the guards (loud, never silent)
+- [x] done
+ROLE core author · EDIT src/rag/tq_cache.py: TQLinearAttentionLayer.crop
+/ batch_repeat_interleave refuse loudly (NotImplementedError naming the
+W28 guard + the matrix command) — a generate()-path call through the
+parent's raw-tensor arithmetic on code stores becomes a NAMED failure.
+The quantize read/write paths untouched (default bit-identical). GATE:
+test_tq_cache.py contract 12 (AUTHORED, PENDING the box).
+
+#### W28.5 — the docs + the build hygiene
+- [x] done
+ROLE core author · FINDINGS.md Errata W28 (items 8-12) · HANDOVER.md
+W28 (the extension REBUILD step in the bootstrap — the repo is a copy,
+not a build; a stale .so under new wrappers produces silently wrong
+numbers; the matrix's [0] measures it) · this wave row.
+
+#### W28.6 — wave close
+DO-D: python3 scripts/w20_static_audit.py --wave W28 exit 0 AND --all
+exit 0; tag w28-tq-repair pushed.
+COMMIT: "W28.1 — the TQ repair wave: the core verified correct three
+ways (static + paper + an independent numpy sim), F2b isolated (the
+per-unit norm's dynamic-range hazard on the 32-head S state, worst-head
+rel-MSE 10.7x at a 55x head spread — hidden by every total-rel-MSE
+gate), the generate()-interplay gap closed with tq_gen_matrix.py (the
+2x2 localizer + the kernel parity probe + --trace), the Cache-protocol
+guards loud — 'TQ on kernel works fine' is now a one-command
+measurement"

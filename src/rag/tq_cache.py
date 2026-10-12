@@ -569,6 +569,34 @@ class TQLinearAttentionLayer(LinearAttentionLayer):
             "TurboQuant code stores is out of scope for the RAG build "
             "(single-query decode contract, SPECIFICATION §6)")
 
+    # ---------------------------------------- W28: the protocol guards ----
+    def crop(self, *args, **kwargs) -> None:
+        """W28 — LOUD refusal (never a silent corruption): the parent's
+        crop assumes RAW conv/recurrent tensors in the state dicts; the
+        online TQ layer holds CODES (the dicts are _StateView shims over
+        code stores). A generate()-path call that reaches here (e.g.
+        DynamicCache.crop at max-length) would silently no-op or corrupt
+        the code stores through the parent's raw-tensor arithmetic.
+        If your run hits this, the call came from the transformers
+        generate machinery — paste the traceback and the
+        tq_gen_matrix.py --trace output (the dev box owns the fix)."""
+        raise NotImplementedError(
+            "TQLinearAttentionLayer.crop: cropping a TurboQuant code "
+            "store is not implemented — the online layer's conv/recurrent "
+            "state is CODES, not raw tensors (W28 guard; run "
+            "scripts/gpu/tq_gen_matrix.py --trace and paste the "
+            "backtrace)")
+
+    def batch_repeat_interleave(self, *args, **kwargs) -> None:
+        """W28 — LOUD refusal (the same contract as crop): beam/repeat
+        expansion of code stores is not defined for the single-query RAG
+        decode path; a silent parent fallback would corrupt the codes."""
+        raise NotImplementedError(
+            "TQLinearAttentionLayer.batch_repeat_interleave: beam "
+            "expansion over TurboQuant code stores is not implemented "
+            "(W28 guard; single-query decode contract, SPECIFICATION §6)"
+        )
+
 
 # ---------------------------------------------------------------- TQCache ---
 class TQCache(DynamicCache):
