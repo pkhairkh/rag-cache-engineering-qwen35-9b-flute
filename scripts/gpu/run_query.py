@@ -22,7 +22,8 @@ from _bootstrap import DEFAULTS, boot, load_model
 
 boot()
 
-from index import ChunkVectorLoader, load_retrieval_frame, rerank  # noqa: E402
+from index import (ChunkVectorLoader, corpus_memory_state,  # noqa: E402
+                    load_retrieval_frame, rerank)
 from ingest import (check_m1m2_geometry, load_system_state,  # noqa: E402
                     m1m2_mem_size_from_system, reseed_cache)
 from query import answer_query, query_cache_vector  # noqa: E402
@@ -107,6 +108,41 @@ def main() -> int:
           f"{loader.manifest.get('chunk_protocol', 'delta-v1')}; "
           f"m1m2 mem_size {mem_size if mem_size else 'OFF'}")
 
+    # W27: the corpus's M1/M2 ingest regime — the retrieval-side query
+    # prefill must run in the regime the chunk vectors were CAPTURED in
+    # (a loaded gates artifact on a zero-write corpus produces a query
+    # vector whose memory pieces and S capture have NO counterpart in
+    # any chunk vector — regime mismatch, measured as score deflation
+    # + rank distortion; the box's old snapshots are exactly this case)
+    mem_state = None
+    if not args.no_m1m2:
+        mem_state = corpus_memory_state(loader)
+        s_dims = sum(int(c.d) for c in system.s_codes.values())
+        all_dims = s_dims + sum(
+            int(c.d) for c in (system.m1_codes, system.m2_codes)
+            if c is not None)
+        if mem_state is None:
+            print("    [W27] corpus M1/M2 memories: absent (no memory "
+                  "codes) — no memory regime to match")
+        elif mem_state:
+            print(f"    [W27] corpus M1/M2 memories EMPTY (zero-write "
+                  f"ingest: every sampled chunk's memory codes "
+                  f"dequantize to the reset point's) — the memory "
+                  f"subspace is inert; the §4 metric rides the S "
+                  f"subspace alone ({s_dims}/{all_dims} dims)")
+            if args.m1m2_gates:
+                print("    [W27] --m1m2-gates on a zero-write corpus: the "
+                      "chunks carry no memory content, so the gates' "
+                      "query-time writes cannot match anything — the "
+                      "retrieval prefill runs M1/M2-OFF (regime match); "
+                      "the ANSWER phase keeps the gates A/B; re-ingest "
+                      "with the gates to activate the memory subspace")
+        elif not args.m1m2_gates:
+            print("    [W27] corpus memories carry content but no "
+                  "--m1m2-gates loaded — the query's memory writes stay "
+                  "empty; pass the ingest-time artifact for a matched "
+                  "retrieval regime")
+
     print("\n[2] Loading model + tokenizer "
           f"(m1m2_mem_size={mem_size or 128})...")
     model, _ = load_model(args.artifacts_dir, args.heads_dir,
@@ -141,7 +177,11 @@ def main() -> int:
             "--retrieval-frame centered but no retrieval_frame.npz — "
             "run scripts/gpu/run_index.py first")
     else:
-        print("    [W16] centered retrieval frame OFF (absolute metric)")
+        print("    [W16] centered retrieval frame OFF (absolute metric) — "
+              "run scripts/gpu/run_index.py for the centered content "
+              "metric (the absolute frame's shared system component "
+              "flattens the score spread; W16 measured the floor on "
+              "this box)")
 
     if args.question:
         questions = [args.question]
@@ -171,6 +211,14 @@ def main() -> int:
         print("    [W26] GDN S install (n>=2): sum — the §6 contract "
               "(SEE FINDINGS.md F1: non-additive at n>=2; the E1-E3 "
               "ladder baseline)")
+    # W27: the shared module handle (the retrieval-prefill regime match
+    # below and the W23 answer-phase A/B both flip `enabled` on it)
+    m1m2_mod = getattr(inner, "m1m2", None)
+    # the retrieval prefill runs M1/M2-OFF when the corpus's memories
+    # are EMPTY and gates are loaded (the regime match — see the [W27]
+    # diagnosis at [1]); gateless runs are already regime-consistent
+    # (zero-init write gates leave the codes at the reset point's)
+    retrieval_match_off = bool(mem_state) and args.m1m2_gates is not None
     for i, question in enumerate(questions):
         print(f"\n    Query {i + 1}: {question[:80]}...")
         # add_special_tokens=False: matches the ingestion's chunk and
@@ -184,10 +232,18 @@ def main() -> int:
 
         cache = cache_factory()
         reseed_cache(cache, system)
-        with torch.no_grad():
-            model(input_ids=query_ids, past_key_values=cache, use_cache=True)
-        qvec = query_cache_vector(cache, system)
-
+        if retrieval_match_off and m1m2_mod is not None:
+            m1m2_mod.enabled = False
+            print("    [W27] retrieval prefill: M1/M2 OFF — regime match "
+                  "to the corpus's zero-write ingest")
+        try:
+            with torch.no_grad():
+                model(input_ids=query_ids, past_key_values=cache,
+                      use_cache=True)
+            qvec = query_cache_vector(cache, system)
+        finally:
+            if retrieval_match_off and m1m2_mod is not None:
+                m1m2_mod.enabled = True
         ids, scores = rerank(loader, qvec, np.array(chunks),
                              k=args.top_k, frame=frame)
         print(f"    Top {args.top_k}: {[int(x) for x in ids]} "
@@ -201,7 +257,6 @@ def main() -> int:
         # W23: the answer-phase M1/M2 A/B — disabled AFTER the retrieval
         # prefill above (the query vector keeps the M1/M2 codes),
         # re-enabled right after the answer
-        m1m2_mod = getattr(inner, "m1m2", None)
         if args.no_answer_m1m2 and m1m2_mod is not None:
             m1m2_mod.enabled = False
             print("    [W23] M1/M2 read/write OFF for the answer "
@@ -226,8 +281,19 @@ def main() -> int:
                 if result.token_confs else 0.0)
         rep = (sum(1 for a, b in zip(toks, toks[1:]) if a == b)
                / max(1, len(toks) - 1))
+        # W27: the script-mix ratio — the box's E1 'passed' the conf bar
+        # at 0.382 while the answer was multilingual soup; a conf number
+        # alone cannot see that. English answers about a retrieved doc
+        # measure ~0.00-0.05 here; the soup measured ~0.2-0.4.
+        non_ascii = (sum(1 for ch in answer if not ch.isascii())
+                     / max(1, len(answer)))
+        verdict = ("CLEAN-RANGE" if conf >= 0.60 else
+                   ("WEAK — soup can pass the 0.20 bar; judge the TEXT "
+                    "(the control measured 0.895)" if conf >= 0.20 else
+                    "GARBAGE-RANGE"))
         print(f"    Answer: {answer[:300]}")
         print(f"    [gen gate] mean conf {conf:.3f} | repetition {rep:.2f} "
+              f"| non-ascii {non_ascii:.2f} | {verdict} "
               f"(bisect_install's bar: conf >= 0.20, rep <= 0.6; the "
               f"true-doc control measured 0.895)")
 

@@ -2338,6 +2338,96 @@ trained gates (the corpus codes were written under the OLD gates
 regime — M1/M2 carry ~zeros; the W22 decision tree's re-ingest step);
 the ladder's held-out spread (the W22 box sequence owns it).
 
+## WAVE W27 — the ladder-repair wave: the E-ladder must actually run
+(the box's hermes session, classified)
+
+The W26 box attempt: E1 garbage (contaminated — the "gates" were a
+hand-broadcast forgery of a pre-W21 (24,) artifact, np.repeat-ed to
+(24, 32): right shapes, zero per-head addressing signal, loaded
+cleanly under the W26 checks); E2/E3 CRASHED at query_cache_vector
+(torch.cat on mixed devices — the host-side M1/M2 codes the disabled
+m1m2 block never requantizes vs the model-device S codes) — the
+F1-vs-F3 isolation never ran. The gen gate "passed" the soup at conf
+0.382 (the 0.20 bar cannot see mixed-script output). Retrieval on the
+old snapshots: the centered frame was never built (every log prints
+"frame OFF"), the memory subspace is inert (8.39M of 8.49M §4 dims),
+and the query-side regime mismatched the zero-write ingest whenever
+gates were loaded.
+
+#### W27.1 — query.py: the §4 vector's device alignment
+- [x] done
+ROLE core author · EDIT `src/rag/query.py::query_cache_vector`: every
+dequantized piece hops to the S pieces' device (the live model's) —
+uniform-device flows are bit-identical no-ops (torch.equal-pinned);
+mixed-device flows (the --no-answer-m1m2 prefill regime) no longer
+crash. No flow-contract change: oracle mode still computes the vector.
+DO-D: `python3 -m py_compile src/rag/query.py` exit 0.
+COMMIT: (folded into W27.1)
+
+#### W27.2 — m1m2_finetune.py: the forgery guards
+- [x] done
+ROLE core author · EDIT `save_gates` (bakes meta_write_addr/
+center_write/addr_blocks — every artifact self-describes its kernel
+regime; existing round-trips unchanged) + `load_gates` (refuses (a)
+artifacts without meta_write_addr on a content-addressing module,
+(b) write_gate_k rows constant across heads — the broadcast
+signature; write_gate_v deliberately unchecked: fill_ is a legitimate
+calibration pattern the W17/W21 suites use). The box's two hermes
+files are refused by construction now; both deleted from the repo
+(the motivating box log is preserved at commit a9bbda2).
+DO-D: `python3 -m py_compile src/rag/m1m2_finetune.py` exit 0.
+
+#### W27.3 — index.py + run_query.py: the ingest-regime contract
+- [x] done
+ROLE core+driver author · WRITE `src/rag/index.py::corpus_memory_state`
+(the empty / carries-content / absent trichotomy over the §4 delta's
+memory tail; loud on layout drift) · EDIT `scripts/gpu/run_query.py`
+(the [W27] diagnosis lines; the retrieval-prefill regime match — M1/M2
+OFF for the prefill when the corpus memories are empty and gates are
+loaded; the centered-frame guidance when retrieval_frame.npz is
+absent). Gateless runs were already regime-consistent (zero-init
+write gates leave the codes at the reset point's).
+DO-D: `python3 -m py_compile src/rag/index.py
+scripts/gpu/run_query.py` exit 0.
+
+#### W27.4 — run_query.py: the gen gate sees script-mixing
+- [x] done
+ROLE driver author · EDIT the [gen gate] print: the non-ascii ratio of
+the decoded answer + the verdict band (CLEAN-RANGE ≥ 0.60 / WEAK
+0.20–0.60 — "soup can pass the bar; judge the TEXT" / GARBAGE-RANGE).
+The E1 forgery run "passed" at 0.382 while being multilingual soup.
+DO-D: (covered by W27.3's compile).
+
+#### W27.5 — the gates (AUTHORED, PENDING the A10G box)
+ROLE core author · WRITE `src/rag/tests/test_w27_regime_guards.py`
+(A: the no-meta forgery refused, nothing mutated; B: the broadcast
+signature refused even WITH meta; C: the honest round-trip + baked
+regime meta + the positional-module refusal; D–G: the corpus-regime
+trichotomy + the layout-drift refusal) · EDIT
+`src/rag/tests/test_query.py` (the device-alignment gate — the E2/E3
+crash reproduced and closed, bit-equal to the uniform build; the
+real-loader memory-state leg).
+DO-D: `python3 -m py_compile` both test files exit 0; box Gate Zero
+runs them before the ladder.
+
+#### W27.6 — the docs
+ROLE core author · WRITE `FINDINGS.md` Errata W27 (items 4–7: the
+forged-artifact classification, the corrected GATELESS ladder, the
+retrieval decomposition, the crash-fix note) · REWRITE `HANDOVER.md`
+as the W27 runbook (the copy-not-clone bootstrap, Gate Zero, the
+gateless E1–E3 ladder with the updated decision tree, the
+run_index/eval_retrieval ground-truth section, the retrain recipe,
+the paste-back format; the pinned W23/M1/M2 headings preserved).
+
+#### W27.7 — wave close
+DO-D: `python3 scripts/w20_static_audit.py --wave W27` exit 0 AND
+`--all` exit 0; tag `w27-ladder-repair` pushed.
+COMMIT: "W27.1 — the ladder-repair wave: the E2/E3 device crash fixed
+at the crash site, the broadcast gates forgery refused by
+construction, the corpus ingest-regime contract (retrieval regime
+match), the gen gate sees script-mixing — the gateless E-ladder is
+runnable"
+
 ## 5. The attestation ledger (the no-CPU-test law, per wave)
 
 One line per wave close, written by the orchestrator, only when

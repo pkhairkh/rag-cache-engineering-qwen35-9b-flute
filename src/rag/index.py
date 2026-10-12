@@ -772,6 +772,62 @@ class ChunkVectorLoader:
             yield self.delta_vector(cid)
 
 
+# ------------------------------------------------- W27: ingest regime -----
+def corpus_memory_state(loader, n_sample: int = 3, rel_tol: float = 0.01
+                        ) -> Optional[bool]:
+    """W27 — is the corpus's M1/M2 memory subspace EMPTY, CARRIES CONTENT,
+    or ABSENT?  The retrieval-side query prefill must run in the SAME
+    write regime the chunk vectors were CAPTURED in; this introspection
+    supplies the corpus's side of that contract.
+
+    Returns:
+      None   the corpus carries no M1/M2 units at all (or no chunks) —
+             there is no memory regime to match.
+      True   EMPTY — every sampled chunk's memory delta is ~0 relative to
+             its own full delta: the corpus was INGESTED WITH ZERO WRITE
+             GATES (the P3 no-op regime — the box's
+             ragga_ingested_test100 is exactly this: its chunk m1/m2
+             codes dequantize to exact zeros, so the memory subspace is
+             inert and the §4 metric rides the S subspace alone).
+      False  CARRIES CONTENT — at least one sampled chunk wrote real
+             memory content at ingest; the query side needs the SAME
+             trained-gates artifact to produce a matching query vector.
+
+    Mechanics: the §4 delta vector's layout is [S layers ascending, M1,
+    M2], so the memory subspace is the tail of len = system m1.d + m2.d;
+    `rel_tol` separates the EXACT zeros of a no-op write (idempotent
+    requant of a norm-0 unit) from real content (which dominates the
+    vector — the M1/M2 dims are the large majority of d in production
+    geometry).  `loader` only needs `.chunk_ids()` and
+    `.delta_vector(cid)` (ChunkVectorLoader has both; tests may stub).
+    """
+    ids = list(loader.chunk_ids()) if hasattr(loader, "chunk_ids") else []
+    if not ids:
+        return None
+    system = getattr(loader, "system", None)
+    d_tail = 0
+    for attr in ("m1_codes", "m2_codes"):
+        c = getattr(system, attr, None) if system is not None else None
+        if c is not None:
+            d_tail += int(c.d)
+    if d_tail == 0:
+        return None
+    for cid in ids[:max(1, int(n_sample))]:
+        v = loader.delta_vector(int(cid))
+        if not torch.is_tensor(v) or v.numel() < d_tail:
+            raise ValueError(
+                f"corpus_memory_state: chunk {cid} delta vector "
+                f"{tuple(v.shape) if torch.is_tensor(v) else type(v)} is "
+                f"shorter than the memory tail {d_tail} — the loader and "
+                f"the system state disagree on the §4 layout")
+        tail = v[v.numel() - d_tail:]
+        v_norm = float(torch.linalg.vector_norm(v.float()))
+        t_norm = float(torch.linalg.vector_norm(tail.float()))
+        if t_norm > rel_tol * max(1.0, v_norm):
+            return False
+    return True
+
+
 # ---------------------------------------------------- W16: the frame ------
 FRAME_META_KEYS = ("kind", "dims", "system_ref", "n_mean_chunks",
                    "chunk_protocol", "created_utc")

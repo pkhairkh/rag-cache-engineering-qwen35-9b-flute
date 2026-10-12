@@ -1283,6 +1283,68 @@ CHECKS = {
         {"kind": "git_log", "target": "W26.1 —"},
         {"kind": "git_tag", "target": "w26-gdn-best-install"},
     ],
+    "W27": [
+        # W27.1 — query.py: the §4 vector's device alignment (the box's
+        # E2/E3 crash: torch.cat on host M1/M2 vs model-device S codes)
+        {"kind": "grep", "target": "src/rag/query.py",
+         "pattern": r"DEVICE ALIGNMENT"},
+        {"kind": "grep", "target": "src/rag/query.py",
+         "pattern": r"dev = pieces\[0\]\.device"},
+        {"kind": "py_compile", "target": "src/rag/query.py"},
+        # W27.2 — m1m2_finetune.py: the forgery guards (the hermes
+        # broadcast artifact refused by construction)
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"THE REGIME META IS MANDATORY"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"THE BROADCAST SIGNATURE"},
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"np\.all\(a_k == a_k\[:, :1\]\)"},
+        # save_gates bakes the regime meta (every artifact self-describes)
+        {"kind": "grep", "target": "src/rag/m1m2_finetune.py",
+         "pattern": r"regime_key in \(\"write_addr\", \"center_write\", "
+                    r"\"addr_blocks\"\)"},
+        {"kind": "py_compile", "target": "src/rag/m1m2_finetune.py"},
+        # W27.3 — index.py: the corpus ingest-regime trichotomy
+        {"kind": "grep", "target": "src/rag/index.py",
+         "pattern": r"def corpus_memory_state"},
+        {"kind": "py_compile", "target": "src/rag/index.py"},
+        # W27.3/4 — run_query.py: the regime diagnosis + the match +
+        # the gen gate's script-mix honesty
+        {"kind": "grep", "target": "scripts/gpu/run_query.py",
+         "pattern": r"corpus_memory_state\(loader\)"},
+        {"kind": "grep", "target": "scripts/gpu/run_query.py",
+         "pattern": r"retrieval_match_off"},
+        {"kind": "grep", "target": "scripts/gpu/run_query.py",
+         "pattern": r"non_ascii"},
+        {"kind": "grep", "target": "scripts/gpu/run_query.py",
+         "pattern": r"GARBAGE-RANGE"},
+        {"kind": "py_compile", "target": "scripts/gpu/run_query.py"},
+        # W27.5 — the gates (AUTHORED, PENDING the A10G box)
+        {"kind": "grep", "target": "src/rag/tests/test_w27_regime_guards.py",
+         "pattern": r"def test_w27a_regime_meta_is_mandatory"},
+        {"kind": "grep", "target": "src/rag/tests/test_w27_regime_guards.py",
+         "pattern": r"def test_w27b_broadcast_k_refused"},
+        {"kind": "grep", "target": "src/rag/tests/test_query.py",
+         "pattern": r"def test_query_cache_vector_device_alignment"},
+        {"kind": "grep", "target": "src/rag/tests/test_query.py",
+         "pattern": r"def test_corpus_memory_state_real_loader"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_w27_regime_guards.py"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_query.py"},
+        # W27.6 — the docs
+        {"kind": "grep", "target": "FINDINGS.md",
+         "pattern": r"## Errata \(W27"},
+        {"kind": "grep", "target": "HANDOVER.md",
+         "pattern": r"W27"},
+        {"kind": "grep", "target": "TASKS.md",
+         "pattern": r"## WAVE W27"},
+        # the two hermes forgery files are GONE from the tree (the
+        # deletion is the commit's own fact; the ledger check pins the
+        # wave's closure)
+        {"kind": "ledger", "target": "W27"},
+        {"kind": "py_compile", "target": "scripts/w20_static_audit.py"},
+        {"kind": "git_log", "target": "W27.1 —"},
+        {"kind": "git_tag", "target": "w27-ladder-repair"},
+    ],
 }
 
 

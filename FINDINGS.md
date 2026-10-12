@@ -413,3 +413,78 @@ the true-doc control measured 0.895).
    references above were written at `ad0d926`; W26 shifts them
    (install_snapshot is now at `install.py:344+`, the query call at
    `query.py:227`). The *shapes* of the claims are unchanged.
+
+---
+
+## Errata (W27 — the box's E-ladder attempt, classified)
+
+The W26 HANDOVER's E1–E3 ladder ran on the box (the uploaded hermes
+session log). Verdict per leg, with the new evidence:
+
+- **E1 (top-k 1, gates loaded): GARBAGE** — multilingual soup from
+  token 1 (`"by theness原则anImmke BIfetimes..."`) while the printed
+  gen gate *passed* its own bar (conf 0.382 ≥ 0.20, rep 0.25) — the
+  conf bar cannot see script-mixing; W27 adds the non-ascii ratio and
+  a verdict band to the printout. **CONTAMINATED**: the "gates" it ran
+  with were not a trained artifact at all — see Erratum 4.
+- **E2 (top-k 3, --no-answer-m1m2): CRASHED before the install** —
+  `torch.cat` in `query_cache_vector` raised "Expected all tensors to
+  be on the same device" (host M1/M2 codes vs model-device S codes;
+  the disabled M1/M2 block never requantizes the memory codes onto the
+  model device, and the reseed leaves them host-side off disk).
+  **THE F1-vs-F3 ISOLATION NEVER RAN.**
+- **E3 (top-k 1, --no-answer-m1m2): CRASHED** — same site, same cause.
+
+4. **The box's gates artifact is a hand-broadcast forgery, and it was
+   the E1 contamination.** The box's only artifact
+   (`m1m2_gates_trained.npz`) is pre-W21 per-layer `(24,)`; the
+   on-box hermes session "repaired" it by `np.repeat`-ing each layer's
+   scalar across all 32 heads (`m1m2_gates_trained_fixed.npz`, pushed
+   to this repo at `a9bbda2` and deleted in W27) — correct shapes,
+   correct geometry meta, **zero per-head addressing signal** (a
+   content-addressed kernel with per-layer-constant gate rows is
+   noise-by-construction: the read injects content-blind signal at 24
+   layers × every decode step). That file loaded cleanly under the
+   W26 checks and rode the entire E1 run. **W27 closes the hole**:
+   `load_gates` now (a) refuses artifacts without `meta_write_addr`
+   on a content-addressing module (every save_gates file since W21
+   carries it; W27 additionally bakes it in), and (b) refuses the
+   broadcast signature (write_gate_k rows constant across heads).
+   The E-ladder is re-specified GATELESS (Erratum 5).
+5. **The corrected ladder drops `--m1m2-gates` on the box's corpus.**
+   The corpus was ingested with zero-init write gates (the W17-era
+   ingest predates the finetune; the W22 log itself said "re-ingest
+   with --m1m2-gates" and that was never done), so its chunk M1/M2
+   codes dequantize to exact zeros — the memory subspace is INERT and
+   F3 (the read's answer-phase effect) is **untestable on this
+   corpus** (an empty memory returns nothing the read could blur).
+   E1-gateless and E3 are therefore expected to agree; the ladder's
+   discriminating legs are E2 (F1, the n≥3 sum) and E3 (F2, the
+   quantized write-path floor). Retrieval-side regime consistency is
+   now automatic: `run_query.py` introspects the corpus
+   (`index.corpus_memory_state`) and runs the retrieval prefill
+   M1/M2-OFF when the memories are empty and gates are loaded (the
+   W27 regime match — the gateless runs were already consistent).
+6. **The retrieval complaint ("rerank fails badly on old snapshots")
+   decomposes into three measured, non-architectural causes**: (a) the
+   absolute-frame common-component floor (W16's own measurement: a
+   ~0.70 score floor with ~0.016 spread — the centered frame
+   `run_index.py` writes exists to remove it, and the box has never
+   run it for test100: every log prints "centered retrieval frame
+   OFF"); (b) the inert memory subspace diluting the §4 metric (on
+   the box geometry 8,388,608 of 8,486,912 dims are M1/M2 — inert
+   mass that compresses the S signal's score spread; the centered
+   frame's sys-subtraction removes the shared part); (c) the
+   query-time regime mismatch when gates are loaded against a
+   zero-write corpus (fixed by the W27 regime match). The ground
+   truth question ("is chunk 70 the right doc for perf-canary?") is
+   answerable with `scripts/gpu/eval_retrieval.py` (hit@1/3/5 in all
+   three frames against the benchmark's gold doc ids) — run it after
+   `run_index.py`.
+7. **The E2/E3 crash is fixed at the crash site** (W27.1:
+   `query_cache_vector` aligns every §4 piece to the S pieces' device
+   — the live model's; uniform-device flows are bit-identical no-ops,
+   pinned by `test_query_cache_vector_device_alignment`). No flow
+   contract changed: oracle mode still computes the (now
+   crash-free) query vector, the install still overwrites the codes
+   the prefill left.

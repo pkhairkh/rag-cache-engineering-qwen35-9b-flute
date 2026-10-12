@@ -255,6 +255,15 @@ def save_gates(module, path: str, extra_meta: Optional[dict] = None) -> str:
     module-mismatched file loudly (a gates file trained at mem_size=1024
     applied to a mem_size=128 module would otherwise silently scatter
     into the wrong slots).
+
+    W27 — the WRITE KERNEL REGIME IS BAKED IN (write_addr, and
+    center_write/addr_blocks when the module carries them): every
+    artifact produced by this function is self-describing about its
+    addressing regime, so load_gates can (a) refuse artifacts that
+    predate W21 content addressing (no meta_write_addr — the pre-W21
+    (L,) era, and any hand-broadcast forgery of it) and (b) refuse
+    regime-mismatched loads. The finetune driver ALSO passes the regime
+    in extra_meta (W21); the baked copy is authoritative and identical.
     """
     path = os.fspath(path)
     if not path.endswith(".npz"):
@@ -262,6 +271,9 @@ def save_gates(module, path: str, extra_meta: Optional[dict] = None) -> str:
     arrays = {k: getattr(module, k).detach().cpu().numpy().astype(np.float64)
               for k in _GATE_KEYS}
     meta = _module_geometry(module)
+    for regime_key in ("write_addr", "center_write", "addr_blocks"):
+        if hasattr(module, regime_key):
+            meta[regime_key] = getattr(module, regime_key)
     meta["created_utc"] = datetime.now(timezone.utc).isoformat(
         timespec="seconds")
     meta["torch_version"] = torch.__version__
@@ -299,8 +311,7 @@ def load_gates(module, path: str) -> Dict[str, object]:
     # W21 — the addressing regime must match (validated BEFORE any
     # parameter mutates): a content-trained artifact loaded into a
     # positional module (or vice versa) would silently score the wrong
-    # kernel; the shapes alone cannot catch it. Pre-W21 artifacts carry
-    # no regime meta — the shape check above already refuses them.
+    # kernel; the shapes alone cannot catch it.
     if ("write_addr" in file_meta
             and hasattr(module, "write_addr")
             and str(file_meta["write_addr"]) != str(module.write_addr)):
@@ -322,6 +333,51 @@ def load_gates(module, path: str) -> Dict[str, object]:
                 f"{want_shape} — the gate-vector geometry disagrees "
                 f"(a pre-W21 (L,) artifact is meaningless under content "
                 f"addressing; retrain)")
+    # W27.2 — THE REGIME META IS MANDATORY on a content-addressing module
+    # (has write_addr): save_gates has baked meta_write_addr in since W27,
+    # and the W21+ finetune driver passed it in extra_meta before that.
+    # An artifact WITHOUT it either predates W21 content addressing or was
+    # hand-assembled from one — the box's hermes session built exactly
+    # such a file (a pre-W21 (24,) vector np.repeat-ed to (24, 32)) and
+    # it slipped past both the shape and regime checks above while
+    # carrying zero per-head addressing signal.
+    if hasattr(module, "write_addr") and "write_addr" not in file_meta:
+        raise ValueError(
+            f"load_gates: {path} carries no meta_write_addr — the "
+            f"artifact predates W21 content addressing (or was "
+            f"hand-assembled from one); its gate semantics cannot address "
+            f"this module's kernel regime; retrain with the W21+ "
+            f"finetune driver (scripts/gpu/finetune_m1m2.py)")
+    # W27.2 — the secondary regime keys, when BOTH sides carry them
+    # (mismatch = a kernel the artifact was not trained under)
+    for regime_key in ("center_write", "addr_blocks"):
+        if (regime_key in file_meta and hasattr(module, regime_key)
+                and str(file_meta[regime_key]) != str(
+                    getattr(module, regime_key))):
+            raise ValueError(
+                f"load_gates: {path} was trained at {regime_key}="
+                f"{file_meta[regime_key]!r}, this module runs "
+                f"{getattr(module, regime_key)!r} — write-kernel regime "
+                f"drift; refusing a silent mismatch")
+    # W27.2 — THE BROADCAST SIGNATURE: a genuine (L, H) training run never
+    # produces a write_gate_k whose rows are CONSTANT across every head
+    # (measure-zero under SGD); a hand-broadcast pre-W21 (L,) artifact is
+    # exactly that. Only write_gate_k is checked — write_gate_v is
+    # legitimately uniform in tests/calibration (fill_(c) is a real
+    # pattern), and the KEY gate is the one whose per-head structure IS
+    # the content addressing signal.
+    a_k = arrays["write_gate_k"]
+    if (a_k.ndim == 2 and a_k.shape[1] > 1
+            and bool(np.all(a_k == a_k[:, :1]))):
+        raise ValueError(
+            f"load_gates: {path} write_gate_k rows are constant across "
+            f"all {a_k.shape[1]} heads — the broadcast signature of a "
+            f"pre-W21 (L,) artifact reshaped to (L, H); it carries no "
+            f"per-head addressing signal (the box's "
+            f"m1m2_gates_trained_fixed.npz was exactly this and produced "
+            f"garbage); retrain under content addressing")
+    for k in _GATE_KEYS:
+        param = getattr(module, k, None)
         with torch.no_grad():
             param.copy_(torch.from_numpy(arrays[k]).to(
                 param.device, param.dtype))

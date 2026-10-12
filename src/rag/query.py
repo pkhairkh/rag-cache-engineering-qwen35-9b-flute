@@ -82,7 +82,21 @@ def query_cache_vector(cache: TQCache, system: SystemState) -> torch.Tensor:
     """The §4 query vector: dequantized ABSOLUTE-from-system codes of the
     query prefill, concatenated in §4 order (S ascending, M1, M2), fp32 —
     a torch tensor on the codes' device (W20.4.3; the faiss hand-off in
-    index.preselect owns the host hop)."""
+    index.preselect owns the host hop).
+
+    W27 — DEVICE ALIGNMENT (the box's E2/E3 crash, verbatim traceback):
+    the M1/M2 codes ride wherever `reseed_cache` left them (HOST — they
+    come off disk through load_system_state) and only move to the model
+    device when the m1m2 block's forward REQUANTIZES them (update_m1/
+    update_m2 quantize-on-write on the writer's device). A prefill with
+    the module DISABLED (run_query.py's --no-answer-m1m2 regime, or any
+    W27 regime-matched prefill) never touches them — so the S pieces
+    land on cuda:0 while the M1/M2 pieces stay on cpu and torch.cat
+    (device-strict) raises. The S pieces' device — the live model's —
+    is the canonical frame; every other piece hops there once. Uniform-
+    device flows (every existing test) are exact no-ops: values, order
+    and dtype are unchanged, so the §4 contract and the W20.4.3 hand-off
+    semantics are bit-preserved."""
     codes = cache.snapshot_codes()
     pieces = []
     for L in sorted(system.s_codes):
@@ -97,6 +111,9 @@ def query_cache_vector(cache: TQCache, system: SystemState) -> torch.Tensor:
         if c is not None:
             pieces.append(resolve_quantizer(
                 kind.upper(), c.d, system.bits).dequant(c))
+    if pieces:
+        dev = pieces[0].device
+        pieces = [p if p.device == dev else p.to(dev) for p in pieces]
     return torch.cat(pieces).to(torch.float32)
 
 

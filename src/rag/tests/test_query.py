@@ -80,6 +80,7 @@ not in this repo):
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import zlib
 from types import SimpleNamespace
@@ -95,7 +96,8 @@ from ingest import IngestDriver, load_system_state, reseed_cache
 from snapshot import ChunkSnapshot, load_chunk
 from install import install_from_disk, install_snapshot, sum_turboquant_codes
 from query import answer_query, query_cache_vector
-from index import ChunkVectorLoader, IndexConfig, build_index, load_index
+from index import (ChunkVectorLoader, IndexConfig, build_index,
+                   corpus_memory_state, load_index)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ------------------------------------------------------------- geometry ---
@@ -548,6 +550,77 @@ def test_query_cache_vector_layout(corpus):
     cos3 = float(vq @ (c3 / torch.linalg.vector_norm(c3)))
     cos0 = float(vq @ (c0 / torch.linalg.vector_norm(c0)))
     assert cos3 > 0.95 and cos0 < 0.2 and cos3 - cos0 > 0.7
+
+
+def _codes_to(c, device):
+    """Move a TQCodes unit's tensors to `device` (the W27 device test's
+    host-side staging helper — dataclasses.replace keeps every scalar)."""
+    kw = dict(norm=c.norm.to(device), idx_lo=c.idx_lo.to(device),
+              idx_hi=c.idx_hi.to(device))
+    if getattr(c, "partition", "half") == "outlier":
+        kw["mask"] = c.mask.to(device)
+        kw["norm_hi"] = c.norm_hi.to(device)
+    return dataclasses.replace(c, **kw)
+
+
+def test_query_cache_vector_device_alignment(corpus):
+    """W27 — THE BOX'S E2/E3 CRASH, reproduced and closed: a prefill with
+    the M1/M2 module DISABLED never requantizes the memory codes, so they
+    stay wherever reseed_cache left them (HOST, off disk) while the S
+    codes land on the model device — torch.cat raised
+    'Expected all tensors to be on the same device' on the GPU box (the
+    --no-answer-m1m2 runs of the W26 ladder died HERE, before the
+    install, so F1-vs-F3 was never measured). The W27 fix aligns every
+    piece to the S pieces' device (the live model's): no crash, values
+    BIT-identical to the uniform-device build, and the m1/m2 segments
+    equal the dequant of the HOST codes they came from."""
+    cache = _make_cache()
+    reseed_cache(cache, corpus.system)
+    corpus.model.active_topic = 3
+    try:
+        with torch.no_grad():
+            corpus.model(QUERY_IDS, past_key_values=cache, use_cache=True)
+    finally:
+        corpus.model.active_topic = None
+
+    # the uniform-device reference vector (bit-exactness anchor)
+    v_ref = query_cache_vector(cache, corpus.system)
+
+    # stage the E2/E3 regime: the memory codes back on host (exactly
+    # where reseed_cache left them; the disabled forward never touched
+    # them) — on CUDA boxes this makes the pieces MIXED-DEVICE
+    host = torch.device("cpu")
+    m1_host = _codes_to(cache.m1_codes, host)
+    m2_host = _codes_to(cache.m2_codes, host)
+    cache.m1_codes = m1_host
+    cache.m2_codes = m2_host
+    # the mixed-device state is genuinely staged on CUDA boxes (the
+    # crash regime); on CPU-only runs the test degrades to the
+    # uniform-device no-op regression pin (still bit-equality)
+    if DEVICE.type == "cuda":
+        assert cache.m1_codes.idx_lo.device.type == "cpu"
+        assert cache.layers[0].s_codes.idx_lo.device.type == "cuda"
+
+    v = query_cache_vector(cache, corpus.system)
+    assert v.shape == v_ref.shape and v.dtype == torch.float32
+    assert v.device == v_ref.device          # the S pieces' frame wins
+    assert torch.equal(v, v_ref)              # values bit-identical
+    # the m1/m2 segments are the HOST codes' dequant (moved, not recomputed)
+    q_m1 = resolve_quantizer("M1", M_D, BITS)
+    q_m2 = resolve_quantizer("M2", M_D, BITS)
+    assert torch.equal(v[2 * S_D:2 * S_D + M_D].cpu(),
+                       q_m1.dequant(m1_host).cpu())
+    assert torch.equal(v[2 * S_D + M_D:].cpu(),
+                       q_m2.dequant(m2_host).cpu())
+
+
+def test_corpus_memory_state_real_loader(corpus):
+    """W27 — the real-loader leg of the corpus-regime introspection: this
+    suite's stub model WRITES memory content at ingest (M_NOISE), so the
+    corpus reports False (carries content — the query side needs the
+    ingest-time gates for a matched retrieval regime). The EMPTY and
+    absent legs are pinned against fakes in test_w27_regime_guards.py."""
+    assert corpus_memory_state(corpus.loader) is False
 
 
 # ================================= 6a. mini e2e: flow + §9 ===================
