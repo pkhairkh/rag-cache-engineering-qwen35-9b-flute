@@ -381,3 +381,35 @@ the true-doc control measured 0.895).
   Output is reproduced in F1's table.
 - Evidence files: uploaded HANDOVER.md (the garbage run), this repo at
   `ad0d926`.
+
+---
+
+## Errata (W26 — post-publication audit, before the box run)
+
+1. **F3's remedy line overstates the driver surface.** "train
+   read_gate via the existing `--aux-nll-weight` path (the finetune
+   already supports it)" is TRUE at the module docstring level
+   (`m1m2_finetune.py` names `--aux-nll-weight` as "the driver's"
+   flag) but **FALSE at the driver level**:
+   `scripts/gpu/finetune_m1m2.py` has NO `--aux-nll-weight` argument
+   (checked against the argparse surface at W26). The driver's
+   `--train-read-gate` merely unfreezes the parameter — the §7
+   contrastive loss has no gradient path to it (it scores WRITTEN
+   states), so unfreezing alone trains nothing. Read_gate currently
+   CANNOT be trained by any driver flag; the read-gate training path
+   is a TODO. The interim read mitigations that DO exist today:
+   `--no-answer-m1m2` (the honest answer-quality default until
+   calibrated) and `--m1m2-read-topk` (sparse read, W22).
+2. **The F1 remedy is IMPLEMENTED (opt-in, W26).** The 3-line patch of
+   "Recommended minimal fix order" item 2 now ships as
+   `install_snapshot(..., gdn_install="best")` /
+   `run_query.py --install-gdn best`: S + conv verbatim from the
+   highest-scoring retrieved chunk, M1/M2 summed (unchanged). The
+   default stays `"sum"` (the §6 contract) so the E1–E3 ladder above
+   measures the broken path exactly as ranked; switch to `best` only
+   after E1 confirms. Gates: `test_query.py::
+   test_install_gdn_best_mode` (AUTHORED, PENDING the box).
+3. Line-number caveat: the `install.py:219-306` / `query.py:217`
+   references above were written at `ad0d926`; W26 shifts them
+   (install_snapshot is now at `install.py:344+`, the query call at
+   `query.py:227`). The *shapes* of the claims are unchanged.

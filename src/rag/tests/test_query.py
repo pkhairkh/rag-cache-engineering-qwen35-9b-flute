@@ -418,6 +418,87 @@ def test_install_m1m2_sum_budget(corpus):
     assert _codes_equal(cache.m2_codes, cache2.m2_codes)
 
 
+# ================================= 5b. W26: the best-chunk GDN install =======
+def test_install_gdn_best_mode(corpus):
+    """W26 (FINDINGS.md F1/F4), AUTHORED — PENDING the A10G box: with
+    gdn_install="best" over 3 absolute snapshots, the S codes install
+    VERBATIM from the retrieval-order FIRST (highest-scoring) chunk
+    (bit-identity — the n==1 hand-off, zero requant), conv comes from
+    the SAME chunk (F4: 'last' = the lowest-scoring chunk), M1/M2 KEEP
+    the D4 sum (additive write — one-round budget), the report reads
+    best-verbatim+best-conv with s_source_chunk = the first chunk's id;
+    the kwarg-less call stays the §6 sum bit-identically; n=1 + best is
+    the plain verbatim install; a bogus mode is a loud refusal; and
+    answer_query plumbs the flag through (oracle install report)."""
+    snaps = [_snap(corpus, cid) for cid in SNAP_IDS]
+    assert not _codes_equal(snaps[0].s_codes[LINEARS[0]],
+                            snaps[-1].s_codes[LINEARS[0]])  # non-vacuous
+
+    # (a) best mode: S + conv verbatim from snaps[0], M1/M2 summed
+    cache = _make_cache()
+    report = install_snapshot(cache, corpus.system, snaps,
+                              gdn_install="best")
+    for L in LINEARS:
+        assert _codes_equal(cache.layers[L].s_codes, snaps[0].s_codes[L])
+        assert not _codes_equal(cache.layers[L].s_codes,
+                                snaps[-1].s_codes[L])
+        assert _codes_equal(cache.layers[L].conv_codes,
+                            snaps[0].conv_codes[L])
+        assert report[L]["mode"] == "best-verbatim+best-conv"
+        assert report[L]["n_chunks"] == len(SNAP_IDS)
+        assert report[L]["s_source_chunk"] == snaps[0].chunk_id
+    n = len(snaps)
+    for kind, attr in (("M1", "m1_codes"), ("M2", "m2_codes")):
+        q = resolve_quantizer(kind, M_D, BITS)
+        sys_c = getattr(corpus.system, attr)
+        expect = sum(q.dequant(getattr(s, attr), device=DEVICE) for s in snaps) \
+            - (n - 1) * q.dequant(sys_c, device=DEVICE)
+        got = q.dequant(getattr(cache, attr), device=DEVICE)
+        assert _rel_mse(got, expect) < SINGLE_ROUND_GATE
+        assert report[kind] == {"mode": "sum-abs", "n_chunks": n}
+
+    # (b) the kwarg-less call is the §6 sum, bit-identical to the
+    # explicit gdn_install="sum" (the E-ladder baseline is untouched)
+    cache_sum = _make_cache()
+    install_snapshot(cache_sum, corpus.system, snaps)
+    cache_sum2 = _make_cache()
+    install_snapshot(cache_sum2, corpus.system, snaps, gdn_install="sum")
+    for L in LINEARS:
+        assert _codes_equal(cache_sum.layers[L].s_codes,
+                            cache_sum2.layers[L].s_codes)
+        assert _codes_equal(cache_sum.layers[L].conv_codes,
+                            cache_sum2.layers[L].conv_codes)
+
+    # (c) n == 1 + best: the plain verbatim install (conv still best =
+    # the only chunk), mode unchanged from the W16 surface
+    cache_one = _make_cache()
+    rep_one = install_snapshot(cache_one, corpus.system, snaps[:1],
+                               gdn_install="best")
+    for L in LINEARS:
+        assert _codes_equal(cache_one.layers[L].s_codes,
+                            snaps[0].s_codes[L])
+        assert rep_one[L]["mode"] == "verbatim+best-conv"
+        assert "s_source_chunk" not in rep_one[L]
+
+    # (d) a bogus mode is a loud refusal, never a silent default
+    with pytest.raises(ValueError, match="gdn_install"):
+        install_snapshot(_make_cache(), corpus.system, snaps,
+                         gdn_install="wat")
+
+    # (e) answer_query plumbs the flag through (oracle mode, no decode)
+    corpus.model.active_topic = CORRECT_TOPIC
+    try:
+        res = answer_query(corpus.model, QUERY_IDS, corpus.system,
+                           loader=corpus.loader, cache_factory=_make_cache,
+                           retrieved_ids=list(SNAP_IDS),
+                           gdn_install="best")
+    finally:
+        corpus.model.active_topic = None
+    for L in LINEARS:
+        assert res.install_report[L]["mode"] == "best-verbatim+best-conv"
+        assert res.install_report[L]["s_source_chunk"] == SNAP_IDS[0]
+
+
 # ================================= 7. query vector (§4) ======================
 def test_query_cache_vector_layout(corpus):
     """The §4 query vector: length = Σ S dims + M1 + M2 (conv EXCLUDED),

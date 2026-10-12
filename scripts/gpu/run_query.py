@@ -72,6 +72,17 @@ def main() -> int:
                          "it ON, so the query vector is unaffected) — "
                          "the memory's generation effect becomes a "
                          "measured A/B, not an assumption")
+    ap.add_argument("--install-gdn", choices=("sum", "best"),
+                    default="sum",
+                    help="W26 (FINDINGS.md F1): the n>=2 GDN S-state "
+                         "install. 'sum' = the §6 contract "
+                         "(Σ abs_i − (n−1)·sys — the measured-broken "
+                         "superposition; the E1-E3 ladder runs on it as "
+                         "the A/B baseline); 'best' = S+conv VERBATIM "
+                         "from the highest-scoring chunk (algebra-exact: "
+                         "the delta-rule recurrence is non-additive), "
+                         "M1/M2 still summed (their write is additive). "
+                         "n=1 is always verbatim either way")
     ap.add_argument("--no-m1m2", action="store_true",
                     help="W17: load without the wiring (only valid for a "
                          "corpus ingested --no-m1m2")
@@ -150,6 +161,16 @@ def main() -> int:
 
     print(f"\n[4] Running {len(questions)} queries "
           f"(direct rerank over {len(chunks)} chunks)...")
+    # W26: the regime line — the box log must always record which GDN
+    # install the answers ran on (the E-ladder's A/B reads this)
+    if args.install_gdn == "best":
+        print("    [W26] GDN S install (n>=2): best — S+conv VERBATIM "
+              "from the top-scoring chunk, M1/M2 summed (the FINDINGS "
+              "F1 remedy)")
+    else:
+        print("    [W26] GDN S install (n>=2): sum — the §6 contract "
+              "(SEE FINDINGS.md F1: non-additive at n>=2; the E1-E3 "
+              "ladder baseline)")
     for i, question in enumerate(questions):
         print(f"\n    Query {i + 1}: {question[:80]}...")
         # add_special_tokens=False: matches the ingestion's chunk and
@@ -193,7 +214,8 @@ def main() -> int:
                 loader=loader,
                 cache_factory=cache_factory,
                 retrieved_ids=[int(x) for x in ids],
-                max_new_tokens=args.max_new_tokens)
+                max_new_tokens=args.max_new_tokens,
+                gdn_install=args.install_gdn)
         finally:
             if m1m2_mod is not None:
                 m1m2_mod.enabled = True

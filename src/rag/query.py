@@ -143,6 +143,7 @@ def answer_query(
     retrieved_ids: Optional[Sequence[int]] = None,   # oracle mode
     max_new_tokens: int = 0,
     decode_fn: Optional[Callable] = None,
+    gdn_install: str = "sum",
 ) -> QueryResult:
     """Run the §6 flow. `cache` (or cache_factory) must produce a cache the
     MODEL accepts (production: TQCache(config=model.config); tests:
@@ -154,6 +155,13 @@ def answer_query(
     the retrieved chunks' CODES, summed on the system reset point). The
     W23 text-reprefill branch is REMOVED (it bypassed the installed
     codes — the venture's core mechanism).
+
+    W26 (FINDINGS F1): `gdn_install` selects the n>=2 GDN S-state
+    install — "sum" (the default) keeps the §6 contract (the E1-E3
+    ladder's baseline); "best" installs S+conv VERBATIM from the
+    highest-scoring retrieved chunk and sums only M1/M2 (the
+    algebra-exact remedy — the delta-rule recurrence makes chunk
+    states non-additive). n=1 is verbatim either way.
     """
     res = QueryResult()
     res.oracle = retrieved_ids is not None
@@ -212,9 +220,12 @@ def answer_query(
         snaps.append(snap_mod.load_chunk(path))
     t["load_codes"] = time.perf_counter() - t0
 
-    # [6] install (dequant-sum-requant; conv = last chunk)
+    # [6] install (dequant-sum-requant; conv = last chunk — or, with
+    # gdn_install="best", the W26/FINDINGS-F1 remedy: S+conv verbatim
+    # from the highest-scoring chunk, only M1/M2 summed)
     t0 = time.perf_counter()
-    res.install_report = install_snapshot(cache, system, snaps)
+    res.install_report = install_snapshot(cache, system, snaps,
+                                          gdn_install=gdn_install)
     t["install"] = time.perf_counter() - t0
 
     # W16: the full-attn layers run FRESH for the answer prefill (spec

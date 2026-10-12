@@ -68,6 +68,23 @@ bit-identical to the pre-W20.10 install, which the CPU gate suite pins.
 The W16 verbatim install (n<=1 hand-offs) is untouched: CODE-COPY,
 never recompute, bit-exact within a backend.
 
+W26 — THE GDN BEST-CHUNK INSTALL (FINDINGS.md F1/F4, the E-ladder's
+fix arm, opt-in): the GatedDeltaNet recurrence
+S ← λ(I−βkkᵀ)S + βkvᵀ carries erase+decay, so independently-captured
+chunk states are NOT additive — the n>=2 §6 S sum installs a state no
+trajectory ever produced (scripts/demo_install_algebra.py: n=1
+rel-MSE 0.0000, n=3 rel-MSE 2.63 vs the 0.15 corruption budget).
+install_snapshot(..., gdn_install="best") installs the S codes
+VERBATIM from the highest-scoring retrieved chunk (the n==1 path's
+bit-exact hand-off — zero requant rounds) and takes conv from the
+SAME chunk (F4: retrieval order is score-descending, so the sum
+path's "last" chunk is the LOWEST-scoring one). M1/M2 stay summed
+either way — their write is additive and the superposition is exact
+(m1m2.py D4; the READ side is FINDINGS F3's business, not the
+install's). gdn_install="sum" (the default) keeps the §6 contract
+bit-identical — the E1-E3 ladder (FINDINGS.md §E) measures the
+broken path on it; flip to "best" only after E1 confirms.
+
 Frame guard: every code must carry the kind's D3 seed — a mismatched frame
 would silently corrupt the sum (PROPOSAL D3); it raises loudly here.
 """
@@ -216,6 +233,24 @@ def _last_conv(retrieved: Sequence[ChunkSnapshot], layer_idx: int
     return None
 
 
+def _best_conv(retrieved: Sequence[ChunkSnapshot], layer_idx: int
+               ) -> Optional[TQCodes]:
+    """W26 (FINDINGS F4): conv_state from the BEST (highest-scoring =
+    retrieval-order FIRST) retrieved chunk's codes, never summed.
+
+    Retrieval order is score-descending, so the §6 "last retrieved
+    chunk" rule hands the answer the LOWEST-scoring chunk's tail
+    window — and with gdn_install="best" the S state comes from the
+    top-scoring chunk, so the conv must come from the SAME chunk or
+    the first query tokens read a window belonging to a state that was
+    never installed. Per-layer fallback mirrors _last_conv: the first
+    snapshot in retrieval order that carries the layer's conv codes."""
+    for snap in retrieved:
+        if layer_idx in snap.conv_codes and snap.conv_codes[layer_idx] is not None:
+            return snap.conv_codes[layer_idx]
+    return None
+
+
 def sum_absolute_codes(system: TQCodes, absolutes: Sequence[TQCodes],
                        kind: str, bits: float = 3.5,
                        qjl: bool = False) -> TQCodes:
@@ -307,7 +342,8 @@ def sum_absolute_codes(system: TQCodes, absolutes: Sequence[TQCodes],
 
 
 def install_snapshot(cache: TQCache, system: SystemState,
-                     retrieved: Sequence[ChunkSnapshot]) -> dict:
+                     retrieved: Sequence[ChunkSnapshot],
+                     gdn_install: str = "sum") -> dict:
     """The §6 install into `cache` (a live query cache — shapes known):
 
       S per layer:      sum_turboquant_codes(sys, [snap deltas], kind="S")
@@ -317,9 +353,20 @@ def install_snapshot(cache: TQCache, system: SystemState,
       M1 / M2:          same, kind="M1"/"M2"
       conv per layer:   the LAST retrieved chunk's codes, verbatim
 
+    W26 (FINDINGS F1/F4): `gdn_install="best"` — S codes VERBATIM from
+    the highest-scoring retrieved chunk (retrieval order is
+    score-descending; the per-layer addend lists below filter None in
+    that order, so their head IS the best chunk), conv from the SAME
+    chunk (_best_conv), M1/M2 still summed (additive write, exact
+    superposition). "sum" (the default) is the §6 contract above,
+    bit-identical to the pre-W26 install — the E1-E3 ladder's baseline.
+
     Returns a report {layer: {"mode": ..., ...}} for the evals ledger
-    ("mode" gains "verbatim"/"sum-abs" for the W16 absolute path). The
-    full-attn layers are untouched (spec §2.4).
+    ("mode" gains "verbatim"/"sum-abs" for the W16 absolute path and
+    "best-verbatim"/"best-delta" for the W26 best path; best-mode S
+    entries also carry "s_source_chunk" — the chunk id the S state
+    came from, so the box log can verify it equals the top-1 retrieved
+    id). The full-attn layers are untouched (spec §2.4).
 
     W16: the requant inherits the CACHE's qjl A/B setting (the codes are
     self-describing; a qjl cache requantizes the sum WITH the sketch so
@@ -348,34 +395,66 @@ def install_snapshot(cache: TQCache, system: SystemState,
             f"install_snapshot: mixed snapshot protocols {sorted(protocols)} "
             f"— a corpus carries ONE chunk protocol (re-ingest consistently)")
     absolute = bool(protocols) and "absolute" in protocols
+    if gdn_install not in ("sum", "best"):
+        raise ValueError(
+            f"install_snapshot: gdn_install={gdn_install!r} — expected "
+            f"'sum' (the §6 contract) or 'best' (the FINDINGS F1 remedy: "
+            f"S+conv verbatim from the highest-scoring chunk, M1/M2 "
+            f"summed)")
     report: dict = {}
     for L in sorted(system.s_codes):
         if absolute:
             absolutes = [s.s_codes[L] for s in retrieved
                          if L in s.s_codes and s.s_codes[L] is not None]
-            summed = sum_absolute_codes(system.s_codes[L], absolutes,
+            # W26 (FINDINGS F1): the GDN S state is NON-ADDITIVE under
+            # the delta-rule recurrence — in "best" mode the S codes
+            # install VERBATIM from the highest-scoring chunk (the
+            # n==1 hand-off: bit-exact, zero requant). ONLY the S
+            # addends are sliced; M1/M2 below keep the full D4 sum.
+            s_absolutes = absolutes
+            best_mode = gdn_install == "best" and len(absolutes) > 1
+            if best_mode:
+                s_absolutes = absolutes[:1]
+            summed = sum_absolute_codes(system.s_codes[L], s_absolutes,
                                         kind="S", bits=bits, qjl=qjl)
-            mode = ("verbatim" if len(absolutes) == 1 else "sum-abs") \
-                if absolutes else "sys-verbatim"
+            if not absolutes:
+                mode = "sys-verbatim"
+            elif best_mode:
+                mode = "best-verbatim"
+            else:
+                mode = "verbatim" if len(absolutes) == 1 else "sum-abs"
             report[L] = {"mode": mode, "n_chunks": len(retrieved),
                          "protocol": "absolute"}
+            if best_mode:
+                report[L]["s_source_chunk"] = next(
+                    s.chunk_id for s in retrieved
+                    if L in s.s_codes and s.s_codes[L] is not None)
         else:
             deltas = [s.s_codes[L] for s in retrieved
                       if L in s.s_codes and s.s_codes[L] is not None]
-            summed = sum_turboquant_codes(system.s_codes[L], deltas,
+            # W26: the delta-protocol twin — in "best" mode only the
+            # BEST chunk's delta installs (quant(sys + delta_best), one
+            # requant); M1/M2 below keep the full sum.
+            s_deltas = deltas
+            best_mode = gdn_install == "best" and len(deltas) > 1
+            if best_mode:
+                s_deltas = deltas[:1]
+            summed = sum_turboquant_codes(system.s_codes[L], s_deltas,
                                           kind="S", bits=bits, qjl=qjl)
-            mode = "sum"
+            mode = "best-delta" if best_mode else "sum"
         cache.set_s_codes(L, summed)
 
-        conv = _last_conv(retrieved, L)
+        conv = _best_conv(retrieved, L) if gdn_install == "best" \
+            else _last_conv(retrieved, L)
+        conv_tag = "best-conv" if gdn_install == "best" else "last-conv"
         if conv is not None:
             cache.set_conv_codes(L, conv)
             if absolute:
-                report[L]["mode"] = f"{mode}+last-conv"
+                report[L]["mode"] = f"{mode}+{conv_tag}"
                 report[L]["conv_partition"] = conv.partition
             else:
                 # the legacy report shape, VERBATIM (the tests pin it)
-                report[L] = {"mode": f"{mode}+last-conv",
+                report[L] = {"mode": f"{mode}+{conv_tag}",
                              "n_deltas": len(deltas),
                              "conv_partition": conv.partition}
         elif not absolute:
@@ -383,6 +462,8 @@ def install_snapshot(cache: TQCache, system: SystemState,
                          "conv": "system"}
     if system.m1_codes is not None:
         if absolute:
+            # W26: M1/M2 KEEP the full sum in "best" mode too — the
+            # write is additive (m1m2.py D4); F1 owns only the GDN S.
             m1_abs = [s.m1_codes for s in retrieved if s.m1_codes is not None]
             cache.m1_codes = sum_absolute_codes(
                 system.m1_codes, m1_abs, kind="M1", bits=bits, qjl=qjl)
@@ -410,9 +491,11 @@ def install_snapshot(cache: TQCache, system: SystemState,
 
 def install_from_disk(cache: TQCache, disk_dir: str,
                       retrieved_ids: Sequence[int],
-                      bits: float = 3.5) -> dict:
+                      bits: float = 3.5,
+                      gdn_install: str = "sum") -> dict:
     """Convenience: load the reset point + chunk snapshots from disk and
-    install (spec §6 steps 5–6).
+    install (spec §6 steps 5–6). gdn_install passes through to
+    install_snapshot (W26: "best" = the F1 remedy; default "sum").
 
     W20.4.2: the loads ride snapshot.py's disk edge — load_system_state
     and load_chunk both rebuild torch TQCodes through the from_arrays
@@ -431,7 +514,7 @@ def install_from_disk(cache: TQCache, disk_dir: str,
         if not os.path.exists(path):
             raise ValueError(f"install_from_disk: {path} not found")
         snaps.append(load_snapshot(path))
-    return install_snapshot(cache, system, snaps)
+    return install_snapshot(cache, system, snaps, gdn_install=gdn_install)
 
 
 def load_snapshot(path: str) -> ChunkSnapshot:

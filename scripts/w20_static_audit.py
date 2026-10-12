@@ -1212,8 +1212,10 @@ CHECKS = {
         {"kind": "absent", "target": "src/rag/query.py",
          "pattern": "\"mode\": \"prefill\""},
         # the install steps 5-6 remain THE answer context build
+        # (W26 amended the call: install_snapshot(cache, system, snaps,
+        # gdn_install=...) — the install is still the ONLY context build)
         {"kind": "grep", "target": "src/rag/query.py",
-         "pattern": r"install_snapshot\(cache, system, snaps\)"},
+         "pattern": r"install_snapshot\(cache, system, snaps"},
         # W24.2 — the reset is the control's exact call
         {"kind": "grep", "target": "src/rag/query.py",
          "pattern": r"layer\.reset\(\)"},
@@ -1235,6 +1237,51 @@ CHECKS = {
          "pattern": "_chunk_ctx"},
         {"kind": "py_compile", "target": "src/rag/tests/test_query.py"},
         {"kind": "git_log", "target": "W24.1 —"},
+    ],
+
+    # W26 — the FINDINGS.md F1 fix arm: the GDN best-chunk install
+    # (S+conv verbatim from the highest-scoring retrieved chunk, M1/M2
+    # summed) behind gdn_install="best"; the §6 sum stays the DEFAULT
+    # (the E1-E3 ladder's A/B baseline, bit-identical to pre-W26)
+    "W26": [
+        # W26.1 — install.py: the best-chunk S/conv install
+        {"kind": "grep", "target": "src/rag/install.py",
+         "pattern": r"gdn_install: str = \"sum\""},
+        {"kind": "grep", "target": "src/rag/install.py",
+         "pattern": r"def _best_conv"},
+        {"kind": "grep", "target": "src/rag/install.py",
+         "pattern": r"best-verbatim"},
+        # the §6 sum math is UNTOUCHED (the E-ladder baseline)
+        {"kind": "grep", "target": "src/rag/install.py",
+         "pattern": r"acc = q\.dequant\(system\) \* \(1 - len\(absolutes\)\)"},
+        # only the S addends are sliced in best mode; M1/M2 keep the sum
+        {"kind": "grep", "target": "src/rag/install.py",
+         "pattern": r"s_absolutes = absolutes\[:1\]"},
+        {"kind": "py_compile", "target": "src/rag/install.py"},
+        # W26.2 — query.py: the flag plumbs through answer_query
+        {"kind": "grep", "target": "src/rag/query.py",
+         "pattern": r"gdn_install"},
+        {"kind": "grep", "target": "src/rag/query.py",
+         "pattern": r"install_snapshot\(cache, system, snaps,"},
+        {"kind": "py_compile", "target": "src/rag/query.py"},
+        # W26.3 — run_query.py: the driver flag + the regime line
+        {"kind": "grep", "target": "scripts/gpu/run_query.py",
+         "pattern": r"--install-gdn"},
+        {"kind": "grep", "target": "scripts/gpu/run_query.py",
+         "pattern": r"gdn_install=args\.install_gdn"},
+        {"kind": "py_compile", "target": "scripts/gpu/run_query.py"},
+        # W26.4 — the gates (AUTHORED, PENDING the A10G box)
+        {"kind": "grep", "target": "src/rag/tests/test_query.py",
+         "pattern": "test_install_gdn_best_mode"},
+        {"kind": "py_compile", "target": "src/rag/tests/test_query.py"},
+        # W26.5 — the FINDINGS errata + the handover rewrite
+        {"kind": "grep", "target": "FINDINGS.md",
+         "pattern": r"## Errata \(W26"},
+        {"kind": "grep", "target": "HANDOVER.md",
+         "pattern": r"--install-gdn"},
+        {"kind": "py_compile", "target": "scripts/w20_static_audit.py"},
+        {"kind": "git_log", "target": "W26.1 —"},
+        {"kind": "git_tag", "target": "w26-gdn-best-install"},
     ],
 }
 
